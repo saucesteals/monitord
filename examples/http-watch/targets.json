@@ -1,0 +1,4 @@
+[
+  { "name": "example", "url": "https://example.com/" },
+  { "name": "cloudflare", "url": "https://1.1.1.1/" }
+]

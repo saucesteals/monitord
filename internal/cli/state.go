@@ -1,0 +1,186 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/saucesteals/monitord/internal/model"
+	"github.com/saucesteals/monitord/internal/monitor"
+	"github.com/spf13/cobra"
+)
+
+func (c *CLI) newStateCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "state",
+		Short: "Manage monitor state",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return requireSubcommand("state", "get, set, clear")
+		},
+	}
+	cmd.AddCommand(
+		c.newStateGetCmd(),
+		c.newStateSetCmd(),
+		c.newStateClearCmd(),
+	)
+
+	return cmd
+}
+
+func (c *CLI) newStateGetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "get NAME",
+		Short: "Print stored monitor state",
+		Args:  exactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return c.stateGet(args[0])
+		},
+	}
+}
+
+func (c *CLI) stateGet(rawName string) error {
+	name, err := model.ParseMonitorName(rawName)
+	if err != nil {
+		return err
+	}
+
+	store, _, err := c.store()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+
+	m, err := store.GetMonitor(context.Background(), name)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(indentJSON(m.State))
+
+	return nil
+}
+
+// stateSet replaces stored state from a file, or from stdin when given "-".
+//
+// The write bumps the state revision, so a tick already in flight loses to this
+// edit instead of overwriting it.
+func (c *CLI) newStateSetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "set NAME FILE",
+		Short: "Replace stored monitor state",
+		Args:  exactArgs(2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return c.stateSet(args[0], args[1])
+		},
+	}
+}
+
+func (c *CLI) stateSet(rawName string, source string) error {
+	name, err := model.ParseMonitorName(rawName)
+	if err != nil {
+		return err
+	}
+
+	raw, err := readStateFile(source)
+	if err != nil {
+		return err
+	}
+	if source == "-" {
+		source = "stdin"
+	}
+	if !json.Valid(raw) {
+		return fmt.Errorf("%s does not contain valid JSON", source)
+	}
+
+	store, _, err := c.store()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	m, err := store.GetMonitor(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	// Hold the edit to the monitor's own struct. Storing unvalidated JSON would
+	// fail every subsequent tick, with nothing able to overwrite it.
+	canonical, err := monitor.ValidateState(ctx, m.BinaryPath, m.SourceDir, raw, m.StateVersion)
+	if err != nil {
+		return fmt.Errorf("state from %s rejected by %s: %w", source, name, err)
+	}
+	if err := store.SetMonitorState(ctx, name, canonical, m.StateVersion); err != nil {
+		return err
+	}
+
+	fmt.Printf("state updated for %s (version %d)\n", name, m.StateVersion)
+	fmt.Println(indentJSON(canonical))
+
+	return nil
+}
+
+func (c *CLI) newStateClearCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "clear NAME",
+		Short: "Reset stored monitor state",
+		Args:  exactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return c.stateClear(args[0])
+		},
+	}
+}
+
+func (c *CLI) stateClear(rawName string) error {
+	name, err := model.ParseMonitorName(rawName)
+	if err != nil {
+		return err
+	}
+
+	store, _, err := c.store()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	m, err := store.GetMonitor(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	// Empty input makes the monitor report its own defaults, so a cleared
+	// monitor starts from the same state a fresh deploy would.
+	defaults, err := monitor.ValidateState(ctx, m.BinaryPath, m.SourceDir, nil, m.StateVersion)
+	if err != nil {
+		return err
+	}
+	if err := store.SetMonitorState(ctx, name, defaults, m.StateVersion); err != nil {
+		return err
+	}
+
+	fmt.Printf("state cleared for %s\n", name)
+	fmt.Println(indentJSON(defaults))
+
+	return nil
+}
+
+func readStateFile(path string) ([]byte, error) {
+	if path == "-" {
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return nil, fmt.Errorf("read state from stdin: %w", err)
+		}
+
+		return raw, nil
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read state file: %w", err)
+	}
+
+	return raw, nil
+}
