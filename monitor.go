@@ -1,17 +1,14 @@
 // Package monitord is the authoring SDK for monitord monitors.
 //
-// A monitor is a single Go file with a main function that hands its definition
-// and a tick function to Main:
+// A monitor is a Go package with a main function that hands its tick function
+// to Main. Scheduling and runtime configuration live in monitor.yaml:
 //
 //	type State struct {
 //		LastSeenID string `json:"last_seen_id"`
 //	}
 //
 //	func main() {
-//		monitord.Main(monitord.Definition{
-//			Name:    "checkout-watch",
-//			Clients: 8,
-//		}, run)
+//		monitord.Main(run)
 //	}
 //
 //	func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
@@ -48,8 +45,8 @@ type Runner[S any] func(context.Context, *Run[S]) Result
 type Run[S any] struct {
 	// Monitor is the deployed monitor name.
 	Monitor MonitorName
-	// Route is the monitor's default notification route.
-	Route RouteName
+	// Routes are the monitor's configured notification routes.
+	Routes []RouteName
 	// RunID identifies this tick.
 	RunID string
 	// Deadline is when the daemon will abandon this tick, if set.
@@ -68,14 +65,15 @@ type Run[S any] struct {
 }
 
 // Main implements the monitord executable contract and never returns.
-func Main[S any](def Definition, runner Runner[S]) {
-	if err := dispatch(def, runner, os.Args[1:], os.Stdin, os.Stdout); err != nil {
+func Main[S any](runner Runner[S]) {
+	if err := dispatch(runner, os.Args[1:], os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 }
 
-func dispatch[S any](def Definition, runner Runner[S], args []string, stdin io.Reader, stdout io.Writer) error {
+func dispatch[S any](runner Runner[S], args []string, stdin io.Reader, stdout io.Writer) error {
+	def := Definition{}
 	def = def.WithDefaults()
 	def.StateVersion = stateVersion[S]()
 	if err := def.Validate(); err != nil {
@@ -213,7 +211,7 @@ func tick[S any](runner Runner[S], w *worker, t Tick, out *stream) error {
 
 	run := &Run[S]{
 		Monitor:  w.hello.Monitor,
-		Route:    w.hello.Route,
+		Routes:   append([]RouteName(nil), w.hello.Routes...),
 		RunID:    t.RunID,
 		Deadline: t.Deadline,
 		State:    state,

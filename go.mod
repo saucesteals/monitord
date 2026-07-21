@@ -6,6 +6,7 @@ require (
 	github.com/saucesteals/fhttp v1.0.1
 	github.com/saucesteals/mimic v1.0.1
 	github.com/spf13/cobra v1.10.2
+	go.yaml.in/yaml/v3 v3.0.4
 	modernc.org/sqlite v1.33.1
 )
 

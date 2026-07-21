@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -18,6 +19,7 @@ import (
 	monitord "github.com/saucesteals/monitord"
 	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/model"
+	"github.com/saucesteals/monitord/internal/routes"
 	"github.com/saucesteals/monitord/internal/storage"
 )
 
@@ -29,16 +31,9 @@ const (
 // Request describes one monitor build.
 type Request struct {
 	// Dir is the monitor's source directory.
-	Dir        string
-	Name       model.MonitorName
-	Every      time.Duration
-	TTL        time.Duration
-	Timeout    time.Duration
-	Route      model.RouteName
-	ProxyPool  model.PoolName
-	Persistent bool
-	// MentionOverride replaces the route's mentions for this monitor.
-	MentionOverride string
+	Dir    string
+	Name   model.MonitorName
+	Config Config
 
 	// Current is the monitor's existing state, if it was deployed before. The
 	// new binary validates and migrates it before the deploy is accepted.
@@ -85,20 +80,21 @@ func Build(ctx context.Context, paths config.Paths, req Request) (storage.Monito
 	}
 
 	def := described.Definition.WithDefaults()
+	def.Name = req.Name.String()
+	def.Description = req.Config.Description
+	def.Clients = req.Config.Clients
+	def.Persistent = req.Config.Persistent
 	if err := def.Validate(); err != nil {
 		return storage.Monitor{}, err
-	}
-	if def.Name != "" && def.Name != req.Name.String() {
-		return storage.Monitor{}, fmt.Errorf("monitor declares name %q but its directory is %q", def.Name, req.Name)
 	}
 
 	now := time.Now().UTC()
 	var expiresAt *time.Time
-	ttlSeconds := int64(req.TTL.Seconds())
-	if req.Persistent || def.Persistent {
+	ttlSeconds := int64(req.Config.TTL.Seconds())
+	if req.Config.Persistent {
 		ttlSeconds = 0
 	} else {
-		expires := now.Add(req.TTL)
+		expires := now.Add(req.Config.TTL)
 		expiresAt = &expires
 	}
 
@@ -110,12 +106,11 @@ func Build(ctx context.Context, paths config.Paths, req Request) (storage.Monito
 		Definition:      def,
 		State:           described.State,
 		StateVersion:    def.StateVersion,
-		IntervalSeconds: int64(req.Every.Seconds()),
+		IntervalSeconds: int64(req.Config.Every.Seconds()),
 		TTLSeconds:      ttlSeconds,
-		TimeoutSeconds:  int64(req.Timeout.Seconds()),
-		Route:           req.Route,
-		ProxyPool:       req.ProxyPool,
-		MentionOverride: req.MentionOverride,
+		TimeoutSeconds:  int64(req.Config.Timeout.Seconds()),
+		ProxyPool:       req.Config.ProxyPool,
+		Deliveries:      routes.CloneDeliveries(req.Config.Deliveries),
 		Status:          model.MonitorStatusActive,
 		CreatedAt:       &now,
 		UpdatedAt:       &now,
@@ -128,11 +123,11 @@ func validateDir(req Request) (string, error) {
 	if err := req.Name.Validate(); err != nil {
 		return "", err
 	}
-	if err := req.Route.Validate(); err != nil {
+	if err := req.Config.ProxyPool.Validate(); err != nil {
 		return "", err
 	}
-	if err := req.ProxyPool.Validate(); err != nil {
-		return "", err
+	if len(req.Config.Deliveries) == 0 {
+		return "", errors.New("monitor requires at least one route")
 	}
 
 	dir, err := filepath.Abs(req.Dir)

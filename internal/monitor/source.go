@@ -52,9 +52,12 @@ func Scaffold(paths config.Paths, name model.MonitorName) (string, error) {
 		return "", fmt.Errorf("create monitor dir: %w", err)
 	}
 
-	source := fmt.Sprintf(scaffoldTemplate, name)
+	source := scaffoldTemplate
 	if err := os.WriteFile(filepath.Join(dir, "monitor.go"), []byte(source), 0o600); err != nil {
 		return "", fmt.Errorf("write monitor source: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ConfigFileName), []byte(scaffoldConfig), 0o600); err != nil {
+		return "", fmt.Errorf("write monitor config: %w", err)
 	}
 
 	return dir, nil
@@ -75,34 +78,40 @@ type State struct {
 }
 
 func main() {
-	monitord.Main(monitord.Definition{
-		Name:    %q,
-		Clients: 1,
-	}, run)
+	monitord.Main(run)
 }
 
 func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/", nil)
 	if err != nil {
-		return monitord.Failuref("build request: %%v", err)
+		return monitord.Failuref("build request: %v", err)
 	}
 
 	resp, err := r.Client().Do(req)
 	if err != nil {
-		return monitord.Failuref("request failed: %%v", err)
+		return monitord.Failuref("request failed: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != r.State.LastStatus {
-		r.Logf(monitord.LogInfo, "status changed %%d -> %%d", r.State.LastStatus, resp.StatusCode)
+		r.Logf(monitord.LogInfo, "status changed %d -> %d", r.State.LastStatus, resp.StatusCode)
 		r.State.LastStatus = resp.StatusCode
 		r.Save()
 	}
 
 	if resp.StatusCode >= 400 {
-		return monitord.Failuref("HTTP %%d", resp.StatusCode)
+		return monitord.Failuref("HTTP %d", resp.StatusCode)
 	}
 
-	return monitord.Successf("HTTP %%d", resp.StatusCode)
+	return monitord.Successf("HTTP %d", resp.StatusCode)
 }
+`
+
+const scaffoldConfig = `description: HTTP status monitor
+clients: 1
+every: 5m
+ttl: 24h
+timeout: 30s
+routes:
+  - route: discord:alerts
 `

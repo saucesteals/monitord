@@ -10,13 +10,13 @@
 [![SQLite](https://img.shields.io/badge/State-SQLite-3f7f5f?style=flat)](https://sqlite.org/)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-lightgrey)]()
 
-**Monitoring** | **Typed State** | **Long-Lived Workers** | **Discord Alerts** | **CLI Ops**
+**Monitoring** | **Typed State** | **Long-Lived Workers** | **Discord Alerts** | **OpenClaw Tasks** | **CLI Ops**
 
 </div>
 
 ---
 
-`monitord` is a local Go daemon for recurring checks that need memory. It handles scheduling, durable state, worker lifecycle, run history, proxy-backed clients, and Discord notifications, while each monitor stays a small Go program focused on one question: did something meaningful happen?
+`monitord` is a local Go daemon for recurring checks that need memory. It handles scheduling, durable state, worker lifecycle, run history, proxy-backed clients, and notification delivery, while each monitor stays a small Go program focused on one question: did something meaningful happen?
 
 Use it when cron is too stateless and a full job platform is too much.
 
@@ -27,6 +27,7 @@ Use it when cron is too stateless and a full job platform is too much.
 - Lifecycle: `test`, `deploy`, schedule, expire, inspect, and remove monitors through one CLI.
 - Workers: deployed monitors run as long-lived worker processes, so HTTP clients, sessions, and caches can survive between ticks.
 - Discord: send rich embeds for alerts, failure edges, recoveries, and deduped per-target events.
+- OpenClaw: turn monitor hits into agent tasks with a per-monitor prompt and notification context.
 - Proxies: import proxy pools once, then assign managed proxy clients at deploy time without putting credentials in source.
 
 ## Code
@@ -39,7 +40,7 @@ type State struct {
 }
 
 func main() {
-	monitord.Main(monitord.Definition{Name: "restock-alert", Clients: 1}, run)
+	monitord.Main(run)
 }
 
 func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
@@ -59,6 +60,23 @@ func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
 }
 ```
 
+Everything except the runner lives beside it in `monitor.yaml`:
+
+```yaml
+description: Watches a product for restocks
+clients: 1
+every: 5m
+ttl: 24h
+timeout: 30s
+routes:
+  - route: discord:alerts
+    options:
+      mentions: user:USER_ID
+  - route: openclaw:concierge
+    options:
+      prompt: Reserve the item when it comes back in stock.
+```
+
 Discord messages are embeds. Add fields when the alert should be useful without opening logs:
 
 ```go
@@ -76,13 +94,13 @@ return monitord.Alert("back in stock").
 infra/install.sh
 
 monitord init
-monitord route create discord alerts --webhook-url "$DISCORD_WEBHOOK_URL"
+monitord route create discord alerts --option url="$DISCORD_WEBHOOK_URL"
 
 monitord new restock-alert
-$EDITOR ~/.monitord/monitors/restock-alert/monitor.go
+$EDITOR ~/.monitord/monitors/restock-alert/{monitor.go,monitor.yaml}
 monitord test restock-alert
 
-monitord deploy restock-alert --every 5m --ttl 24h --route discord:alerts
+monitord deploy restock-alert
 monitord list
 ```
 
@@ -129,16 +147,42 @@ monitord state clear restock-alert
 
 `Failure` notifications are edge-triggered: one message when a monitor starts failing and one when it recovers. `Alert` sends every time it is returned, which is the right fit for healthy checks that found something interesting.
 
-Routes are local labels for Discord webhooks:
+Routes are local labels for notification backends:
 
 ```bash
-monitord route create discord alerts --webhook-url "$DISCORD_WEBHOOK_URL"
+monitord route create discord alerts --option url="$DISCORD_WEBHOOK_URL"
 monitord route test discord:alerts
-monitord deploy restock-alert --route discord:alerts --mention user:USER_ID
-monitord deploy quiet-watch --route discord:alerts --mention none
 ```
 
-Mentions accept `user:ID`, `role:ID`, `here`, `everyone`, comma-separated combinations, or `none`. They are sent through Discord `allowed_mentions`, so scraped content cannot create surprise mass pings.
+Assign routes and per-monitor options in `monitor.yaml`. A monitor may list any number of routes, including multiple routes of the same kind. Discord mentions accept `user:ID`, `role:ID`, `here`, `everyone`, comma-separated combinations, or `none`; they are sent through `allowed_mentions`, so scraped content cannot create surprise mass pings.
+
+OpenClaw routes call the Gateway's `/hooks/agent` endpoint. The route stores hook settings; the monitor stores the prompt OpenClaw should follow when a notification fires:
+
+```bash
+monitord route create openclaw concierge \
+  --option token="$OPENCLAW_HOOK_TOKEN" \
+  --option agent-id=main \
+  --option deliver=true \
+  --option channel=discord \
+  --option to=user:USER_ID
+```
+
+Then configure the monitor:
+
+```yaml
+every: 30s
+ttl: 2h
+routes:
+  - route: discord:alerts
+  - route: openclaw:concierge
+    options:
+      prompt: >-
+        Reserve the table if the available slot matches the monitor alert.
+```
+
+OpenClaw defaults to `http://127.0.0.1:18789/hooks/agent`; override it with `--option url=...`. Other supported route keys are `session-key`, `wake-mode`, `model`, `thinking`, and `timeout-seconds`.
+
+Route drivers own their accepted route and monitor option keys. Both sets are stored as JSON, so adding another delivery backend does not require another database column or CLI flag.
 
 ## Install And Update
 
@@ -172,15 +216,14 @@ monitord daemon --interval 5s --concurrency 8
 
 ## Proxies
 
-Import a pool once, then attach it when deploying a monitor:
+Import a pool once, then name it in `monitor.yaml`:
 
 ```bash
 monitord proxy import residential ./proxies.txt
 monitord proxy list
-monitord deploy catalog-watch --proxies residential --route discord:alerts
 ```
 
-The monitor declares `Clients: N`; monitord assigns that many proxy-backed clients to the worker. Proxy credentials live in monitord state, not monitor source or process arguments.
+Set `proxies: residential` and `clients: N`; monitord assigns that many proxy-backed clients to the worker. Proxy credentials live in monitord state, not monitor source or process arguments.
 
 ## AI Skill
 

@@ -1,0 +1,7 @@
+description: Checks a list of URLs and alerts on status changes
+clients: 4
+every: 5m
+ttl: 24h
+timeout: 30s
+routes:
+  - route: discord:alerts

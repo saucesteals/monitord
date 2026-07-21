@@ -35,13 +35,7 @@ type State struct {
 func (State) StateVersion() int { return 1 }
 
 func main() {
-	monitord.Main(monitord.Definition{
-		Name:        "http-watch",
-		Description: "checks a list of URLs and alerts on status changes",
-		// One client per proxy, each keeping its own connection pool warm
-		// across ticks.
-		Clients: 4,
-	}, run)
+	monitord.Main(run)
 }
 
 func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {

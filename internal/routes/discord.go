@@ -1,4 +1,3 @@
-// Package routes delivers monitor notifications to their destinations.
 package routes
 
 import (
@@ -10,22 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
-)
 
-// Level selects a notification's accent colour.
-type Level string
-
-const (
-	// LevelInfo is neutral information.
-	LevelInfo Level = "info"
-	// LevelSuccess is a healthy or recovered state.
-	LevelSuccess Level = "success"
-	// LevelWarn is a warning.
-	LevelWarn Level = "warn"
-	// LevelFailure is a failed check.
-	LevelFailure Level = "failure"
-	// LevelCritical is a high-importance failure.
-	LevelCritical Level = "critical"
+	"github.com/saucesteals/monitord/internal/model"
 )
 
 // color returns the embed accent for a level.
@@ -44,26 +29,68 @@ func (l Level) color() int {
 	}
 }
 
-// Field is one labelled value shown in a notification.
-type Field struct {
-	Name   string
-	Value  string
-	Inline bool
+type discordDriver struct{}
+
+const discordKind model.RouteKind = "discord"
+
+func init() {
+	Register(discordDriver{})
 }
 
-// Message is a notification payload rendered to Discord.
-type Message struct {
-	Title   string
-	Summary string
-	Details string
-	// URL makes the title a link.
-	URL string
-	// Level selects the accent colour.
-	Level Level
-	// Fields are labelled values rendered under the message.
-	Fields []Field
-	// Footer identifies the monitor that produced the message.
-	Footer string
+func (discordDriver) Kind() model.RouteKind {
+	return discordKind
+}
+
+func (discordDriver) PrepareRoute(options Options) (Options, error) {
+	if err := validateOptionKeys(options, "url", "mentions"); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(options["url"]) == "" {
+		return nil, fmt.Errorf("discord route option url is required")
+	}
+	if _, err := ParseMentions(options["mentions"]); err != nil {
+		return nil, err
+	}
+
+	return options, nil
+}
+
+func (discordDriver) ValidateMonitor(options Options) error {
+	if err := validateOptionKeys(options, "mentions"); err != nil {
+		return err
+	}
+	_, err := ResolveMentions(options["mentions"], nil)
+
+	return err
+}
+
+func (discordDriver) DescribeRoute(options Options) string {
+	return fmt.Sprintf("pings=%s %s", orDefault(options["mentions"], "-"), RedactURL(options["url"]))
+}
+
+func (discordDriver) DescribeMonitor(options Options) string {
+	if options["mentions"] == "" {
+		return ""
+	}
+
+	return "pings=" + options["mentions"]
+}
+
+func (discordDriver) TestOptions() Options {
+	return nil
+}
+
+func (discordDriver) Deliver(ctx context.Context, routeOptions Options, monitorOptions Options, msg Message) error {
+	mentions, err := ParseMentions(routeOptions["mentions"])
+	if err != nil {
+		return err
+	}
+	mentions, err = ResolveMentions(monitorOptions["mentions"], mentions)
+	if err != nil {
+		return err
+	}
+
+	return SendDiscord(ctx, routeOptions["url"], msg, mentions)
 }
 
 // MentionKind identifies who a route pings.

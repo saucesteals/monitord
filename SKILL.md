@@ -1,11 +1,11 @@
 ---
 name: monitord
-description: Build, deploy, operate, and debug persistent monitors that run on a schedule, keep typed state, and notify Discord when something changes, fails, or recovers. Use for requests like "monitor X", "watch X", "alert me when X changes", "check X every N minutes", "tell me when X is back", or to inspect, repair, redeploy, expire, or remove an existing monitor.
+description: Build, deploy, operate, and debug persistent monitors that run on a schedule, keep typed state, and notify Discord or trigger OpenClaw agent tasks when something changes, fails, or recovers. Use for requests like "monitor X", "watch X", "alert me when X changes", "check X every N minutes", "tell me when X is back", or to inspect, repair, redeploy, expire, or remove an existing monitor.
 ---
 
 # monitord
 
-`monitord` runs small Go programs that check something repeatedly and report only the moments that matter. Use it instead of cron when a watch needs durable state, a TTL, edge-triggered failure/recovery notifications, structured Discord alerts, or proxy-backed HTTP clients.
+`monitord` runs small Go programs that check something repeatedly and report only the moments that matter. Use it instead of cron when a watch needs durable state, a TTL, edge-triggered failure/recovery notifications, structured Discord alerts, OpenClaw agent tasks, or proxy-backed HTTP clients.
 
 Default install layout:
 
@@ -22,11 +22,11 @@ The install is self-contained: the daemon binary and every monitor compile again
 Clarify these points before writing code. Ask the requester only when the answer changes behavior.
 
 - What is a hit: status code, JSON field, text selector, price threshold, inventory state, feed item, or some other condition?
-- How often should it run: set `--every`.
-- How long should it live: set `--ttl`, or use `--persistent` only for long-lived infrastructure checks.
+- How often should it run: set `every` in `monitor.yaml`.
+- How long should it live: set `ttl`, or use `persistent: true` only for long-lived infrastructure checks.
 - What state must it remember: previous status, last seen ID, last price, known hashes, auth/session data?
 - Does it need proxies: use them only for targets that rate-limit or block direct traffic.
-- Who should be notified: choose a route and optional mention override.
+- Who should be notified or acted for: choose a route and its per-monitor route options.
 
 Default to a TTL. Temporary watches should expire by themselves.
 
@@ -34,15 +34,15 @@ Default to a TTL. Temporary watches should expire by themselves.
 
 ```bash
 monitord new <name>
-$EDITOR ~/.monitord/monitors/<name>/monitor.go
+$EDITOR ~/.monitord/monitors/<name>/{monitor.go,monitor.yaml}
 monitord test <name>
-monitord deploy <name> --every 5m --ttl 24h --route discord:alerts
+monitord deploy <name>
 monitord list
 ```
 
-Always run `monitord test` before deploying. It builds the monitor, runs one real tick, prints logs, events, result, and state, and does not deploy or send Discord messages.
+Always run `monitord test` before deploying. It builds the monitor, runs one real tick, prints logs, events, result, and state, and does not deploy or deliver notifications.
 
-After editing a deployed monitor, `monitord deploy <name>` rebuilds it and keeps the existing schedule, timeout, route, proxy pool, TTL, and mention override unless new flags are provided.
+After editing either source or YAML, `monitord deploy <name>` rebuilds the monitor and applies the complete `monitor.yaml` configuration.
 
 ## Writing A Monitor
 
@@ -63,10 +63,7 @@ type State struct {
 }
 
 func main() {
-	monitord.Main(monitord.Definition{
-		Name:    "<name>",
-		Clients: 1,
-	}, run)
+	monitord.Main(run)
 }
 
 func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
@@ -93,10 +90,22 @@ func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
 }
 ```
 
+The matching `monitor.yaml` owns all runtime configuration:
+
+```yaml
+description: What this monitor watches
+clients: 1
+every: 5m
+ttl: 24h
+timeout: 30s
+routes:
+  - route: discord:alerts
+```
+
 Rules that matter:
 
 - Import `http "github.com/saucesteals/fhttp"` and send requests with `r.Client()`.
-- `Definition.Name` must match the monitor directory name.
+- Keep `main` to `monitord.Main(run)`; configuration belongs in `monitor.yaml`.
 - Call `r.Save()` after mutating `r.State`, or the state change is discarded.
 - Put data files beside the monitor source and read them with `r.Path("targets.json")`.
 - Do not hardcode secrets. Store monitor-owned credentials in state and update them with `monitord state set`.
@@ -165,27 +174,58 @@ func (s *State) MigrateState(from int, raw json.RawMessage) error {
 
 If the shape changed and there is no migration, deploy refuses instead of silently dropping data. Either add a migration or clear state intentionally.
 
-## Routes And Mentions
+## Routes
 
 ```bash
 monitord route list
-monitord route create discord alerts --webhook-url "$DISCORD_WEBHOOK_URL"
+monitord route create discord alerts --option url="$DISCORD_WEBHOOK_URL"
 monitord route test discord:alerts
 ```
 
 Routes are named `<kind>:<name>`, for example `discord:alerts`. The route name is a local label; the webhook URL decides where the message lands. Webhook URLs are redacted from output and logs.
 
-Mentions can live on the route or be overridden per monitor:
+Mentions can live on the route or be overridden per monitor in YAML:
 
 ```bash
-monitord route create discord ops --webhook-url "$DISCORD_WEBHOOK_URL" --mention role:ROLE_ID
-monitord deploy api-health --route discord:ops --mention user:USER_ID
-monitord deploy quiet-watch --route discord:ops --mention none
+monitord route create discord ops \
+  --option url="$DISCORD_WEBHOOK_URL" \
+  --option mentions=role:ROLE_ID
 ```
 
-`--mention` accepts `user:ID`, `role:ID`, `here`, `everyone`, comma-separated combinations, or `none`. Mentions are also an allowlist: scraped content containing `@everyone` is rendered inert unless that mention was explicitly allowed.
+```yaml
+routes:
+  - route: discord:ops
+    options:
+      mentions: user:USER_ID
+```
+
+The Discord `mentions` option accepts `user:ID`, `role:ID`, `here`, `everyone`, comma-separated combinations, or `none`. Mentions are also an allowlist: scraped content containing `@everyone` is rendered inert unless that mention was explicitly allowed.
 
 Prefer one route per destination webhook and per-monitor mention overrides for who gets pinged.
+
+## OpenClaw Routes
+
+Use an OpenClaw route when a monitor hit should become an agent task, such as reserving a table, drafting a response, or checking out a matching item.
+
+```bash
+monitord route create openclaw concierge \
+  --option token="$OPENCLAW_HOOK_TOKEN" \
+  --option agent-id=main
+```
+
+```yaml
+every: 30s
+ttl: 2h
+routes:
+  - route: discord:alerts
+  - route: openclaw:concierge
+    options:
+      prompt: Reserve the table if the available slot matches the alert.
+```
+
+OpenClaw routes call `POST /hooks/agent` using `Authorization: Bearer <token>`. The monitor's `prompt` option is sent first, then monitord appends the notification title, summary, URL, details, fields, level, and monitor name as context.
+
+Set route settings with repeatable `--option key=value` flags. OpenClaw supports `url`, `token`, `agent-id`, `session-key`, `wake-mode`, `deliver`, `channel`, `to`, `model`, `thinking`, and `timeout-seconds`. Only set `session-key` when OpenClaw hooks are configured to allow request session keys.
 
 ## Proxies
 
@@ -195,8 +235,9 @@ Skip proxies unless the target needs them.
 monitord proxy import residential ./proxies.txt
 monitord proxy list
 monitord proxy show residential
-monitord deploy <name> --proxies residential --route discord:alerts
 ```
+
+Set `proxies: residential` in `monitor.yaml`.
 
 Import accepts common proxy formats:
 
@@ -208,7 +249,7 @@ scheme://user:pass@host:port
 scheme://host:port
 ```
 
-Set `Clients: N` in the monitor definition to request N clients. Each client gets its own proxy assignment and connection pool. `r.Client()` rotates through them; `r.Clients().At(i)` gives a stable client when one target should stick to one exit.
+Set `clients: N` in `monitor.yaml` to request N clients. Each client gets its own proxy assignment and connection pool. `r.Client()` rotates through them; `r.Clients().At(i)` gives a stable client when one target should stick to one exit.
 
 Proxy credentials live in monitord's database, not monitor source, environment, or process arguments.
 
@@ -268,8 +309,8 @@ monitord daemon --interval 5s --concurrency 8
 
 ## Gotchas
 
-- `--ttl` is required unless `--persistent` is set.
-- Slow checks need `--timeout` above the default 30s.
+- `ttl` is required unless `persistent: true` is set.
+- Slow checks need a larger `timeout` than the default 30s.
 - `monitord test` runs direct and sends no notifications. Deployed behavior can differ when proxies are attached.
 - Deploy fails when a route or proxy pool does not exist. Create routes and import proxy pools first.
 - State schema changes require a version bump and migration, or an intentional `monitord state clear`.

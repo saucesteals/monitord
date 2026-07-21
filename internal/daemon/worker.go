@@ -14,6 +14,7 @@ import (
 
 	monitord "github.com/saucesteals/monitord"
 	"github.com/saucesteals/monitord/internal/monitor"
+	"github.com/saucesteals/monitord/internal/routes"
 	"github.com/saucesteals/monitord/internal/storage"
 )
 
@@ -122,7 +123,7 @@ func (w *worker) handshake(ctx context.Context, logger *slog.Logger, m storage.M
 		Type: monitord.InboundHello,
 		Hello: &monitord.Hello{
 			Monitor: monitord.MonitorName(m.Name.String()),
-			Route:   monitord.RouteName(m.Route.String()),
+			Routes:  protocolRouteNames(m.Deliveries),
 			Dir:     m.SourceDir,
 			Network: network,
 		},
@@ -148,6 +149,15 @@ func (w *worker) handshake(ctx context.Context, logger *slog.Logger, m storage.M
 	w.clients = msg.Ready.Clients
 
 	return nil
+}
+
+func protocolRouteNames(deliveries []routes.Delivery) []monitord.RouteName {
+	names := make([]monitord.RouteName, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		names = append(names, monitord.RouteName(delivery.Route.String()))
+	}
+
+	return names
 }
 
 // tick sends one run to the worker and consumes messages until its result.

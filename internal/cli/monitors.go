@@ -92,36 +92,17 @@ func (c *CLI) daemon(interval time.Duration, concurrency int) error {
 }
 
 func (c *CLI) newDeployCmd() *cobra.Command {
-	var name string
-	var every time.Duration
-	var ttl time.Duration
-	var route string
-	var proxies string
-	var timeout time.Duration
-	var persistent bool
-	var mention string
-
-	cmd := &cobra.Command{
+	return &cobra.Command{
 		Use:   "deploy NAME",
 		Short: "Build and deploy a monitor",
 		Args:  exactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return c.deploy(args[0], name, every, ttl, route, proxies, timeout, persistent, mention)
+			return c.deploy(args[0])
 		},
 	}
-	cmd.Flags().StringVar(&name, "name", "", "monitor name")
-	cmd.Flags().DurationVar(&every, "every", 0, "run interval")
-	cmd.Flags().DurationVar(&ttl, "ttl", 0, "monitor lifetime")
-	cmd.Flags().StringVar(&route, "route", "", "notification route")
-	cmd.Flags().StringVar(&proxies, "proxies", "", "proxy pool to draw clients from")
-	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "per-tick timeout")
-	cmd.Flags().BoolVar(&persistent, "persistent", false, "never expire this monitor")
-	cmd.Flags().StringVar(&mention, "mention", "", "who this monitor pings, overriding the route: user:ID, role:ID, here, everyone, or none")
-
-	return cmd
 }
 
-func (c *CLI) deploy(target string, name string, every time.Duration, ttl time.Duration, route string, proxies string, timeout time.Duration, persistent bool, mention string) error {
+func (c *CLI) deploy(target string) error {
 	store, paths, err := c.store()
 	if err != nil {
 		return err
@@ -132,83 +113,35 @@ func (c *CLI) deploy(target string, name string, every time.Duration, ttl time.D
 	if err != nil {
 		return err
 	}
-	if name != "" {
-		if monitorName, err = model.ParseMonitorName(name); err != nil {
-			return err
-		}
+	monitorConfig, err := monitor.LoadConfig(dir)
+	if err != nil {
+		return err
 	}
 
 	ctx := context.Background()
 	existing, existingErr := store.GetMonitor(ctx, monitorName)
-
-	// A redeploy keeps whatever it is not told to change, so routine
-	// "rebuild after an edit" needs no flags.
 	req := monitor.Request{
-		Dir:        dir,
-		Name:       monitorName,
-		Every:      every,
-		TTL:        ttl,
-		Timeout:    timeout,
-		Persistent: persistent,
+		Dir:    dir,
+		Name:   monitorName,
+		Config: monitorConfig,
 	}
 	if existingErr == nil {
 		req.Current = existing.State
 		req.CurrentVersion = existing.StateVersion
-		if req.Every == 0 {
-			req.Every = time.Duration(existing.IntervalSeconds) * time.Second
-		}
-		if req.TTL == 0 && existing.TTLSeconds > 0 {
-			req.TTL = time.Duration(existing.TTLSeconds) * time.Second
-		}
-		if existing.TTLSeconds == 0 {
-			req.Persistent = true
-		}
-		if route == "" {
-			req.Route = existing.Route
-		}
-		if proxies == "" {
-			req.ProxyPool = existing.ProxyPool
-		}
-		if mention == "" {
-			req.MentionOverride = existing.MentionOverride
-		}
 	}
 
-	if route != "" {
-		if req.Route, err = model.ParseRouteName(route); err != nil {
+	for _, delivery := range monitorConfig.Deliveries {
+		selectedRoute, err := store.GetRoute(ctx, delivery.Route)
+		if err != nil {
 			return err
 		}
-	}
-	if proxies != "" {
-		if req.ProxyPool, err = model.ParsePoolName(proxies); err != nil {
-			return err
+		if err := routes.ValidateMonitor(selectedRoute.Kind, delivery.Options); err != nil {
+			return fmt.Errorf("route %s: %w", delivery.Route, err)
 		}
 	}
-	if mention != "" {
-		// Validated now so a typo fails the deploy rather than the first alert.
-		if _, err := routes.ResolveMentions(mention, nil); err != nil {
-			return err
-		}
-		req.MentionOverride = mention
-	}
-
-	switch {
-	case req.Every <= 0:
-		return errors.New("--every is required")
-	case !req.Persistent && req.TTL <= 0:
-		return errors.New("--ttl is required unless --persistent is set")
-	case req.Route == "":
-		return errors.New("--route is required")
-	case req.Timeout <= 0:
-		return errors.New("--timeout must be positive")
-	}
-
-	if _, err := store.GetRoute(ctx, req.Route); err != nil {
-		return err
-	}
-	if req.ProxyPool != "" {
+	if monitorConfig.ProxyPool != "" {
 		// Resolved now so a missing pool fails the deploy, not the first tick.
-		if _, err := store.GetProxyPool(ctx, req.ProxyPool); err != nil {
+		if _, err := store.GetProxyPool(ctx, monitorConfig.ProxyPool); err != nil {
 			return err
 		}
 	}
@@ -229,17 +162,28 @@ func (c *CLI) deploy(target string, name string, every time.Duration, ttl time.D
 	fmt.Printf("deployed %s\n", built.Name)
 	fmt.Printf("source   %s\n", built.SourceDir)
 	fmt.Printf("artifact %s\n", built.ArtifactDir)
-	fmt.Printf("schedule every %s, timeout %s, route %s\n",
+	fmt.Printf("schedule every %s, timeout %s\n",
 		time.Duration(built.IntervalSeconds)*time.Second,
-		time.Duration(built.TimeoutSeconds)*time.Second,
-		built.Route)
+		time.Duration(built.TimeoutSeconds)*time.Second)
 	fmt.Printf("clients  %d", built.Definition.Clients)
 	if built.ProxyPool != "" {
 		fmt.Printf(" from pool %s", built.ProxyPool)
 	}
 	fmt.Println()
-	if built.MentionOverride != "" {
-		fmt.Printf("pings    %s (overriding route)\n", built.MentionOverride)
+	for _, delivery := range built.Deliveries {
+		selectedRoute, err := store.GetRoute(ctx, delivery.Route)
+		if err != nil {
+			return err
+		}
+		description, err := routes.DescribeMonitor(selectedRoute.Kind, delivery.Options)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("route    %s", delivery.Route)
+		if description != "" {
+			fmt.Printf(" (%s)", truncate(description, 80))
+		}
+		fmt.Println()
 	}
 	if req.CurrentVersion != 0 && req.CurrentVersion != built.StateVersion {
 		fmt.Printf("state migrated v%d -> v%d\n", req.CurrentVersion, built.StateVersion)
@@ -280,9 +224,9 @@ func (c *CLI) newMonitor(rawName string) error {
 	}
 
 	fmt.Printf("created %s\n", dir)
-	fmt.Printf("edit %s, then:\n", filepath.Join(dir, "monitor.go"))
+	fmt.Printf("edit %s and %s, then:\n", filepath.Join(dir, "monitor.go"), filepath.Join(dir, monitor.ConfigFileName))
 	fmt.Printf("  monitord test %s\n", name)
-	fmt.Printf("  monitord deploy %s --every 5m --ttl 24h --route discord:monitors\n", name)
+	fmt.Printf("  monitord deploy %s\n", name)
 
 	return nil
 }
@@ -386,10 +330,10 @@ func (c *CLI) list() error {
 		return nil
 	}
 
-	fmt.Printf("%-24s %-8s %-9s %-10s %-20s %s\n", "NAME", "STATUS", "HEALTH", "NEXT", "EXPIRES", "ROUTE")
+	fmt.Printf("%-24s %-8s %-9s %-10s %-20s %s\n", "NAME", "STATUS", "HEALTH", "NEXT", "EXPIRES", "ROUTES")
 	for _, m := range monitors {
 		fmt.Printf("%-24s %-8s %-9s %-10s %-20s %s\n",
-			m.Name, m.Status, health(m), until(m.NextDueAt), until(m.ExpiresAt), m.Route)
+			m.Name, m.Status, health(m), until(m.NextDueAt), until(m.ExpiresAt), deliveryNames(m.Deliveries))
 	}
 
 	return nil
@@ -462,9 +406,23 @@ func (c *CLI) inspect(rawName string) error {
 
 	fmt.Printf("name: %s\n", m.Name)
 	fmt.Printf("status: %s\n", m.Status)
-	fmt.Printf("route: %s\n", m.Route)
 	fmt.Printf("proxies: %s\n", orDash(m.ProxyPool.String()))
-	fmt.Printf("pings: %s\n", orDash(m.MentionOverride))
+	fmt.Println("routes:")
+	for _, delivery := range m.Deliveries {
+		route, err := store.GetRoute(context.Background(), delivery.Route)
+		if err != nil {
+			return err
+		}
+		description, err := routes.DescribeMonitor(route.Kind, delivery.Options)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("  - %s", delivery.Route)
+		if description != "" {
+			fmt.Printf(": %s", description)
+		}
+		fmt.Println()
+	}
 	fmt.Printf("clients: %d\n", m.Definition.Clients)
 	fmt.Printf("every: %s\n", time.Duration(m.IntervalSeconds)*time.Second)
 	fmt.Printf("timeout: %s\n", time.Duration(m.TimeoutSeconds)*time.Second)
@@ -527,4 +485,13 @@ func indentJSON(raw json.RawMessage) string {
 	}
 
 	return out.String()
+}
+
+func deliveryNames(deliveries []routes.Delivery) string {
+	names := make([]string, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		names = append(names, delivery.Route.String())
+	}
+
+	return strings.Join(names, ",")
 }

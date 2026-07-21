@@ -11,11 +11,6 @@ type MonitorName string
 // RouteKind identifies a notification route backend.
 type RouteKind string
 
-const (
-	// RouteKindDiscord sends notifications through Discord webhooks.
-	RouteKindDiscord RouteKind = "discord"
-)
-
 // RouteName identifies a daemon-owned notification route.
 type RouteName string
 
@@ -141,17 +136,17 @@ func (p PoolName) Validate() error {
 	return nil
 }
 
-// Validate checks whether a route kind is supported.
+// Validate checks whether a route kind is safe for storage and route names.
+// Driver registration determines whether the kind is supported at runtime.
 func (k RouteKind) Validate() error {
-	switch k {
-	case RouteKindDiscord:
-		return nil
-	default:
-		return fmt.Errorf("unsupported route kind %q", k)
+	if !validName(string(k)) {
+		return fmt.Errorf("invalid route kind %q", k)
 	}
+
+	return nil
 }
 
-// Validate checks whether a route name has a supported kind and safe target.
+// Validate checks whether a route name has a valid kind and safe target.
 func (n RouteName) Validate() error {
 	kind, target, ok := strings.Cut(string(n), ":")
 	if !ok || kind == "" || target == "" {

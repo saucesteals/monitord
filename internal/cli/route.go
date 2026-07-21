@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/saucesteals/monitord/internal/model"
@@ -38,8 +37,7 @@ func (c *CLI) routeStore() (*storage.Store, error) {
 }
 
 func (c *CLI) newRouteCreateCmd() *cobra.Command {
-	var webhookURL string
-	var mention string
+	var opts routeCreateOptions
 
 	cmd := &cobra.Command{
 		Use:   "create KIND NAME",
@@ -52,24 +50,21 @@ func (c *CLI) newRouteCreateCmd() *cobra.Command {
 			}
 			defer func() { _ = store.Close() }()
 
-			return routeCreate(store, args[0], args[1], webhookURL, mention)
+			return routeCreate(store, args[0], args[1], opts)
 		},
 	}
-	cmd.Flags().StringVar(&webhookURL, "webhook-url", "", "discord webhook URL")
-	cmd.Flags().StringVar(&mention, "mention", "", "who to ping: user:ID, role:ID, here, everyone (comma separated)")
+	cmd.Flags().StringArrayVar(&opts.Options, "option", nil, "route setting as key=value (repeatable)")
+	cmd.Flags().StringArrayVar(&opts.OptionFiles, "option-file", nil, "route setting read from key=path (repeatable)")
 
 	return cmd
 }
 
-func routeCreate(store *storage.Store, rawKind string, rawName string, webhookURL string, mention string) error {
-	if webhookURL == "" {
-		return errors.New("--webhook-url is required")
-	}
-	mentions, err := routes.ParseMentions(mention)
-	if err != nil {
-		return err
-	}
+type routeCreateOptions struct {
+	Options     []string
+	OptionFiles []string
+}
 
+func routeCreate(store *storage.Store, rawKind string, rawName string, opts routeCreateOptions) error {
 	kind, err := model.ParseRouteKind(rawKind)
 	if err != nil {
 		return err
@@ -79,23 +74,35 @@ func routeCreate(store *storage.Store, rawKind string, rawName string, webhookUR
 		return err
 	}
 
-	route := storage.Route{
-		Name:       name,
-		Kind:       kind,
-		Target:     rawName,
-		WebhookURL: webhookURL,
-		Mentions:   mentions,
+	route, err := buildRoute(name, kind, opts)
+	if err != nil {
+		return err
 	}
 	if err := store.UpsertRoute(context.Background(), route); err != nil {
 		return err
 	}
 
-	fmt.Printf("route %s created (%s)\n", route.Name, routes.RedactURL(route.WebhookURL))
-	if len(mentions) > 0 {
-		fmt.Printf("pings %s\n", routes.FormatMentions(mentions))
+	description, err := routes.DescribeRoute(route.Kind, route.Options)
+	if err != nil {
+		return err
 	}
+	fmt.Printf("route %s created\n", route.Name)
+	fmt.Printf("config %s\n", description)
 
 	return nil
+}
+
+func buildRoute(name model.RouteName, kind model.RouteKind, opts routeCreateOptions) (storage.Route, error) {
+	options, err := readRouteOptions(opts.Options, opts.OptionFiles)
+	if err != nil {
+		return storage.Route{}, err
+	}
+	options, err = routes.PrepareRoute(kind, options)
+	if err != nil {
+		return storage.Route{}, err
+	}
+
+	return storage.Route{Name: name, Kind: kind, Options: options}, nil
 }
 
 func (c *CLI) newRouteListCmd() *cobra.Command {
@@ -121,8 +128,11 @@ func routeList(store *storage.Store) error {
 		return err
 	}
 	for _, item := range items {
-		fmt.Printf("%-28s %-8s pings=%-24s %s\n",
-			item.Name, item.Kind, orDash(routes.FormatMentions(item.Mentions)), routes.RedactURL(item.WebhookURL))
+		description, err := routes.DescribeRoute(item.Kind, item.Options)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%-28s %-12s %s\n", item.Name, item.Kind, description)
 	}
 
 	return nil
@@ -154,10 +164,11 @@ func routeTest(store *storage.Store, rawName string) error {
 	if err != nil {
 		return err
 	}
-	if err := routes.SendDiscord(context.Background(), route.WebhookURL, routes.Message{
+	msg := routes.Message{
 		Title:   "monitord route test",
 		Summary: "test notification from monitord",
-	}, route.Mentions); err != nil {
+	}
+	if err := routes.Test(context.Background(), route.Kind, route.Options, msg); err != nil {
 		return err
 	}
 

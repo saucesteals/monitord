@@ -109,7 +109,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 // wait returns how long to sleep before the next scan.
 //
 // Sleeping until the soonest due monitor, rather than on a fixed cadence, is
-// what makes `--every` mean what it says: a fixed ticker rounds every schedule
+// what makes a monitor's `every` interval exact: a fixed ticker rounds schedules
 // up to its own period, so a 5s monitor whose tick takes any time at all misses
 // its slot and waits for the following one.
 //
@@ -181,14 +181,13 @@ func (d *Daemon) dispatch(ctx context.Context, m storage.Monitor) {
 	}()
 }
 
-// notification pairs a rendered message with the route that should receive it.
+// notification pairs a rendered message with the routes that should receive it.
 type notification struct {
-	Route   model.RouteName
-	Message routes.Message
+	Deliveries []routes.Delivery
+	Message    routes.Message
 	// DedupeKey suppresses repeats of the same event within EventDedupeWindow.
 	DedupeKey string
-	// MarkStatus, when set, is recorded as the status the route was told about
-	// once delivery succeeds.
+	// MarkStatus, when set, is recorded once every delivery succeeds.
 	MarkStatus monitor.ResultStatus
 	// Silent records MarkStatus without sending anything, used to seed a
 	// monitor's notified status from its first healthy run.
@@ -435,16 +434,16 @@ func (d *Daemon) notificationsFor(m storage.Monitor, out tickOutput, status moni
 	var notifications []notification
 
 	for _, event := range out.NotifyEvents {
-		route := m.Route
+		deliveries := routes.CloneDeliveries(m.Deliveries)
 		if event.Route != "" {
 			parsed, err := model.ParseRouteName(event.Route.String())
 			if err == nil {
-				route = parsed
+				deliveries = deliveriesForRoute(m.Deliveries, parsed)
 			}
 		}
 		notifications = append(notifications, notification{
-			Route:     route,
-			DedupeKey: event.DedupeKey,
+			Deliveries: deliveries,
+			DedupeKey:  event.DedupeKey,
 			Message: routes.Message{
 				Title:   event.Title,
 				Summary: event.Summary,
@@ -461,8 +460,8 @@ func (d *Daemon) notificationsFor(m storage.Monitor, out tickOutput, status moni
 	// edge-triggering.
 	if out.Result.Notify && status != monitor.StatusFailure {
 		return append(notifications, notification{
-			Route:   m.Route,
-			Message: resultMessage(m, out.Result, status, exitCode, errorText, 0),
+			Deliveries: routes.CloneDeliveries(m.Deliveries),
+			Message:    resultMessage(m, out.Result, status, exitCode, errorText, 0),
 		})
 	}
 	if status == m.NotifiedStatus {
@@ -474,7 +473,6 @@ func (d *Daemon) notificationsFor(m storage.Monitor, out tickOutput, status moni
 	// `monitord list` already shows.
 	if m.NotifiedStatus == "" && status == monitor.StatusSuccess {
 		return append(notifications, notification{
-			Route:      m.Route,
 			MarkStatus: status,
 			Silent:     true,
 		})
@@ -488,10 +486,20 @@ func (d *Daemon) notificationsFor(m storage.Monitor, out tickOutput, status moni
 	}
 
 	return append(notifications, notification{
-		Route:      m.Route,
+		Deliveries: routes.CloneDeliveries(m.Deliveries),
 		Message:    resultMessage(m, out.Result, status, exitCode, errorText, failures),
 		MarkStatus: status,
 	})
+}
+
+func deliveriesForRoute(configured []routes.Delivery, name model.RouteName) []routes.Delivery {
+	for _, delivery := range configured {
+		if delivery.Route == name {
+			return []routes.Delivery{{Route: name, Options: routes.CloneOptions(delivery.Options)}}
+		}
+	}
+
+	return []routes.Delivery{{Route: name, Options: routes.Options{}}}
 }
 
 func resultMessage(m storage.Monitor, result monitor.Result, status monitor.ResultStatus, exitCode int, errorText string, failures int64) routes.Message {
@@ -579,7 +587,7 @@ func (d *Daemon) deliver(m storage.Monitor, notifications []notification) {
 		cancel()
 
 		if err != nil {
-			d.logger.Error("notification failed", "monitor", m.Name, "route", item.Route, "error", err)
+			d.logger.Error("notification failed", "monitor", m.Name, "routes", deliveryNames(item.Deliveries), "error", err)
 			failures = append(failures, err.Error())
 
 			continue
@@ -597,7 +605,7 @@ func (d *Daemon) deliver(m storage.Monitor, notifications []notification) {
 }
 
 // deliverOne sends a single notification, honouring event dedupe keys and
-// recording the status the route was told about.
+// recording the status once every configured route received it.
 func (d *Daemon) deliverOne(ctx context.Context, m storage.Monitor, item notification) error {
 	if item.Silent {
 		return d.store.MarkNotified(ctx, m.Name, item.MarkStatus)
@@ -614,8 +622,26 @@ func (d *Daemon) deliverOne(ctx context.Context, m storage.Monitor, item notific
 		}
 	}
 
-	if err := d.notify(ctx, item.Route, item.Message, m.MentionOverride); err != nil {
-		return err
+	deliveryErrors := make(chan error, len(item.Deliveries))
+	var deliveries sync.WaitGroup
+	for _, delivery := range item.Deliveries {
+		deliveries.Add(1)
+		go func(delivery routes.Delivery) {
+			defer deliveries.Done()
+			if err := d.notify(ctx, delivery, item.Message); err != nil {
+				deliveryErrors <- fmt.Errorf("%s: %w", delivery.Route, err)
+			}
+		}(delivery)
+	}
+	deliveries.Wait()
+	close(deliveryErrors)
+
+	var joined []error
+	for err := range deliveryErrors {
+		joined = append(joined, err)
+	}
+	if len(joined) > 0 {
+		return errors.Join(joined...)
 	}
 	if item.MarkStatus != "" {
 		if err := d.store.MarkNotified(ctx, m.Name, item.MarkStatus); err != nil {
@@ -626,21 +652,20 @@ func (d *Daemon) deliverOne(ctx context.Context, m storage.Monitor, item notific
 	return nil
 }
 
-func (d *Daemon) notify(ctx context.Context, name model.RouteName, msg routes.Message, mentionOverride string) error {
-	route, err := d.store.GetRoute(ctx, name)
-	if err != nil {
-		return err
-	}
-	if route.Kind != model.RouteKindDiscord {
-		return fmt.Errorf("unsupported route kind %q", route.Kind)
-	}
-
-	// The monitor's own override wins, so two monitors sharing one channel can
-	// ping two different people without duplicating the route.
-	mentions, err := routes.ResolveMentions(mentionOverride, route.Mentions)
+func (d *Daemon) notify(ctx context.Context, delivery routes.Delivery, msg routes.Message) error {
+	route, err := d.store.GetRoute(ctx, delivery.Route)
 	if err != nil {
 		return err
 	}
 
-	return routes.SendDiscord(ctx, route.WebhookURL, msg, mentions)
+	return routes.Deliver(ctx, route.Kind, route.Options, delivery.Options, msg)
+}
+
+func deliveryNames(deliveries []routes.Delivery) string {
+	names := make([]string, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		names = append(names, delivery.Route.String())
+	}
+
+	return strings.Join(names, ",")
 }

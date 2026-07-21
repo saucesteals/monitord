@@ -32,14 +32,10 @@ type Store struct {
 
 // Route is a named notification sink.
 type Route struct {
-	ID         int64
-	Name       model.RouteName
-	Kind       model.RouteKind
-	Target     string
-	WebhookURL string
-	// Mentions are pinged whenever this route fires, and are the only
-	// mentions Discord is allowed to honour in the message.
-	Mentions  []routes.Mention
+	ID        int64
+	Name      model.RouteName
+	Kind      model.RouteKind
+	Options   routes.Options
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -71,12 +67,9 @@ type Monitor struct {
 	IntervalSeconds int64
 	TTLSeconds      int64
 	TimeoutSeconds  int64
-	Route           model.RouteName
+	Deliveries      []routes.Delivery
 	ProxyPool       model.PoolName
 	Status          model.MonitorStatus
-	// MentionOverride replaces the route's mentions for this monitor. Empty
-	// inherits the route; "none" pings nobody.
-	MentionOverride string
 
 	CreatedAt *time.Time
 	UpdatedAt *time.Time
@@ -91,7 +84,7 @@ type Monitor struct {
 
 	// LastStatus is the outcome of the most recent completed run.
 	LastStatus monitor.ResultStatus
-	// NotifiedStatus is the status the route was last told about. Notifications
+	// NotifiedStatus is the status all routes were last told about. Notifications
 	// are edge-triggered off this so a broken monitor does not page on every
 	// tick.
 	NotifiedStatus monitor.ResultStatus
@@ -123,10 +116,12 @@ type Run struct {
 }
 
 const monitorColumns = `name, source_dir, artifact_dir, binary_path, definition_json, state_json, state_version, state_revision,
-	interval_seconds, ttl_seconds, timeout_seconds, route, proxy_pool, status, mention_override,
+	interval_seconds, ttl_seconds, timeout_seconds, deliveries_json, proxy_pool, status,
 	created_at, updated_at, expires_at, next_due_at, last_run_at, expired_at,
 	running_run_id, running_started_at, running_expires_at,
 	last_status, notified_status, consecutive_failures, total_runs, total_failures`
+
+const routeColumns = `id, name, kind, config_json, created_at, updated_at`
 
 // Open opens a SQLite store and runs migrations.
 func Open(path string) (*Store, error) {
@@ -168,9 +163,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL UNIQUE,
 			kind TEXT NOT NULL,
-			target TEXT NOT NULL,
-			webhook_url TEXT NOT NULL,
-			mentions TEXT NOT NULL DEFAULT '',
+			config_json TEXT NOT NULL DEFAULT '{}',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
@@ -186,10 +179,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			interval_seconds INTEGER NOT NULL,
 			ttl_seconds INTEGER NOT NULL,
 			timeout_seconds INTEGER NOT NULL,
-			route TEXT NOT NULL,
+			deliveries_json TEXT NOT NULL DEFAULT '[]',
 			proxy_pool TEXT NOT NULL,
 			status TEXT NOT NULL,
-			mention_override TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			expires_at TEXT,
@@ -262,9 +254,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{table: "monitors", name: "consecutive_failures", spec: "INTEGER NOT NULL DEFAULT 0"},
 		{table: "monitors", name: "total_runs", spec: "INTEGER NOT NULL DEFAULT 0"},
 		{table: "monitors", name: "total_failures", spec: "INTEGER NOT NULL DEFAULT 0"},
-		{table: "monitors", name: "mention_override", spec: "TEXT NOT NULL DEFAULT ''"},
 		{table: "monitors", name: "proxy_pool", spec: "TEXT NOT NULL DEFAULT ''"},
-		{table: "routes", name: "mentions", spec: "TEXT NOT NULL DEFAULT ''"},
 		{table: "runs", name: "notification_error", spec: "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range columns {
@@ -363,18 +353,23 @@ func (s *Store) UpsertRoute(ctx context.Context, route Route) error {
 	if err := route.Kind.Validate(); err != nil {
 		return err
 	}
-
+	prepared, err := routes.PrepareRoute(route.Kind, route.Options)
+	if err != nil {
+		return err
+	}
+	route.Options = prepared
+	configJSON, err := encodeOptions(route.Options)
+	if err != nil {
+		return err
+	}
 	now := formatTime(time.Now().UTC())
-	_, err := s.db.ExecContext(ctx, `INSERT INTO routes (name, kind, target, webhook_url, mentions, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO routes (name, kind, config_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			kind = excluded.kind,
-			target = excluded.target,
-			webhook_url = excluded.webhook_url,
-			mentions = excluded.mentions,
+			config_json = excluded.config_json,
 			updated_at = excluded.updated_at`,
-		route.Name.String(), route.Kind.String(), route.Target, route.WebhookURL,
-		routes.FormatMentions(route.Mentions), now, now)
+		route.Name.String(), route.Kind.String(), configJSON, now, now)
 	if err != nil {
 		return fmt.Errorf("upsert route %s: %w", route.Name, err)
 	}
@@ -384,7 +379,7 @@ func (s *Store) UpsertRoute(ctx context.Context, route Route) error {
 
 // ListRoutes returns all notification routes.
 func (s *Store) ListRoutes(ctx context.Context) ([]Route, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, kind, target, webhook_url, mentions, created_at, updated_at FROM routes ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+routeColumns+` FROM routes ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("list routes: %w", err)
 	}
@@ -411,7 +406,7 @@ func (s *Store) GetRoute(ctx context.Context, name model.RouteName) (Route, erro
 		return Route{}, err
 	}
 
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, kind, target, webhook_url, mentions, created_at, updated_at FROM routes WHERE name = ?`, name.String())
+	row := s.db.QueryRowContext(ctx, `SELECT `+routeColumns+` FROM routes WHERE name = ?`, name.String())
 	route, err := scanRoute(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Route{}, fmt.Errorf("route %s not found", name)
@@ -429,8 +424,13 @@ func (s *Store) UpsertMonitor(ctx context.Context, m Monitor) error {
 	if err := m.Name.Validate(); err != nil {
 		return err
 	}
-	if err := m.Route.Validate(); err != nil {
-		return err
+	if len(m.Deliveries) == 0 {
+		return errors.New("monitor requires at least one delivery")
+	}
+	for _, delivery := range m.Deliveries {
+		if err := delivery.Route.Validate(); err != nil {
+			return err
+		}
 	}
 	if err := m.Definition.Validate(); err != nil {
 		return err
@@ -461,11 +461,21 @@ func (s *Store) UpsertMonitor(ctx context.Context, m Monitor) error {
 	if err != nil {
 		return fmt.Errorf("marshal monitor definition: %w", err)
 	}
+	deliveriesJSON, err := json.Marshal(m.Deliveries)
+	if err != nil {
+		return fmt.Errorf("marshal monitor deliveries: %w", err)
+	}
 
 	// A redeploy resets the run claim so a worker from the previous artifact
 	// cannot report against the new one.
 	_, err = s.db.ExecContext(ctx, `INSERT INTO monitors (`+monitorColumns+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', NULL, NULL, '', '', 0, 0, 0)
+		VALUES (
+			?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?,
+			'', NULL, NULL, '', '', 0, 0, 0
+		)
 		ON CONFLICT(name) DO UPDATE SET
 			source_dir = excluded.source_dir,
 			artifact_dir = excluded.artifact_dir,
@@ -477,10 +487,9 @@ func (s *Store) UpsertMonitor(ctx context.Context, m Monitor) error {
 			interval_seconds = excluded.interval_seconds,
 			ttl_seconds = excluded.ttl_seconds,
 			timeout_seconds = excluded.timeout_seconds,
-			route = excluded.route,
+			deliveries_json = excluded.deliveries_json,
 			proxy_pool = excluded.proxy_pool,
 			status = excluded.status,
-			mention_override = excluded.mention_override,
 			updated_at = excluded.updated_at,
 			expires_at = excluded.expires_at,
 			next_due_at = excluded.next_due_at,
@@ -489,7 +498,7 @@ func (s *Store) UpsertMonitor(ctx context.Context, m Monitor) error {
 			running_started_at = NULL,
 			running_expires_at = NULL`,
 		m.Name.String(), m.SourceDir, m.ArtifactDir, m.BinaryPath, string(definitionJSON), string(m.State), m.StateVersion, m.StateRevision,
-		m.IntervalSeconds, m.TTLSeconds, m.TimeoutSeconds, m.Route.String(), m.ProxyPool.String(), m.Status.String(), m.MentionOverride,
+		m.IntervalSeconds, m.TTLSeconds, m.TimeoutSeconds, string(deliveriesJSON), m.ProxyPool.String(), m.Status.String(),
 		formatTimePtr(m.CreatedAt), formatTimePtr(m.UpdatedAt), formatTimePtr(m.ExpiresAt), formatTimePtr(m.NextDueAt),
 		formatTimePtr(m.LastRunAt), formatTimePtr(m.ExpiredAt))
 	if err != nil {
@@ -812,7 +821,7 @@ func (s *Store) UpdateRunNotification(ctx context.Context, runID string, sent bo
 	return nil
 }
 
-// MarkNotified records the status a monitor's route was last told about, so
+// MarkNotified records the status a monitor's routes were last told about, so
 // notifications can be edge-triggered rather than sent on every failing tick.
 func (s *Store) MarkNotified(ctx context.Context, name model.MonitorName, status monitor.ResultStatus) error {
 	if _, err := s.db.ExecContext(ctx, `UPDATE monitors SET notified_status = ? WHERE name = ?`,
@@ -1133,20 +1142,25 @@ type scanner interface {
 
 func scanRoute(row scanner) (Route, error) {
 	var r Route
-	var name, kind, mentions, createdAt, updatedAt string
-	if err := row.Scan(&r.ID, &name, &kind, &r.Target, &r.WebhookURL, &mentions, &createdAt, &updatedAt); err != nil {
+	var name, kind, configJSON, createdAt, updatedAt string
+	if err := row.Scan(&r.ID, &name, &kind, &configJSON, &createdAt, &updatedAt); err != nil {
 		return Route{}, err
 	}
 
 	var err error
-	if r.Mentions, err = routes.ParseMentions(mentions); err != nil {
-		return Route{}, fmt.Errorf("parse mentions for route %s: %w", name, err)
-	}
 	if r.Name, err = model.ParseRouteName(name); err != nil {
 		return Route{}, err
 	}
 	if r.Kind, err = model.ParseRouteKind(kind); err != nil {
 		return Route{}, err
+	}
+	r.Options, err = decodeOptions(configJSON)
+	if err != nil {
+		return Route{}, fmt.Errorf("parse config for route %s: %w", name, err)
+	}
+	r.Options, err = routes.PrepareRoute(r.Kind, r.Options)
+	if err != nil {
+		return Route{}, fmt.Errorf("invalid config for route %s: %w", name, err)
 	}
 	if r.CreatedAt, err = parseTime(createdAt); err != nil {
 		return Route{}, err
@@ -1158,15 +1172,40 @@ func scanRoute(row scanner) (Route, error) {
 	return r, nil
 }
 
+func encodeOptions(options routes.Options) (string, error) {
+	if options == nil {
+		options = routes.Options{}
+	}
+	raw, err := json.Marshal(options)
+	if err != nil {
+		return "", fmt.Errorf("marshal route options: %w", err)
+	}
+
+	return string(raw), nil
+}
+
+func decodeOptions(raw string) (routes.Options, error) {
+	if strings.TrimSpace(raw) == "" {
+		raw = "{}"
+	}
+
+	var options routes.Options
+	if err := json.Unmarshal([]byte(raw), &options); err != nil {
+		return nil, err
+	}
+
+	return routes.CloneOptions(options), nil
+}
+
 func scanMonitor(row scanner) (Monitor, error) {
 	var m Monitor
-	var name, definitionJSON, stateJSON, route, proxyPool, status string
+	var name, definitionJSON, stateJSON, deliveriesJSON, proxyPool, status string
 	var createdAt, updatedAt string
 	var lastStatus, notifiedStatus string
 	var expiresAt, nextDueAt, lastRunAt, expiredAt, runningStartedAt, runningExpiresAt sql.NullString
 
 	err := row.Scan(&name, &m.SourceDir, &m.ArtifactDir, &m.BinaryPath, &definitionJSON, &stateJSON, &m.StateVersion, &m.StateRevision,
-		&m.IntervalSeconds, &m.TTLSeconds, &m.TimeoutSeconds, &route, &proxyPool, &status, &m.MentionOverride,
+		&m.IntervalSeconds, &m.TTLSeconds, &m.TimeoutSeconds, &deliveriesJSON, &proxyPool, &status,
 		&createdAt, &updatedAt, &expiresAt, &nextDueAt, &lastRunAt, &expiredAt,
 		&m.RunningRunID, &runningStartedAt, &runningExpiresAt,
 		&lastStatus, &notifiedStatus, &m.ConsecutiveFailures, &m.TotalRuns, &m.TotalFailures)
@@ -1187,8 +1226,17 @@ func scanMonitor(row scanner) (Monitor, error) {
 		return Monitor{}, fmt.Errorf("invalid monitor definition for %s: %w", m.Name, err)
 	}
 	m.State = json.RawMessage(stateJSON)
-	if m.Route, err = model.ParseRouteName(route); err != nil {
-		return Monitor{}, err
+	if err := json.Unmarshal([]byte(deliveriesJSON), &m.Deliveries); err != nil {
+		return Monitor{}, fmt.Errorf("parse deliveries for monitor %s: %w", m.Name, err)
+	}
+	if len(m.Deliveries) == 0 {
+		return Monitor{}, fmt.Errorf("monitor %s has no deliveries", m.Name)
+	}
+	for index := range m.Deliveries {
+		if err := m.Deliveries[index].Route.Validate(); err != nil {
+			return Monitor{}, fmt.Errorf("invalid delivery for monitor %s: %w", m.Name, err)
+		}
+		m.Deliveries[index].Options = routes.CloneOptions(m.Deliveries[index].Options)
 	}
 	if m.ProxyPool, err = model.ParsePoolName(proxyPool); err != nil {
 		return Monitor{}, err

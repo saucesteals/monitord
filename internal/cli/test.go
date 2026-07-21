@@ -16,6 +16,7 @@ import (
 	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/model"
 	"github.com/saucesteals/monitord/internal/monitor"
+	"github.com/saucesteals/monitord/internal/routes"
 	"github.com/spf13/cobra"
 )
 
@@ -24,7 +25,6 @@ import (
 // Nothing is written to the schedule and no notification is sent; state changes
 // are shown as a diff instead of being saved. This is the authoring loop.
 func (c *CLI) newTestCmd() *cobra.Command {
-	var timeout time.Duration
 	var useStored bool
 
 	cmd := &cobra.Command{
@@ -32,16 +32,15 @@ func (c *CLI) newTestCmd() *cobra.Command {
 		Short: "Build and run one monitor tick locally",
 		Args:  exactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return c.test(args[0], timeout, useStored)
+			return c.test(args[0], useStored)
 		},
 	}
-	cmd.Flags().DurationVar(&timeout, "timeout", 60*time.Second, "tick timeout")
 	cmd.Flags().BoolVar(&useStored, "stored-state", false, "start from the deployed monitor's stored state")
 
 	return cmd
 }
 
-func (c *CLI) test(target string, timeout time.Duration, useStored bool) error {
+func (c *CLI) test(target string, useStored bool) error {
 	paths, err := config.Init(c.root)
 	if err != nil {
 		return err
@@ -50,8 +49,12 @@ func (c *CLI) test(target string, timeout time.Duration, useStored bool) error {
 	if err != nil {
 		return err
 	}
+	monitorConfig, err := monitor.LoadConfig(dir)
+	if err != nil {
+		return err
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout+30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), monitorConfig.Timeout+30*time.Second)
 	defer cancel()
 
 	// Build to a temp dir so a test never disturbs deployed artifacts.
@@ -80,6 +83,10 @@ func (c *CLI) test(target string, timeout time.Duration, useStored bool) error {
 		return err
 	}
 	def := described.Definition.WithDefaults()
+	def.Name = name.String()
+	def.Description = monitorConfig.Description
+	def.Clients = monitorConfig.Clients
+	def.Persistent = monitorConfig.Persistent
 	before := described.State
 
 	if useStored {
@@ -100,7 +107,7 @@ func (c *CLI) test(target string, timeout time.Duration, useStored bool) error {
 	fmt.Printf("monitor  %s (clients %d, state v%d)\n", name, def.Clients, def.StateVersion)
 	fmt.Printf("state in %s\n\n", compactJSON(before))
 
-	after, status, err := runOneTick(ctx, binaryPath, dir, name, def, before, timeout)
+	after, status, err := runOneTick(ctx, binaryPath, dir, name, before, monitorConfig)
 	if err != nil {
 		return err
 	}
@@ -122,9 +129,8 @@ func runOneTick(
 	binaryPath string,
 	dir string,
 	name model.MonitorName,
-	def monitord.Definition,
 	state json.RawMessage,
-	timeout time.Duration,
+	config monitor.Config,
 ) (json.RawMessage, monitord.ResultStatus, error) {
 	cmd := exec.CommandContext(ctx, binaryPath, monitord.FlagWorker)
 	cmd.Dir = dir
@@ -159,7 +165,7 @@ func runOneTick(
 		Type: monitord.InboundHello,
 		Hello: &monitord.Hello{
 			Monitor: monitord.MonitorName(name.String()),
-			Route:   "discord:test",
+			Routes:  testRouteNames(config.Deliveries),
 			Dir:     dir,
 			Network: monitord.Network{},
 		},
@@ -173,7 +179,7 @@ func runOneTick(
 		Tick: &monitord.Tick{
 			RunID:     "test",
 			StartedAt: started,
-			Deadline:  started.Add(timeout),
+			Deadline:  started.Add(config.Timeout),
 			State:     state,
 		},
 	}); err != nil {
@@ -212,7 +218,7 @@ func runOneTick(
 				fmt.Println(indent(msg.Result.Details))
 			}
 			if msg.Result.Notify {
-				fmt.Println("would notify the route")
+				fmt.Printf("would notify %d route(s)\n", len(config.Deliveries))
 			}
 
 			out := msg.Result.State
@@ -228,6 +234,15 @@ func runOneTick(
 	}
 
 	return nil, "", fmt.Errorf("monitor exited without reporting a result")
+}
+
+func testRouteNames(deliveries []routes.Delivery) []monitord.RouteName {
+	names := make([]monitord.RouteName, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		names = append(names, monitord.RouteName(delivery.Route.String()))
+	}
+
+	return names
 }
 
 func compactJSON(raw json.RawMessage) string {

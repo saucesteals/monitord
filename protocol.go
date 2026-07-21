@@ -9,7 +9,7 @@ import (
 
 // Protocol is the monitord worker wire version. The daemon refuses artifacts
 // built against a different version.
-const Protocol = 1
+const Protocol = 2
 
 // Executable flags implementing the monitord worker contract.
 const (
@@ -86,7 +86,7 @@ type Network struct {
 // Hello is the first message the daemon sends to a worker.
 type Hello struct {
 	Monitor MonitorName `json:"monitor"`
-	Route   RouteName   `json:"route"`
+	Routes  []RouteName `json:"routes"`
 	// Dir is the monitor's source directory and working directory, so a
 	// monitor can read config or data files that live beside its source.
 	Dir     string  `json:"dir,omitempty"`
@@ -288,8 +288,13 @@ func (h Hello) Validate() error {
 	if h.Monitor == "" {
 		return errors.New("hello monitor name is required")
 	}
-	if h.Route == "" {
-		return errors.New("hello route is required")
+	if len(h.Routes) == 0 {
+		return errors.New("hello requires at least one route")
+	}
+	for _, route := range h.Routes {
+		if route == "" {
+			return errors.New("hello routes must not be empty")
+		}
 	}
 
 	return nil
