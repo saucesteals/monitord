@@ -4,9 +4,7 @@ package daemon
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -14,7 +12,6 @@ import (
 	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/model"
 	"github.com/saucesteals/monitord/internal/network"
-	"github.com/saucesteals/monitord/internal/routes"
 	"github.com/saucesteals/monitord/internal/storage"
 )
 
@@ -26,8 +23,17 @@ const (
 	notifyTimeout      = 10 * time.Second
 	recordTimeout      = 10 * time.Second
 
-	// EventDedupeWindow is how long an event's dedupe key suppresses repeats.
+	// EventDedupeWindow is how long an event's ID suppresses repeats.
 	EventDedupeWindow = time.Hour
+
+	// maxEventsPerTick is the default cap on how many events one tick may
+	// deliver, used when a monitor sets no max_events. Emission order wins: the
+	// first N send, the rest are dropped and logged. An unbounded stream would
+	// let one bad tick flood a route.
+	maxEventsPerTick = 20
+	// maxEventConcurrency bounds in-flight event deliveries per tick, keeping
+	// bursts from tripping a webhook's rate limit.
+	maxEventConcurrency = 5
 
 	// minWait keeps the scheduler from spinning when a monitor is due now or
 	// slightly overdue.
@@ -171,167 +177,10 @@ func (d *Daemon) dispatch(ctx context.Context, m storage.Monitor) {
 			d.wg.Done()
 		}()
 
-		notifications, err := d.runTick(ctx, m)
-		if err != nil {
+		if err := d.runTick(ctx, m); err != nil {
 			d.logger.Error("monitor run failed", "monitor", m.Name, "error", err)
 		}
-		if len(notifications) > 0 {
-			d.deliver(m, notifications)
-		}
 	}()
-}
-
-// notification pairs a rendered message with the routes that should receive it.
-type notification struct {
-	Deliveries []routes.Delivery
-	Message    routes.Message
-	// DedupeKey suppresses repeats of the same event within EventDedupeWindow.
-	DedupeKey string
-	// MarkStatus, when set, is recorded once every delivery succeeds.
-	MarkStatus monitor.ResultStatus
-	// Silent records MarkStatus without sending anything, used to seed a
-	// monitor's notified status from its first healthy run.
-	Silent bool
-}
-
-// runTick executes one claimed run and records its outcome.
-func (d *Daemon) runTick(ctx context.Context, m storage.Monitor) ([]notification, error) {
-	if m.RunningRunID == "" {
-		return nil, fmt.Errorf("monitor %s has no run claim", m.Name)
-	}
-
-	started := time.Now().UTC()
-	timeout := time.Duration(m.TimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = defaultTimeout
-	}
-
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	w, err := d.worker(ctx, m)
-	if err != nil {
-		return d.recordFailure(m, started, fmt.Sprintf("start monitor worker: %v", err))
-	}
-
-	out, tickErr := w.tick(runCtx, d.logger, m, monitor.Tick{
-		RunID:     m.RunningRunID,
-		StartedAt: started,
-		Deadline:  started.Add(timeout),
-		State:     m.State,
-		Revision:  m.StateRevision,
-	})
-
-	stderr := ""
-	if tickErr != nil {
-		// A tick that failed at the transport level leaves the worker in an
-		// unknown state, so it is replaced rather than reused.
-		stderr = w.stderr.String()
-		d.dropWorker(m.Name, w)
-	}
-
-	finished := time.Now().UTC()
-	status, exitCode, errorText := classify(out, tickErr)
-
-	record := storage.Run{
-		ID:            m.RunningRunID,
-		MonitorName:   m.Name,
-		StartedAt:     started,
-		FinishedAt:    finished,
-		Status:        status,
-		ExitCode:      exitCode,
-		Stdout:        out.Stdout,
-		Stderr:        stderr,
-		Error:         errorText,
-		State:         out.Result.State,
-		StateRevision: m.StateRevision,
-	}
-
-	nextDue := nextDueAfter(started, time.Duration(m.IntervalSeconds)*time.Second, finished)
-	if err := d.record(record, nextDue); err != nil {
-		// A state conflict means an external edit won; the run itself stands.
-		if !errors.Is(err, storage.ErrStateConflict) {
-			return nil, err
-		}
-		d.logger.Warn("monitor state edited during run, keeping external value", "monitor", m.Name, "run", record.ID)
-	}
-
-	d.logger.Info("monitor tick complete",
-		"monitor", m.Name,
-		"status", status,
-		"next_due", nextDue,
-	)
-
-	return d.notificationsFor(m, out, status, exitCode, errorText), nil
-}
-
-// recordFailure stores a run that never reached the worker, so a monitor that
-// cannot start still reports and reschedules instead of leaking its lease.
-func (d *Daemon) recordFailure(m storage.Monitor, started time.Time, errorText string) ([]notification, error) {
-	finished := time.Now().UTC()
-	record := storage.Run{
-		ID:          m.RunningRunID,
-		MonitorName: m.Name,
-		StartedAt:   started,
-		FinishedAt:  finished,
-		Status:      monitor.StatusFailure,
-		ExitCode:    -1,
-		Error:       errorText,
-	}
-
-	nextDue := nextDueAfter(started, time.Duration(m.IntervalSeconds)*time.Second, finished)
-	if err := d.record(record, nextDue); err != nil && !errors.Is(err, storage.ErrStateConflict) {
-		return nil, err
-	}
-
-	out := tickOutput{
-		Result: monitor.Result{
-			Status:  monitor.StatusFailure,
-			Summary: errorText,
-			Notify:  true,
-		},
-	}
-
-	return d.notificationsFor(m, out, monitor.StatusFailure, -1, errorText), errors.New(errorText)
-}
-
-// nextDueAfter schedules the following tick relative to when this one started,
-// so the cadence does not drift by however long each tick takes. A tick that
-// overruns its interval skips whole periods rather than running back to back.
-func nextDueAfter(started time.Time, interval time.Duration, now time.Time) time.Time {
-	if interval <= 0 {
-		interval = time.Second
-	}
-
-	next := started.Add(interval)
-	if next.After(now) {
-		return next
-	}
-
-	missed := now.Sub(started) / interval
-
-	return started.Add((missed + 1) * interval)
-}
-
-// classify folds the tick result and any transport error into a final status.
-func classify(out tickOutput, tickErr error) (monitor.ResultStatus, int, string) {
-	var problems []string
-	exitCode := 0
-
-	if tickErr != nil {
-		problems = append(problems, tickErr.Error())
-		exitCode = -1
-	}
-	if out.Result.Status == "" {
-		problems = append(problems, "worker did not report a result")
-	}
-
-	status := out.Result.Status
-	if status == "" || len(problems) > 0 {
-		status = monitor.StatusFailure
-	}
-
-	return status, exitCode, strings.Join(problems, "; ")
 }
 
 // worker returns the live worker for a monitor, starting one if the current
@@ -422,250 +271,4 @@ func (d *Daemon) record(run storage.Run, nextDue time.Time) error {
 	defer cancel()
 
 	return d.store.RecordRun(ctx, run, nextDue)
-}
-
-// notificationsFor decides what a completed tick should send.
-//
-// Result notifications are edge-triggered: a monitor pages when it first fails
-// and again when it recovers, not on every failing tick. Without this a monitor
-// that is down on a 30s interval would send 120 messages an hour. Events are
-// deduplicated separately, by key, in deliver.
-func (d *Daemon) notificationsFor(m storage.Monitor, out tickOutput, status monitor.ResultStatus, exitCode int, errorText string) []notification {
-	var notifications []notification
-
-	for _, event := range out.NotifyEvents {
-		deliveries := routes.CloneDeliveries(m.Deliveries)
-		if event.Route != "" {
-			parsed, err := model.ParseRouteName(event.Route.String())
-			if err == nil {
-				deliveries = deliveriesForRoute(m.Deliveries, parsed)
-			}
-		}
-		notifications = append(notifications, notification{
-			Deliveries: deliveries,
-			DedupeKey:  event.DedupeKey,
-			Message: routes.Message{
-				Title:   event.Title,
-				Summary: event.Summary,
-				Details: strings.TrimSpace(event.Details),
-				URL:     event.URL,
-				Level:   eventLevel(event.Severity),
-				Fields:  toFields(event.Fields),
-				Footer:  m.Name.String(),
-			},
-		})
-	}
-
-	// Result.Notify is an explicit request from the monitor, so it bypasses
-	// edge-triggering.
-	if out.Result.Notify && status != monitor.StatusFailure {
-		return append(notifications, notification{
-			Deliveries: routes.CloneDeliveries(m.Deliveries),
-			Message:    resultMessage(m, out.Result, status, exitCode, errorText, 0),
-		})
-	}
-	if status == m.NotifiedStatus {
-		return notifications
-	}
-
-	// A monitor's first observation is only worth reporting if it is bad.
-	// Otherwise deploying ten monitors would announce ten successes, which
-	// `monitord list` already shows.
-	if m.NotifiedStatus == "" && status == monitor.StatusSuccess {
-		return append(notifications, notification{
-			MarkStatus: status,
-			Silent:     true,
-		})
-	}
-
-	// consecutive_failures was already incremented for this run when it was
-	// recorded, so it counts this failure too.
-	failures := m.ConsecutiveFailures + 1
-	if status == monitor.StatusSuccess {
-		failures = 0
-	}
-
-	return append(notifications, notification{
-		Deliveries: routes.CloneDeliveries(m.Deliveries),
-		Message:    resultMessage(m, out.Result, status, exitCode, errorText, failures),
-		MarkStatus: status,
-	})
-}
-
-func deliveriesForRoute(configured []routes.Delivery, name model.RouteName) []routes.Delivery {
-	for _, delivery := range configured {
-		if delivery.Route == name {
-			return []routes.Delivery{{Route: name, Options: routes.CloneOptions(delivery.Options)}}
-		}
-	}
-
-	return []routes.Delivery{{Route: name, Options: routes.Options{}}}
-}
-
-func resultMessage(m storage.Monitor, result monitor.Result, status monitor.ResultStatus, exitCode int, errorText string, failures int64) routes.Message {
-	summary := result.Summary
-	if summary == "" {
-		summary = errorText
-	}
-	if summary == "" {
-		summary = fmt.Sprintf("exit code %d", exitCode)
-	}
-
-	// Three shapes read very differently, so each gets its own headline. A
-	// monitor.Alert is "the thing you asked about happened", not a health
-	// report, so it leads with the monitor name rather than a status word.
-	var (
-		title = m.Name.String()
-		level = routes.LevelInfo
-	)
-	switch {
-	case status == monitor.StatusFailure:
-		title = fmt.Sprintf("%s failed", m.Name)
-		level = routes.LevelFailure
-	case m.NotifiedStatus == monitor.StatusFailure:
-		title = fmt.Sprintf("%s recovered", m.Name)
-		level = routes.LevelSuccess
-	}
-
-	fields := toFields(result.Fields)
-	if failures > 1 {
-		fields = append(fields, routes.Field{
-			Name:   "Consecutive failures",
-			Value:  fmt.Sprintf("%d", failures),
-			Inline: true,
-		})
-	}
-
-	return routes.Message{
-		Title:   title,
-		Summary: summary,
-		Details: strings.TrimSpace(result.Details),
-		URL:     result.URL,
-		Level:   level,
-		Fields:  fields,
-		Footer:  m.Name.String(),
-	}
-}
-
-// toFields converts monitor-declared fields to their route representation.
-func toFields(fields []monitor.Field) []routes.Field {
-	if len(fields) == 0 {
-		return nil
-	}
-
-	out := make([]routes.Field, 0, len(fields))
-	for _, field := range fields {
-		out = append(out, routes.Field{
-			Name:   field.Name,
-			Value:  field.Value,
-			Inline: field.Inline,
-		})
-	}
-
-	return out
-}
-
-// eventLevel maps a monitor event severity to a notification accent.
-func eventLevel(severity monitor.Severity) routes.Level {
-	switch severity {
-	case monitor.SeverityCritical:
-		return routes.LevelCritical
-	case monitor.SeverityWarn:
-		return routes.LevelWarn
-	default:
-		return routes.LevelInfo
-	}
-}
-
-func (d *Daemon) deliver(m storage.Monitor, notifications []notification) {
-	sent := false
-	var failures []string
-
-	for _, item := range notifications {
-		ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
-		err := d.deliverOne(ctx, m, item)
-		cancel()
-
-		if err != nil {
-			d.logger.Error("notification failed", "monitor", m.Name, "routes", deliveryNames(item.Deliveries), "error", err)
-			failures = append(failures, err.Error())
-
-			continue
-		}
-		if !item.Silent {
-			sent = true
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
-	defer cancel()
-	if err := d.store.UpdateRunNotification(ctx, m.RunningRunID, sent, strings.Join(failures, "; ")); err != nil {
-		d.logger.Error("notification state update failed", "monitor", m.Name, "run", m.RunningRunID, "error", err)
-	}
-}
-
-// deliverOne sends a single notification, honouring event dedupe keys and
-// recording the status once every configured route received it.
-func (d *Daemon) deliverOne(ctx context.Context, m storage.Monitor, item notification) error {
-	if item.Silent {
-		return d.store.MarkNotified(ctx, m.Name, item.MarkStatus)
-	}
-	if item.DedupeKey != "" {
-		send, err := d.store.ShouldSendEvent(ctx, m.Name, item.DedupeKey, time.Now().UTC(), EventDedupeWindow)
-		if err != nil {
-			return err
-		}
-		if !send {
-			d.logger.Debug("event suppressed by dedupe key", "monitor", m.Name, "key", item.DedupeKey)
-
-			return nil
-		}
-	}
-
-	deliveryErrors := make(chan error, len(item.Deliveries))
-	var deliveries sync.WaitGroup
-	for _, delivery := range item.Deliveries {
-		deliveries.Add(1)
-		go func(delivery routes.Delivery) {
-			defer deliveries.Done()
-			if err := d.notify(ctx, delivery, item.Message); err != nil {
-				deliveryErrors <- fmt.Errorf("%s: %w", delivery.Route, err)
-			}
-		}(delivery)
-	}
-	deliveries.Wait()
-	close(deliveryErrors)
-
-	var joined []error
-	for err := range deliveryErrors {
-		joined = append(joined, err)
-	}
-	if len(joined) > 0 {
-		return errors.Join(joined...)
-	}
-	if item.MarkStatus != "" {
-		if err := d.store.MarkNotified(ctx, m.Name, item.MarkStatus); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (d *Daemon) notify(ctx context.Context, delivery routes.Delivery, msg routes.Message) error {
-	route, err := d.store.GetRoute(ctx, delivery.Route)
-	if err != nil {
-		return err
-	}
-
-	return routes.Deliver(ctx, route.Kind, route.Options, delivery.Options, msg)
-}
-
-func deliveryNames(deliveries []routes.Delivery) string {
-	names := make([]string, 0, len(deliveries))
-	for _, delivery := range deliveries {
-		names = append(names, delivery.Route.String())
-	}
-
-	return strings.Join(names, ",")
 }

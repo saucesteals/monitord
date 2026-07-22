@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/saucesteals/monitord/internal/model"
 )
@@ -43,15 +44,29 @@ type Field struct {
 	Inline bool
 }
 
+// Author is the attribution line above a message title.
+type Author struct {
+	Name    string
+	URL     string
+	IconURL string
+}
+
 // Message is a route-neutral monitor notification.
 type Message struct {
-	Title   string
-	Summary string
-	Details string
-	URL     string
-	Level   Level
-	Fields  []Field
-	Footer  string
+	Title      string
+	Summary    string
+	Details    string
+	URL        string
+	Image      string
+	Thumbnail  string
+	Author     Author
+	Level      Level
+	Color      int // explicit accent as 0xRRGGBB; zero derives from Level
+	Fields     []Field
+	Footer     string
+	FooterIcon string
+	// Time is the notification timestamp. Zero means "now" at render.
+	Time time.Time
 }
 
 // Driver owns validation, display, and delivery for one route kind.

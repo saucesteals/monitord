@@ -9,7 +9,10 @@ import (
 
 // Protocol is the monitord worker wire version. The daemon refuses artifacts
 // built against a different version.
-const Protocol = 2
+//
+// v3 replaced the result-attached alert and the separate event stream with a
+// single immediately-delivered Event, so v2 artifacts must be redeployed.
+const Protocol = 3
 
 // Executable flags implementing the monitord worker contract.
 const (
@@ -128,7 +131,7 @@ const (
 	OutboundReady OutboundType = "ready"
 	// OutboundLog carries an incremental structured log line.
 	OutboundLog OutboundType = "log"
-	// OutboundEvent carries an observation that may notify a route.
+	// OutboundEvent carries a notification event to deliver immediately.
 	OutboundEvent OutboundType = "event"
 	// OutboundResult carries the final result for one tick.
 	OutboundResult OutboundType = "result"
@@ -154,32 +157,47 @@ type Field struct {
 	Inline bool `json:"inline,omitempty"`
 }
 
-// Event is a monitor observation that may be routed as a notification.
+// Author is the small attribution line rendered above an event's title.
+type Author struct {
+	Name    string `json:"name,omitempty"`
+	URL     string `json:"url,omitempty"`
+	IconURL string `json:"icon_url,omitempty"`
+}
+
+// Event is one notification a monitor emits during a tick. It maps directly onto
+// a Discord embed and is delivered on its own the moment it is emitted,
+// independent of the tick's final result. Build it as a plain struct literal.
 type Event struct {
-	Severity  Severity  `json:"severity"`
-	Title     string    `json:"title"`
-	Summary   string    `json:"summary,omitempty"`
-	Details   string    `json:"details,omitempty"`
-	DedupeKey string    `json:"dedupe_key,omitempty"`
-	Route     RouteName `json:"route,omitempty"`
-	Notify    bool      `json:"notify,omitempty"`
-	// URL makes the notification title a link.
-	URL string `json:"url,omitempty"`
-	// Fields are labelled values rendered beside the message.
+	// ID is the event's stable identity. Repeats of the same ID are suppressed
+	// for the dedupe window; an empty ID always sends.
+	ID string `json:"id,omitempty"`
+	// Severity is a shortcut for the accent colour. Color overrides it.
+	Severity Severity `json:"severity,omitempty"`
+	// Color is an explicit accent as 0xRRGGBB. Zero derives it from severity.
+	Color     int    `json:"color,omitempty"`
+	Title     string `json:"title"`
+	Summary   string `json:"summary,omitempty"`
+	Details   string `json:"details,omitempty"`
+	URL       string `json:"url,omitempty"`
+	Image     string `json:"image,omitempty"`
+	Thumbnail string `json:"thumbnail,omitempty"`
+	Author    Author `json:"author,omitempty"`
+	Footer    string `json:"footer,omitempty"`
+	// FooterIcon is a small icon shown beside the footer text.
+	FooterIcon string `json:"footer_icon,omitempty"`
+	// Fields are labelled values rendered beside the event.
 	Fields []Field   `json:"fields,omitempty"`
 	Time   time.Time `json:"time"`
 }
 
-// Result is the final outcome of one monitor tick.
+// Result is the health verdict for one monitor tick. Notifications are emitted
+// as events during the tick; the result only reports whether the check ran and
+// whether the watched thing is healthy. The daemon pages on failure and
+// recovery from the status alone.
 type Result struct {
 	Status  ResultStatus `json:"status"`
 	Summary string       `json:"summary,omitempty"`
 	Details string       `json:"details,omitempty"`
-	Notify  bool         `json:"notify,omitempty"`
-	// URL makes the notification title a link.
-	URL string `json:"url,omitempty"`
-	// Fields are labelled values rendered beside the message.
-	Fields []Field `json:"fields,omitempty"`
 	// State is the monitor state after this tick, set by the SDK when the
 	// monitor saved state. Nil means unchanged.
 	State json.RawMessage `json:"state,omitempty"`
@@ -217,12 +235,11 @@ func Success(summary string) Result {
 	}
 }
 
-// Failure returns a failed result, which always notifies.
+// Failure returns a failed result. The daemon pages on the failure edge.
 func Failure(summary string) Result {
 	return Result{
 		Status:  StatusFailure,
 		Summary: summary,
-		Notify:  true,
 	}
 }
 
@@ -234,29 +251,6 @@ func Failuref(format string, args ...any) Result {
 // Successf returns a successful result using a formatted summary.
 func Successf(format string, args ...any) Result {
 	return Success(fmt.Sprintf(format, args...))
-}
-
-// WithURL returns r with a link attached to its title.
-func (r Result) WithURL(url string) Result {
-	r.URL = url
-
-	return r
-}
-
-// WithField returns r with one more labelled value attached.
-func (r Result) WithField(name string, value string, inline bool) Result {
-	r.Fields = append(r.Fields, Field{Name: name, Value: value, Inline: inline})
-
-	return r
-}
-
-// Alert returns a successful result that notifies anyway.
-func Alert(summary string) Result {
-	return Result{
-		Status:  StatusSuccess,
-		Summary: summary,
-		Notify:  true,
-	}
 }
 
 // WithDefaults returns d with zero-value protocol fields filled in.
@@ -376,13 +370,13 @@ func (l Log) Validate() error {
 	return nil
 }
 
-// Validate reports whether the event is usable.
-func (e Event) Validate() error {
-	if err := e.Severity.Validate(); err != nil {
-		return err
-	}
-	if e.Title == "" {
-		return errors.New("event title is required")
+// Validate checks only the structural wire fields. Content problems — a blank
+// title, an empty field, a malformed URL — are not rejected here: the renderer
+// substitutes a visible per-field fallback so a broken event still delivers and
+// flags itself inline rather than vanishing.
+func (i Event) Validate() error {
+	if i.Severity != "" {
+		return i.Severity.Validate()
 	}
 
 	return nil

@@ -26,8 +26,11 @@ type Config struct {
 	TTL         time.Duration
 	Timeout     time.Duration
 	Persistent  bool
-	ProxyPool   model.PoolName
-	Deliveries  []routes.Delivery
+	// MaxEvents caps how many events one tick may deliver. Zero means the
+	// daemon default.
+	MaxEvents  int
+	ProxyPool  model.PoolName
+	Deliveries []routes.Delivery
 }
 
 type fileConfig struct {
@@ -37,6 +40,7 @@ type fileConfig struct {
 	TTL         string      `yaml:"ttl"`
 	Timeout     string      `yaml:"timeout"`
 	Persistent  bool        `yaml:"persistent"`
+	MaxEvents   int         `yaml:"max_events"`
 	Proxies     string      `yaml:"proxies"`
 	Routes      []fileRoute `yaml:"routes"`
 }
@@ -85,6 +89,10 @@ func (raw fileConfig) validate() (Config, error) {
 	}
 	if clients < 0 {
 		return Config{}, errors.New("clients must be positive")
+	}
+
+	if raw.MaxEvents < 0 {
+		return Config{}, errors.New("max_events cannot be negative")
 	}
 
 	every, err := requiredDuration("every", raw.Every)
@@ -145,6 +153,7 @@ func (raw fileConfig) validate() (Config, error) {
 		TTL:         ttl,
 		Timeout:     timeout,
 		Persistent:  raw.Persistent,
+		MaxEvents:   raw.MaxEvents,
 		ProxyPool:   proxyPool,
 		Deliveries:  deliveries,
 	}, nil

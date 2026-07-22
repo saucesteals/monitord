@@ -54,7 +54,7 @@ func (c *CLI) runs(rawName string, limit int, runID string, failed bool) error {
 	if err != nil {
 		return err
 	}
-	items, err := store.ListRuns(ctx, name, limit)
+	events, err := store.ListRuns(ctx, name, limit)
 	if err != nil {
 		return err
 	}
@@ -70,7 +70,7 @@ func (c *CLI) runs(rawName string, limit int, runID string, failed bool) error {
 	}
 	fmt.Println()
 
-	for _, run := range items {
+	for _, run := range events {
 		if failed && run.Status != monitor.StatusFailure {
 			continue
 		}

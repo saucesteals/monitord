@@ -209,16 +209,17 @@ func runOneTick(
 			fmt.Printf("[%s] %s\n", msg.Log.Level, msg.Log.Message)
 		case monitord.OutboundEvent:
 			fmt.Printf("[event/%s] %s: %s\n", msg.Event.Severity, msg.Event.Title, msg.Event.Summary)
-			if msg.Event.DedupeKey != "" {
-				fmt.Printf("          dedupe_key=%s\n", msg.Event.DedupeKey)
+			if msg.Event.ID != "" {
+				fmt.Printf("          id=%s\n", msg.Event.ID)
 			}
+			fmt.Printf("          would deliver to %d route(s)\n", len(config.Deliveries))
 		case monitord.OutboundResult:
 			fmt.Printf("\n[result] %s: %s\n", msg.Result.Status, msg.Result.Summary)
 			if msg.Result.Details != "" {
 				fmt.Println(indent(msg.Result.Details))
 			}
-			if msg.Result.Notify {
-				fmt.Printf("would notify %d route(s)\n", len(config.Deliveries))
+			if msg.Result.Status == monitord.StatusFailure {
+				fmt.Printf("would page %d route(s) on the failure edge\n", len(config.Deliveries))
 			}
 
 			out := msg.Result.State

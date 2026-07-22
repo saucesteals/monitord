@@ -32,7 +32,7 @@ Use it when cron is too stateless and a full job platform is too much.
 
 ## Code
 
-Monitors are ordinary Go programs. The daemon provides typed state and a managed HTTP client; the monitor returns `Success`, `Failure`, or `Alert`.
+Monitors are ordinary Go programs. The daemon provides typed state and a managed HTTP client. A tick returns a health `Result` (`Success` or `Failure`) and emits notification `Event`s along the way.
 
 ```go
 type State struct {
@@ -52,8 +52,11 @@ func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
 	r.Save()
 
 	if inStock && !wasInStock {
-		return monitord.Alert("back in stock").
-			WithURL("https://example.com/product")
+		r.Emit(monitord.Event{
+			ID:    "instock",
+			Title: "back in stock",
+			URL:   "https://example.com/product",
+		})
 	}
 
 	return monitord.Success("unchanged")
@@ -77,15 +80,21 @@ routes:
       prompt: Reserve the item when it comes back in stock.
 ```
 
-Discord messages are embeds. Add fields when the alert should be useful without opening logs:
+Events render as Discord embeds. Add fields and an image when the notification should be useful without opening the listing:
 
 ```go
-return monitord.Alert("back in stock").
-	WithURL("https://example.com/product").
-	WithField("Product", "Everyday Hoodie", true).
-	WithField("Size", "Medium", true).
-	WithField("Price", "$68", true).
-	WithField("Signal", "page contains `In Stock`", false)
+r.Emit(monitord.Event{
+	ID:    "instock",
+	Title: "back in stock",
+	URL:   "https://example.com/product",
+	Image: "https://example.com/product.jpg",
+	Fields: []monitord.Field{
+		{Name: "Product", Value: "Everyday Hoodie", Inline: true},
+		{Name: "Size", Value: "Medium", Inline: true},
+		{Name: "Price", Value: "$68", Inline: true},
+		{Name: "Signal", Value: "page contains `In Stock`"},
+	},
+})
 ```
 
 ## CLI
@@ -145,7 +154,7 @@ monitord state clear restock-alert
 
 ## Notifications
 
-`Failure` notifications are edge-triggered: one message when a monitor starts failing and one when it recovers. `Alert` sends every time it is returned, which is the right fit for healthy checks that found something interesting.
+`Failure` notifications are edge-triggered from the result status: one message when a monitor starts failing and one when it recovers. Everything else is an `Event` — emitted with `r.Emit`, delivered immediately, one embed each. Give a repeating event a dedupe key to suppress it for an hour; without a key it always sends.
 
 Routes are local labels for notification backends:
 

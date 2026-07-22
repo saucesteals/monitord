@@ -301,9 +301,9 @@ func (r *Run[S]) Logf(level LogLevel, format string, args ...any) {
 	r.Log(level, fmt.Sprintf(format, args...))
 }
 
-// Event emits a monitor observation. Warn and critical events notify the
-// monitor's route by default.
-func (r *Run[S]) Event(event Event) {
+// Emit sends one notification event to the monitor's routes. Events are delivered
+// immediately, in the order emitted, independent of the tick's final result.
+func (r *Run[S]) Emit(event Event) {
 	_ = r.stream.event(event)
 }
 

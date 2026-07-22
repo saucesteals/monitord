@@ -109,6 +109,7 @@ func Build(ctx context.Context, paths config.Paths, req Request) (storage.Monito
 		IntervalSeconds: int64(req.Config.Every.Seconds()),
 		TTLSeconds:      ttlSeconds,
 		TimeoutSeconds:  int64(req.Config.Timeout.Seconds()),
+		MaxEvents:       int64(req.Config.MaxEvents),
 		ProxyPool:       req.Config.ProxyPool,
 		Deliveries:      routes.CloneDeliveries(req.Config.Deliveries),
 		Status:          model.MonitorStatusActive,
