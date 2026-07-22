@@ -9,10 +9,10 @@ SELECT * FROM runs WHERE id = ?;
 
 -- name: ListRuns :many
 SELECT * FROM runs
-WHERE monitor_name = ?
+WHERE monitor_name = sqlc.arg(monitor_name)
     AND (sqlc.arg(only_failed) = 0 OR status = 'failure')
 ORDER BY started_at DESC
-LIMIT ?;
+LIMIT sqlc.arg(lim);
 
 -- name: UpdateRunNotification :execrows
 UPDATE runs SET notified = ?, notify_error = ? WHERE id = ?;

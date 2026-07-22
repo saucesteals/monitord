@@ -54,7 +54,7 @@ func (c *CLI) runs(rawName string, limit int, runID string, failed bool) error {
 	if err != nil {
 		return err
 	}
-	events, err := store.ListRuns(ctx, name, limit)
+	events, err := store.ListRuns(ctx, name, limit, failed)
 	if err != nil {
 		return err
 	}
@@ -71,9 +71,6 @@ func (c *CLI) runs(rawName string, limit int, runID string, failed bool) error {
 	fmt.Println()
 
 	for _, run := range events {
-		if failed && run.Status != monitor.StatusFailure {
-			continue
-		}
 		summary := run.Error
 		if summary == "" {
 			summary = resultSummary(run.Stdout)

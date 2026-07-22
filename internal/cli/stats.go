@@ -53,7 +53,7 @@ func (c *CLI) stats(rawName string, limit int) error {
 	if err != nil {
 		return err
 	}
-	runs, err := store.ListRuns(ctx, name, limit)
+	runs, err := store.ListRuns(ctx, name, limit, false)
 	if err != nil {
 		return err
 	}
