@@ -26,6 +26,11 @@ const (
 	// EventDedupeWindow is how long an event's ID suppresses repeats.
 	EventDedupeWindow = time.Hour
 
+	// eventRetention is how long delivered events are kept for history before a
+	// prune reclaims them; pruneInterval throttles how often the prune runs.
+	eventRetention = 30 * 24 * time.Hour
+	pruneInterval  = time.Hour
+
 	// maxEventsPerTick is the default cap on how many events one tick may
 	// deliver, used when a monitor sets no max_events. Emission order wins: the
 	// first N send, the rest are dropped and logged. An unbounded stream would
@@ -54,6 +59,10 @@ type Daemon struct {
 
 	workersMu sync.Mutex
 	workers   map[model.MonitorName]*worker
+
+	// lastPrune throttles event retention pruning. Only the scan loop touches
+	// it, so it needs no lock.
+	lastPrune time.Time
 }
 
 // New returns a daemon runtime.
@@ -149,6 +158,15 @@ func (d *Daemon) scan(ctx context.Context) error {
 	}
 	if expired > 0 {
 		d.logger.Info("expired monitors", "count", expired)
+	}
+
+	if now.Sub(d.lastPrune) >= pruneInterval {
+		d.lastPrune = now
+		if pruned, err := d.store.PruneEvents(ctx, now.Add(-eventRetention)); err != nil {
+			d.logger.Error("prune events failed", "error", err)
+		} else if pruned > 0 {
+			d.logger.Info("pruned old events", "count", pruned)
+		}
 	}
 
 	capacity := cap(d.limit) - len(d.limit)
