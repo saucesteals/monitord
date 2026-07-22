@@ -57,6 +57,8 @@ func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
 			Title: "back in stock",
 			URL:   "https://example.com/product",
 		})
+
+		return monitord.Success("back in stock")
 	}
 
 	return monitord.Success("unchanged")
