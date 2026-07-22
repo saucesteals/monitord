@@ -44,11 +44,12 @@ type worker struct {
 	exitErr  error
 }
 
-// tickOutput collects everything one tick produced.
+// tickOutput collects everything one tick produced. Events are not collected
+// here: they are delivered as they arrive, so only the final result and the
+// captured stdout survive the tick.
 type tickOutput struct {
-	Result       monitord.Result
-	NotifyEvents []monitord.Event
-	Stdout       string
+	Result monitord.Result
+	Stdout string
 }
 
 // start launches a worker process and completes the handshake.
@@ -161,7 +162,7 @@ func protocolRouteNames(deliveries []routes.Delivery) []monitord.RouteName {
 }
 
 // tick sends one run to the worker and consumes messages until its result.
-func (w *worker) tick(ctx context.Context, logger *slog.Logger, m storage.Monitor, t monitord.Tick) (tickOutput, error) {
+func (w *worker) tick(ctx context.Context, logger *slog.Logger, m storage.Monitor, t monitord.Tick, emit func(monitord.Event)) (tickOutput, error) {
 	w.runMu.Lock()
 	defer w.runMu.Unlock()
 
@@ -206,7 +207,7 @@ func (w *worker) tick(ctx context.Context, logger *slog.Logger, m storage.Monito
 			return out, fmt.Errorf("worker reported run %s while %s was active", msg.RunID, t.RunID)
 		}
 
-		w.consume(logger, m, msg, &out)
+		w.consume(logger, m, msg, &out, emit)
 		if msg.Type == monitord.OutboundResult {
 			out.Stdout = captured.String()
 
@@ -215,15 +216,13 @@ func (w *worker) tick(ctx context.Context, logger *slog.Logger, m storage.Monito
 	}
 }
 
-func (w *worker) consume(logger *slog.Logger, m storage.Monitor, msg monitord.Outbound, out *tickOutput) {
+func (w *worker) consume(logger *slog.Logger, m storage.Monitor, msg monitord.Outbound, out *tickOutput, emit func(monitord.Event)) {
 	switch msg.Type {
 	case monitord.OutboundLog:
 		logger.Info("monitor log", "monitor", m.Name, "level", msg.Log.Level, "message", msg.Log.Message)
 	case monitord.OutboundEvent:
 		logger.Info("monitor event", "monitor", m.Name, "severity", msg.Event.Severity, "title", msg.Event.Title)
-		if msg.Event.Notify || msg.Event.Severity == monitord.SeverityWarn || msg.Event.Severity == monitord.SeverityCritical {
-			out.NotifyEvents = append(out.NotifyEvents, *msg.Event)
-		}
+		emit(*msg.Event)
 	case monitord.OutboundResult:
 		out.Result = *msg.Result
 	}

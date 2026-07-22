@@ -52,13 +52,13 @@ func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
 		status, err := check(ctx, r, target)
 		if err != nil {
 			failed++
-			r.Event(monitord.Event{
+			r.Emit(monitord.Event{
 				Severity: monitord.SeverityCritical,
 				Title:    fmt.Sprintf("%s unreachable", target.Name),
 				Summary:  err.Error(),
 				// Keyed per target, so one flapping target does not drown out
 				// the others in the notification route.
-				DedupeKey: "unreachable:" + target.Name,
+				ID: "unreachable:" + target.Name,
 			})
 
 			continue
@@ -71,10 +71,10 @@ func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
 
 		if status >= 400 {
 			failed++
-			r.Event(monitord.Event{
-				Severity:  monitord.SeverityWarn,
-				Title:     fmt.Sprintf("%s returned HTTP %d", target.Name, status),
-				DedupeKey: fmt.Sprintf("status:%s:%d", target.Name, status),
+			r.Emit(monitord.Event{
+				Severity: monitord.SeverityWarn,
+				Title:    fmt.Sprintf("%s returned HTTP %d", target.Name, status),
+				ID:       fmt.Sprintf("status:%s:%d", target.Name, status),
 			})
 		}
 	}

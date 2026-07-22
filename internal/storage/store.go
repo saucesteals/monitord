@@ -67,9 +67,11 @@ type Monitor struct {
 	IntervalSeconds int64
 	TTLSeconds      int64
 	TimeoutSeconds  int64
-	Deliveries      []routes.Delivery
-	ProxyPool       model.PoolName
-	Status          model.MonitorStatus
+	// MaxEvents caps events delivered per tick. Zero means the daemon default.
+	MaxEvents  int64
+	Deliveries []routes.Delivery
+	ProxyPool  model.PoolName
+	Status     model.MonitorStatus
 
 	CreatedAt *time.Time
 	UpdatedAt *time.Time
@@ -116,7 +118,7 @@ type Run struct {
 }
 
 const monitorColumns = `name, source_dir, artifact_dir, binary_path, definition_json, state_json, state_version, state_revision,
-	interval_seconds, ttl_seconds, timeout_seconds, deliveries_json, proxy_pool, status,
+	interval_seconds, ttl_seconds, timeout_seconds, max_events, deliveries_json, proxy_pool, status,
 	created_at, updated_at, expires_at, next_due_at, last_run_at, expired_at,
 	running_run_id, running_started_at, running_expires_at,
 	last_status, notified_status, consecutive_failures, total_runs, total_failures`
@@ -179,6 +181,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			interval_seconds INTEGER NOT NULL,
 			ttl_seconds INTEGER NOT NULL,
 			timeout_seconds INTEGER NOT NULL,
+			max_events INTEGER NOT NULL DEFAULT 0,
 			deliveries_json TEXT NOT NULL DEFAULT '[]',
 			proxy_pool TEXT NOT NULL,
 			status TEXT NOT NULL,
@@ -255,6 +258,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{table: "monitors", name: "total_runs", spec: "INTEGER NOT NULL DEFAULT 0"},
 		{table: "monitors", name: "total_failures", spec: "INTEGER NOT NULL DEFAULT 0"},
 		{table: "monitors", name: "proxy_pool", spec: "TEXT NOT NULL DEFAULT ''"},
+		{table: "monitors", name: "max_events", spec: "INTEGER NOT NULL DEFAULT 0"},
 		{table: "runs", name: "notification_error", spec: "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range columns {
@@ -474,6 +478,7 @@ func (s *Store) UpsertMonitor(ctx context.Context, m Monitor) error {
 			?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?,
+			?,
 			'', NULL, NULL, '', '', 0, 0, 0
 		)
 		ON CONFLICT(name) DO UPDATE SET
@@ -487,6 +492,7 @@ func (s *Store) UpsertMonitor(ctx context.Context, m Monitor) error {
 			interval_seconds = excluded.interval_seconds,
 			ttl_seconds = excluded.ttl_seconds,
 			timeout_seconds = excluded.timeout_seconds,
+			max_events = excluded.max_events,
 			deliveries_json = excluded.deliveries_json,
 			proxy_pool = excluded.proxy_pool,
 			status = excluded.status,
@@ -498,7 +504,7 @@ func (s *Store) UpsertMonitor(ctx context.Context, m Monitor) error {
 			running_started_at = NULL,
 			running_expires_at = NULL`,
 		m.Name.String(), m.SourceDir, m.ArtifactDir, m.BinaryPath, string(definitionJSON), string(m.State), m.StateVersion, m.StateRevision,
-		m.IntervalSeconds, m.TTLSeconds, m.TimeoutSeconds, string(deliveriesJSON), m.ProxyPool.String(), m.Status.String(),
+		m.IntervalSeconds, m.TTLSeconds, m.TimeoutSeconds, m.MaxEvents, string(deliveriesJSON), m.ProxyPool.String(), m.Status.String(),
 		formatTimePtr(m.CreatedAt), formatTimePtr(m.UpdatedAt), formatTimePtr(m.ExpiresAt), formatTimePtr(m.NextDueAt),
 		formatTimePtr(m.LastRunAt), formatTimePtr(m.ExpiredAt))
 	if err != nil {
@@ -832,29 +838,32 @@ func (s *Store) MarkNotified(ctx context.Context, name model.MonitorName, status
 	return nil
 }
 
-// ShouldSendEvent reports whether an event with this dedupe key may be sent,
-// recording the send when it may. An empty key always sends.
-func (s *Store) ShouldSendEvent(ctx context.Context, name model.MonitorName, key string, now time.Time, window time.Duration) (bool, error) {
+// ReserveEvent atomically checks and claims a dedupe id. It reports whether the
+// event may send and returns the prior last_sent_at ("" when the id was unseen),
+// so a delivery that then fails can ReleaseEvent the claim and allow a retry
+// rather than burning the whole dedupe window on a send that never landed. An
+// empty key always sends and reserves nothing.
+func (s *Store) ReserveEvent(ctx context.Context, name model.MonitorName, key string, now time.Time, window time.Duration) (bool, string, error) {
 	if key == "" {
-		return true, nil
+		return true, "", nil
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, fmt.Errorf("begin event dedupe: %w", err)
+		return false, "", fmt.Errorf("begin event dedupe: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var lastSent string
+	var prior string
 	err = tx.QueryRowContext(ctx, `SELECT last_sent_at FROM event_dedupe WHERE monitor_name = ? AND dedupe_key = ?`,
-		name.String(), key).Scan(&lastSent)
+		name.String(), key).Scan(&prior)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, fmt.Errorf("read event dedupe: %w", err)
+		return false, "", fmt.Errorf("read event dedupe: %w", err)
 	}
 	if err == nil {
-		sentAt, parseErr := parseTime(lastSent)
+		sentAt, parseErr := parseTime(prior)
 		if parseErr == nil && now.Sub(sentAt) < window {
-			return false, nil
+			return false, "", nil
 		}
 	}
 
@@ -862,13 +871,37 @@ func (s *Store) ShouldSendEvent(ctx context.Context, name model.MonitorName, key
 		VALUES (?, ?, ?)
 		ON CONFLICT(monitor_name, dedupe_key) DO UPDATE SET last_sent_at = excluded.last_sent_at`,
 		name.String(), key, formatTime(now)); err != nil {
-		return false, fmt.Errorf("write event dedupe: %w", err)
+		return false, "", fmt.Errorf("write event dedupe: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("commit event dedupe: %w", err)
+		return false, "", fmt.Errorf("commit event dedupe: %w", err)
 	}
 
-	return true, nil
+	return true, prior, nil
+}
+
+// ReleaseEvent undoes a ReserveEvent claim after a failed delivery: it restores
+// the prior last_sent_at, or removes the row entirely when the id was unseen, so
+// the id is free to retry on the next tick instead of being suppressed for the
+// full window by a send that never landed.
+func (s *Store) ReleaseEvent(ctx context.Context, name model.MonitorName, key, prior string) error {
+	if key == "" {
+		return nil
+	}
+	if prior == "" {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM event_dedupe WHERE monitor_name = ? AND dedupe_key = ?`,
+			name.String(), key); err != nil {
+			return fmt.Errorf("release event dedupe: %w", err)
+		}
+
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE event_dedupe SET last_sent_at = ? WHERE monitor_name = ? AND dedupe_key = ?`,
+		prior, name.String(), key); err != nil {
+		return fmt.Errorf("restore event dedupe: %w", err)
+	}
+
+	return nil
 }
 
 // ListRuns returns a monitor's most recent runs, newest first.
@@ -1205,7 +1238,7 @@ func scanMonitor(row scanner) (Monitor, error) {
 	var expiresAt, nextDueAt, lastRunAt, expiredAt, runningStartedAt, runningExpiresAt sql.NullString
 
 	err := row.Scan(&name, &m.SourceDir, &m.ArtifactDir, &m.BinaryPath, &definitionJSON, &stateJSON, &m.StateVersion, &m.StateRevision,
-		&m.IntervalSeconds, &m.TTLSeconds, &m.TimeoutSeconds, &deliveriesJSON, &proxyPool, &status,
+		&m.IntervalSeconds, &m.TTLSeconds, &m.TimeoutSeconds, &m.MaxEvents, &deliveriesJSON, &proxyPool, &status,
 		&createdAt, &updatedAt, &expiresAt, &nextDueAt, &lastRunAt, &expiredAt,
 		&m.RunningRunID, &runningStartedAt, &runningExpiresAt,
 		&lastStatus, &notifiedStatus, &m.ConsecutiveFailures, &m.TotalRuns, &m.TotalFailures)

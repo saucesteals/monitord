@@ -239,7 +239,18 @@ type embedField struct {
 }
 
 type embedFooter struct {
-	Text string `json:"text"`
+	Text    string `json:"text"`
+	IconURL string `json:"icon_url,omitempty"`
+}
+
+type embedImage struct {
+	URL string `json:"url"`
+}
+
+type embedAuthor struct {
+	Name    string `json:"name"`
+	URL     string `json:"url,omitempty"`
+	IconURL string `json:"icon_url,omitempty"`
 }
 
 type embed struct {
@@ -247,7 +258,10 @@ type embed struct {
 	Description string       `json:"description,omitempty"`
 	URL         string       `json:"url,omitempty"`
 	Color       int          `json:"color"`
+	Author      *embedAuthor `json:"author,omitempty"`
 	Fields      []embedField `json:"fields,omitempty"`
+	Image       *embedImage  `json:"image,omitempty"`
+	Thumbnail   *embedImage  `json:"thumbnail,omitempty"`
 	Footer      *embedFooter `json:"footer,omitempty"`
 	Timestamp   string       `json:"timestamp,omitempty"`
 }
@@ -267,6 +281,8 @@ const (
 	maxFieldName   = 256
 	maxFieldValue  = 1024
 	maxFields      = 25
+	maxAuthor      = 256
+	maxFooter      = 2048
 )
 
 // SendDiscord sends a monitor notification to a Discord webhook, pinging only
@@ -302,6 +318,12 @@ func SendDiscord(ctx context.Context, webhookURL string, msg Message, mentions [
 }
 
 // buildEmbed renders a message as a single Discord embed.
+//
+// Every field is sanitised rather than validated away: a blank title, an empty
+// field name or value, or a malformed URL would each make Discord reject the
+// whole embed with a 400, silently losing the notification. Instead each field
+// falls back to a visible placeholder (or, for a URL, is dropped) so the alert
+// always lands and shows its own defect inline.
 func buildEmbed(msg Message) embed {
 	description := msg.Summary
 	if msg.Details != "" {
@@ -311,32 +333,78 @@ func buildEmbed(msg Message) embed {
 		description += msg.Details
 	}
 
+	title := strings.TrimSpace(msg.Title)
+	if title == "" {
+		title = "(no title)"
+	}
+
+	color := msg.Color
+	if color == 0 {
+		color = msg.Level.color()
+	}
+	stamp := msg.Time
+	if stamp.IsZero() {
+		stamp = time.Now()
+	}
 	out := embed{
-		Title:       truncate(msg.Title, maxTitle),
+		Title:       truncate(title, maxTitle),
 		Description: truncate(description, maxDescription),
-		URL:         msg.URL,
-		Color:       msg.Level.color(),
-		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		URL:         safeURL(msg.URL),
+		Color:       color,
+		Timestamp:   stamp.UTC().Format(time.RFC3339),
 	}
 	if msg.Footer != "" {
-		out.Footer = &embedFooter{Text: msg.Footer}
+		out.Footer = &embedFooter{Text: truncate(msg.Footer, maxFooter), IconURL: safeURL(msg.FooterIcon)}
+	}
+	if msg.Author.Name != "" || msg.Author.URL != "" || msg.Author.IconURL != "" {
+		name := strings.TrimSpace(msg.Author.Name)
+		if name == "" {
+			name = "(unnamed)"
+		}
+		out.Author = &embedAuthor{Name: truncate(name, maxAuthor), URL: safeURL(msg.Author.URL), IconURL: safeURL(msg.Author.IconURL)}
+	}
+	if u := safeURL(msg.Image); u != "" {
+		out.Image = &embedImage{URL: u}
+	}
+	if u := safeURL(msg.Thumbnail); u != "" {
+		out.Thumbnail = &embedImage{URL: u}
 	}
 
 	for _, field := range msg.Fields {
 		if len(out.Fields) == maxFields {
 			break
 		}
-		if field.Name == "" || field.Value == "" {
-			continue
+		name := strings.TrimSpace(field.Name)
+		if name == "" {
+			name = "(unnamed)"
+		}
+		value := strings.TrimSpace(field.Value)
+		if value == "" {
+			value = "(empty)"
 		}
 		out.Fields = append(out.Fields, embedField{
-			Name:   truncate(field.Name, maxFieldName),
-			Value:  truncate(field.Value, maxFieldValue),
+			Name:   truncate(name, maxFieldName),
+			Value:  truncate(value, maxFieldValue),
 			Inline: field.Inline,
 		})
 	}
 
 	return out
+}
+
+// safeURL returns raw when it is an absolute http(s) URL, and "" otherwise.
+// Discord rejects the entire embed if any URL field is malformed, so an invalid
+// link is dropped rather than allowed to sink the whole notification.
+func safeURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return ""
+	}
+
+	return raw
 }
 
 func renderMentions(mentions []Mention) string {

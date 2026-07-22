@@ -83,7 +83,7 @@ func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
 		r.State.LastSeen = current
 		r.Save()
 
-		return monitord.Alert("changed to " + current)
+		r.Emit(monitord.Event{ID: "status:" + current, Title: "status changed to " + current})
 	}
 
 	return monitord.Success("unchanged")
@@ -98,6 +98,7 @@ clients: 1
 every: 5m
 ttl: 24h
 timeout: 30s
+max_events: 20 # optional; per-tick event cap, default 20
 routes:
   - route: discord:alerts
 ```
@@ -111,42 +112,43 @@ Rules that matter:
 - Do not hardcode secrets. Store monitor-owned credentials in state and update them with `monitord state set`.
 - Workers receive a minimal environment, so ordinary shell environment variables are not a reliable monitor configuration channel.
 
-## Return Semantics
+## Result And Events
 
-- `monitord.Success(...)`: the check ran and there is nothing to report. Silent.
-- `monitord.Alert(...)`: the check ran and found something noteworthy. Sends every time it is returned.
-- `monitord.Failure(...)`: the check itself broke. Sends on the failure edge and again on recovery, not every tick.
+A tick does two separate jobs: it returns a health `Result`, and along the way it emits zero or more `Event`s.
 
-Use `Alert` for interesting healthy outcomes such as restock, threshold crossed, new item, or content change. Use `Failure` for broken checks such as unreachable target, bad response, auth failure, or unparseable data.
+- `monitord.Success(...)`: the check ran and the watched thing is healthy. Silent.
+- `monitord.Failure(...)`: the check itself broke. Pages on the failure edge and again on recovery, not every tick.
+- `r.Emit(event)`: something worth reporting happened. Each event is its own Discord embed, delivered the moment it is emitted.
 
-## Useful Discord Messages
+Return `Failure` for broken checks (unreachable target, bad response, auth failure, unparseable data). Emit an `Event` for every noteworthy finding (restock, threshold crossed, new listing, content change) and return `Success`. A tick can emit many events — one per finding — and each is sent live and independently of the result. Deliveries run concurrently, so events are not guaranteed to arrive in emission order.
 
-Notifications render as Discord embeds. Add a URL and fields when the message should be actionable without opening logs.
+## Building Events
 
-```go
-return monitord.Alert("latency crossed 500ms").
-	WithURL("https://status.example.com/").
-	WithField("Latency", "742ms", true).
-	WithField("Region", "us-east", true).
-	WithField("Target", "`https://api.example.com/health`", false)
-```
-
-Use inline fields for short comparable values and non-inline fields for longer values such as URLs, IDs, snippets, or explanations. Field values accept Discord markdown and are truncated to Discord limits.
-
-For monitors that check multiple targets, emit one event per target and set `DedupeKey` so one noisy target does not bury the rest:
+An event is one Discord embed, written as a plain struct literal.
 
 ```go
-r.Event(monitord.Event{
-	Severity:  monitord.SeverityWarn,
-	Title:     target.Name + " is unhealthy",
-	Summary:   "HTTP 503 from health endpoint",
-	DedupeKey: "down:" + target.Name,
-	URL:       target.URL,
-	Fields:    []monitord.Field{{Name: "Status", Value: "503", Inline: true}},
+r.Emit(monitord.Event{
+	ID:       "down:" + target.Name,
+	Title:    target.Name + " is unhealthy",
+	Summary:  "HTTP 503 from health endpoint",
+	Severity: monitord.SeverityWarn,
+	URL:      target.URL,
+	Image:    "https://example.com/chart.png",
+	Fields: []monitord.Field{
+		{Name: "Status", Value: "503", Inline: true},
+	},
 })
 ```
 
-Event severities map to embed colors. Events with the same dedupe key are suppressed for one hour. Events without a key always send.
+Field reference:
+
+- `ID` is the event's identity: repeats of the same id are suppressed for one hour, so a target that stays down pings once, not every tick. An empty id always sends.
+- `Fields` are labelled values — `Inline: true` for short comparable values, false for longer values such as URLs, IDs, snippets, or explanations. Field values accept Discord markdown and are truncated to Discord limits.
+- `Image` renders a large image below the body; `Thumbnail` a small corner image.
+- `Color` is an explicit accent as `0xRRGGBB`; leave it zero to derive the colour from `Severity` (info/warn/critical).
+- `Author` adds an attribution line; `Footer`/`FooterIcon` override the default monitor-name footer.
+
+Emit as many events as a tick finds — each is delivered immediately, concurrently, and on its own. A tick is capped so a runaway monitor can't flood a route: past the cap, the rest are dropped and logged. The default is 20; raise or lower it per monitor with `max_events` in `monitor.yaml`.
 
 ## State
 
@@ -274,12 +276,11 @@ Use `monitord stats <name>` after deploying interval-sensitive monitors. A monit
 
 ## Notification Behavior
 
-- Failure notifications are edge-triggered: one message when a monitor starts failing and one when it recovers.
-- `Alert` sends every time it is returned.
-- Events dedupe by key for one hour.
+- Failure notifications are edge-triggered: one message when a monitor starts failing and one when it recovers. This comes from the result status alone.
+- Events are delivered immediately and concurrently, so they may arrive out of emission order. An event with a dedupe key is suppressed for one hour after it sends; without a key it always sends.
 - Redeploy rolls the worker to the new artifact on the next tick; in-flight ticks finish on the old artifact.
 
-This means a monitor can run frequently without adding manual "only alert once" logic. Let the daemon handle failure and event suppression.
+This means a monitor can run frequently without adding manual "only alert once" logic: give repeating events a stable dedupe key and let the daemon suppress them, and let failure edges handle themselves.
 
 ## Install And Update
 
