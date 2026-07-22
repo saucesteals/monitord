@@ -87,25 +87,26 @@ CREATE TABLE runs (
 
 CREATE INDEX runs_monitor_started ON runs(monitor_name, started_at DESC);
 
--- events: the alert history AND the dedupe source. One row per event sent.
--- Dedupe is a windowed existence check on (monitor_name, event_id); history is
--- kept for a longer retention that a periodic prune enforces.
+-- events: the alert history AND the dedupe source. One row per identified event
+-- (monitor_name, event_id), upserted on every send — so it's the set of distinct
+-- events a monitor has emitted, each carrying its latest send. Dedupe is a
+-- windowed check on that row; history is kept until a periodic prune reclaims it.
+-- Only monitor-emitted events with an id land here (health pages have none).
 CREATE TABLE events (
-    id            INTEGER PRIMARY KEY,
     monitor_name  TEXT NOT NULL REFERENCES monitors(name) ON DELETE CASCADE,
-    event_id      TEXT NOT NULL DEFAULT '',    -- dedupe identity; '' = never deduped
+    event_id      TEXT NOT NULL,
     title         TEXT NOT NULL,
     summary       TEXT NOT NULL DEFAULT '',
     url           TEXT NOT NULL DEFAULT '',
     severity      TEXT NOT NULL DEFAULT 'info',
     sent_at       INTEGER NOT NULL,
     delivered     INTEGER NOT NULL DEFAULT 0,  -- bool
-    error         TEXT NOT NULL DEFAULT ''
+    error         TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (monitor_name, event_id)
 ) STRICT;
 
--- dedupe lookups: newest delivered row for (monitor, event_id) within a window.
-CREATE INDEX events_dedupe ON events(monitor_name, event_id, sent_at DESC);
--- history/prune: by monitor over time, and global prune by age.
+-- history/prune: by monitor over time, and global prune by age. The primary key
+-- already serves dedupe lookups on (monitor_name, event_id).
 CREATE INDEX events_monitor_sent ON events(monitor_name, sent_at DESC);
 CREATE INDEX events_sent ON events(sent_at);
 

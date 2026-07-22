@@ -22,7 +22,7 @@ type EventSuppressedParams struct {
 	SentAt      int64
 }
 
-// Dedupe: is there a delivered event with this id in the window?
+// Dedupe: was this id delivered within the window?
 func (q *Queries) EventSuppressed(ctx context.Context, arg EventSuppressedParams) (bool, error) {
 	row := q.db.QueryRowContext(ctx, eventSuppressed, arg.MonitorName, arg.EventID, arg.SentAt)
 	var exists bool
@@ -30,43 +30,8 @@ func (q *Queries) EventSuppressed(ctx context.Context, arg EventSuppressedParams
 	return exists, err
 }
 
-const insertEvent = `-- name: InsertEvent :one
-INSERT INTO events (monitor_name, event_id, title, summary, url, severity, sent_at, delivered, error)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id
-`
-
-type InsertEventParams struct {
-	MonitorName string
-	EventID     string
-	Title       string
-	Summary     string
-	Url         string
-	Severity    string
-	SentAt      int64
-	Delivered   int64
-	Error       string
-}
-
-func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) (int64, error) {
-	row := q.db.QueryRowContext(ctx, insertEvent,
-		arg.MonitorName,
-		arg.EventID,
-		arg.Title,
-		arg.Summary,
-		arg.Url,
-		arg.Severity,
-		arg.SentAt,
-		arg.Delivered,
-		arg.Error,
-	)
-	var id int64
-	err := row.Scan(&id)
-	return id, err
-}
-
 const listEvents = `-- name: ListEvents :many
-SELECT id, monitor_name, event_id, title, summary, url, severity, sent_at, delivered, error FROM events
+SELECT monitor_name, event_id, title, summary, url, severity, sent_at, delivered, error FROM events
 WHERE monitor_name = ?1
     AND (?2 = 0 OR delivered = 0)
     AND (?3 = 0 OR sent_at >= ?3)
@@ -96,7 +61,6 @@ func (q *Queries) ListEvents(ctx context.Context, arg ListEventsParams) ([]Event
 	for rows.Next() {
 		var i Event
 		if err := rows.Scan(
-			&i.ID,
 			&i.MonitorName,
 			&i.EventID,
 			&i.Title,
@@ -130,4 +94,45 @@ func (q *Queries) PruneEvents(ctx context.Context, sentAt int64) (int64, error) 
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const upsertEvent = `-- name: UpsertEvent :exec
+INSERT INTO events (monitor_name, event_id, title, summary, url, severity, sent_at, delivered, error)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(monitor_name, event_id) DO UPDATE SET
+    title = excluded.title,
+    summary = excluded.summary,
+    url = excluded.url,
+    severity = excluded.severity,
+    sent_at = excluded.sent_at,
+    delivered = excluded.delivered,
+    error = excluded.error
+`
+
+type UpsertEventParams struct {
+	MonitorName string
+	EventID     string
+	Title       string
+	Summary     string
+	Url         string
+	Severity    string
+	SentAt      int64
+	Delivered   int64
+	Error       string
+}
+
+// One row per (monitor, event_id): each send updates the row's latest state.
+func (q *Queries) UpsertEvent(ctx context.Context, arg UpsertEventParams) error {
+	_, err := q.db.ExecContext(ctx, upsertEvent,
+		arg.MonitorName,
+		arg.EventID,
+		arg.Title,
+		arg.Summary,
+		arg.Url,
+		arg.Severity,
+		arg.SentAt,
+		arg.Delivered,
+		arg.Error,
+	)
+	return err
 }
