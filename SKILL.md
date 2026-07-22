@@ -84,6 +84,8 @@ func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
 		r.Save()
 
 		r.Emit(monitord.Event{ID: "status:" + current, Title: "status changed to " + current})
+
+		return monitord.Successf("status changed to %s", current)
 	}
 
 	return monitord.Success("unchanged")
