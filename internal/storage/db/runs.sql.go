@@ -72,20 +72,20 @@ func (q *Queries) InsertRun(ctx context.Context, arg InsertRunParams) error {
 
 const listRuns = `-- name: ListRuns :many
 SELECT id, monitor_name, started_at, finished_at, status, exit_code, stdout, stderr, error, notified, notify_error FROM runs
-WHERE monitor_name = ?
-    AND (?3 = 0 OR status = 'failure')
+WHERE monitor_name = ?1
+    AND (?2 = 0 OR status = 'failure')
 ORDER BY started_at DESC
-LIMIT ?
+LIMIT ?3
 `
 
 type ListRunsParams struct {
 	MonitorName string
 	OnlyFailed  interface{}
-	Limit       int64
+	Lim         int64
 }
 
 func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, error) {
-	rows, err := q.db.QueryContext(ctx, listRuns, arg.MonitorName, arg.OnlyFailed, arg.Limit)
+	rows, err := q.db.QueryContext(ctx, listRuns, arg.MonitorName, arg.OnlyFailed, arg.Lim)
 	if err != nil {
 		return nil, err
 	}

@@ -197,10 +197,10 @@ func (r *tickRun) finalize() {
 	}
 }
 
-// notify is the tick's single send primitive: reserve the dedupe id, fan the
-// message out to every route, release the id if delivery fails so it can retry,
-// and record the notified status once it lands. It is safe for concurrent use,
-// so events deliver in parallel through it.
+// notify is the tick's single send primitive: skip suppressed events, fan the
+// message out to every route, log the event for history and dedupe, and record
+// the notified status once it lands. It is safe for concurrent use, so events
+// deliver in parallel through it.
 func (r *tickRun) notify(note notification) {
 	// Every notification delivers on its own bounded, uncancelable context, so a
 	// slow webhook can't pin a scheduler slot and a shutdown can't drop a health
@@ -214,28 +214,41 @@ func (r *tickRun) notify(note notification) {
 		return
 	}
 
-	var priorSent string
+	now := time.Now().UTC()
 	if note.ID != "" {
-		send, prior, err := r.daemon.store.ReserveEvent(ctx, r.monitor.Name, note.ID, time.Now().UTC(), EventDedupeWindow)
+		suppressed, err := r.daemon.store.EventSuppressed(ctx, r.monitor.Name, note.ID, now.Add(-EventDedupeWindow))
 		if err != nil {
-			r.daemon.logger.Error("event reserve failed", "monitor", r.monitor.Name, "id", note.ID, "error", err)
-
-			return
-		}
-		if !send {
+			// On a dedupe-check failure, prefer sending over silently dropping.
+			r.daemon.logger.Error("event dedupe check failed", "monitor", r.monitor.Name, "id", note.ID, "error", err)
+		} else if suppressed {
 			r.daemon.logger.Debug("event suppressed by id", "monitor", r.monitor.Name, "id", note.ID)
 
 			return
 		}
-		priorSent = prior
 	}
 
-	if errs := r.fanOut(ctx, note); len(errs) > 0 {
+	errs := r.fanOut(ctx, note)
+	delivered := len(errs) == 0
+
+	// Log every send — delivered or not — as the alert history and the source
+	// future dedupe checks read from.
+	if err := r.daemon.store.RecordEvent(ctx, storage.Event{
+		MonitorName: r.monitor.Name,
+		EventID:     note.ID,
+		Title:       note.Message.Title,
+		Summary:     note.Message.Summary,
+		URL:         note.Message.URL,
+		Severity:    string(note.Message.Level),
+		SentAt:      now,
+		Delivered:   delivered,
+		Error:       strings.Join(errs, "; "),
+	}); err != nil {
+		r.daemon.logger.Error("record event failed", "monitor", r.monitor.Name, "error", err)
+	}
+
+	if !delivered {
 		r.daemon.logger.Error("notification delivery failed", "monitor", r.monitor.Name, "routes", deliveryNames(note.Deliveries), "error", strings.Join(errs, "; "))
 		r.recordErrs(errs)
-		if note.ID != "" {
-			r.releaseID(note.ID, priorSent)
-		}
 
 		return
 	}
@@ -281,16 +294,6 @@ func (r *tickRun) recordErrs(errs []string) {
 	r.notifyMu.Lock()
 	r.notifyErrs = append(r.notifyErrs, errs...)
 	r.notifyMu.Unlock()
-}
-
-// releaseID frees a dedupe claim after a failed send so the id can retry,
-// using a fresh context in case delivery failed on a timeout.
-func (r *tickRun) releaseID(id, prior string) {
-	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
-	defer cancel()
-	if err := r.daemon.store.ReleaseEvent(ctx, r.monitor.Name, id, prior); err != nil {
-		r.daemon.logger.Warn("release event id failed", "monitor", r.monitor.Name, "id", id, "error", err)
-	}
 }
 
 // dispatcher delivers a tick's events as the worker streams them: concurrently,

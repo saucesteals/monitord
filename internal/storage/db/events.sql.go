@@ -67,18 +67,18 @@ func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) (int64
 
 const listEvents = `-- name: ListEvents :many
 SELECT id, monitor_name, event_id, title, summary, url, severity, sent_at, delivered, error FROM events
-WHERE monitor_name = ?
-    AND (?3 = 0 OR delivered = 0)
-    AND (?4 = 0 OR sent_at >= ?4)
+WHERE monitor_name = ?1
+    AND (?2 = 0 OR delivered = 0)
+    AND (?3 = 0 OR sent_at >= ?3)
 ORDER BY sent_at DESC
-LIMIT ?
+LIMIT ?4
 `
 
 type ListEventsParams struct {
 	MonitorName string
 	OnlyFailed  interface{}
 	Since       interface{}
-	Limit       int64
+	Lim         int64
 }
 
 func (q *Queries) ListEvents(ctx context.Context, arg ListEventsParams) ([]Event, error) {
@@ -86,7 +86,7 @@ func (q *Queries) ListEvents(ctx context.Context, arg ListEventsParams) ([]Event
 		arg.MonitorName,
 		arg.OnlyFailed,
 		arg.Since,
-		arg.Limit,
+		arg.Lim,
 	)
 	if err != nil {
 		return nil, err
