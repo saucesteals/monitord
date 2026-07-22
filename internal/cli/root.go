@@ -44,6 +44,7 @@ func New() *cobra.Command {
 		c.newTestCmd(),
 		c.newDeployCmd(),
 		c.newRunsCmd(),
+		c.newEventsCmd(),
 		c.newStatsCmd(),
 		c.newRemoveCmd(),
 		c.newListCmd(),
