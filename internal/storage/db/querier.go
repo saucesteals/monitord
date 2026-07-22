@@ -16,7 +16,7 @@ type Querier interface {
 	DeleteMonitor(ctx context.Context, name string) error
 	DeleteProxyPool(ctx context.Context, name string) error
 	EarliestDue(ctx context.Context) (interface{}, error)
-	// Dedupe: is there a delivered event with this id in the window?
+	// Dedupe: was this id delivered within the window?
 	EventSuppressed(ctx context.Context, arg EventSuppressedParams) (bool, error)
 	ExpireDueMonitors(ctx context.Context, now sql.NullInt64) (int64, error)
 	ExpireMonitor(ctx context.Context, arg ExpireMonitorParams) (int64, error)
@@ -25,7 +25,6 @@ type Querier interface {
 	GetProxyPool(ctx context.Context, name string) (ProxyPool, error)
 	GetRoute(ctx context.Context, name string) (Route, error)
 	GetRun(ctx context.Context, id string) (Run, error)
-	InsertEvent(ctx context.Context, arg InsertEventParams) (int64, error)
 	InsertRun(ctx context.Context, arg InsertRunParams) error
 	ListEvents(ctx context.Context, arg ListEventsParams) ([]Event, error)
 	ListMonitors(ctx context.Context) ([]Monitor, error)
@@ -39,6 +38,8 @@ type Querier interface {
 	SetMonitorState(ctx context.Context, arg SetMonitorStateParams) (int64, error)
 	SetProxyOffset(ctx context.Context, arg SetProxyOffsetParams) error
 	UpdateRunNotification(ctx context.Context, arg UpdateRunNotificationParams) (int64, error)
+	// One row per (monitor, event_id): each send updates the row's latest state.
+	UpsertEvent(ctx context.Context, arg UpsertEventParams) error
 	UpsertMonitor(ctx context.Context, arg UpsertMonitorParams) error
 	UpsertProxyPool(ctx context.Context, arg UpsertProxyPoolParams) error
 	UpsertRoute(ctx context.Context, arg UpsertRouteParams) error

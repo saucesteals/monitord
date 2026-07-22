@@ -106,10 +106,9 @@ type Run struct {
 	StateRevision int64
 }
 
-// Event is one notification a monitor emitted: the alert history and the dedupe
-// source in one.
+// Event is one identified event a monitor emitted: the alert history and the
+// dedupe source in one, keyed by (MonitorName, EventID).
 type Event struct {
-	ID          int64
 	MonitorName model.MonitorName
 	EventID     string
 	Title       string
@@ -618,9 +617,10 @@ func (s *Store) EventSuppressed(ctx context.Context, name model.MonitorName, eve
 	})
 }
 
-// RecordEvent logs an emitted event, for history and dedupe.
+// RecordEvent upserts an identified event: one row per (monitor, event id),
+// updated with each send, for history and dedupe.
 func (s *Store) RecordEvent(ctx context.Context, e Event) error {
-	_, err := s.q.InsertEvent(ctx, db.InsertEventParams{
+	if err := s.q.UpsertEvent(ctx, db.UpsertEventParams{
 		MonitorName: e.MonitorName.String(),
 		EventID:     e.EventID,
 		Title:       e.Title,
@@ -630,8 +630,7 @@ func (s *Store) RecordEvent(ctx context.Context, e Event) error {
 		SentAt:      toMs(e.SentAt),
 		Delivered:   b2i(e.Delivered),
 		Error:       e.Error,
-	})
-	if err != nil {
+	}); err != nil {
 		return fmt.Errorf("record event for %s: %w", e.MonitorName, err)
 	}
 
@@ -883,7 +882,6 @@ func toEvent(e db.Event) (Event, error) {
 	}
 
 	return Event{
-		ID:          e.ID,
 		MonitorName: name,
 		EventID:     e.EventID,
 		Title:       e.Title,

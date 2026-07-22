@@ -230,20 +230,23 @@ func (r *tickRun) notify(note notification) {
 	errs := r.fanOut(ctx, note)
 	delivered := len(errs) == 0
 
-	// Log every send — delivered or not — as the alert history and the source
-	// future dedupe checks read from.
-	if err := r.daemon.store.RecordEvent(ctx, storage.Event{
-		MonitorName: r.monitor.Name,
-		EventID:     note.ID,
-		Title:       note.Message.Title,
-		Summary:     note.Message.Summary,
-		URL:         note.Message.URL,
-		Severity:    string(note.Message.Level),
-		SentAt:      now,
-		Delivered:   delivered,
-		Error:       strings.Join(errs, "; "),
-	}); err != nil {
-		r.daemon.logger.Error("record event failed", "monitor", r.monitor.Name, "error", err)
+	// Log identified events only — one row per (monitor, id), the alert history
+	// and the source future dedupe checks read from. Health pages and anonymous
+	// always-send notifications carry no id, so they don't belong in the table.
+	if note.ID != "" {
+		if err := r.daemon.store.RecordEvent(ctx, storage.Event{
+			MonitorName: r.monitor.Name,
+			EventID:     note.ID,
+			Title:       note.Message.Title,
+			Summary:     note.Message.Summary,
+			URL:         note.Message.URL,
+			Severity:    string(note.Message.Level),
+			SentAt:      now,
+			Delivered:   delivered,
+			Error:       strings.Join(errs, "; "),
+		}); err != nil {
+			r.daemon.logger.Error("record event failed", "monitor", r.monitor.Name, "error", err)
+		}
 	}
 
 	if !delivered {

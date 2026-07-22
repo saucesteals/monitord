@@ -1,14 +1,22 @@
 -- name: EventSuppressed :one
--- Dedupe: is there a delivered event with this id in the window?
+-- Dedupe: was this id delivered within the window?
 SELECT EXISTS (
     SELECT 1 FROM events
     WHERE monitor_name = ? AND event_id = ? AND delivered = 1 AND sent_at > ?
 );
 
--- name: InsertEvent :one
+-- name: UpsertEvent :exec
+-- One row per (monitor, event_id): each send updates the row's latest state.
 INSERT INTO events (monitor_name, event_id, title, summary, url, severity, sent_at, delivered, error)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id;
+ON CONFLICT(monitor_name, event_id) DO UPDATE SET
+    title = excluded.title,
+    summary = excluded.summary,
+    url = excluded.url,
+    severity = excluded.severity,
+    sent_at = excluded.sent_at,
+    delivered = excluded.delivered,
+    error = excluded.error;
 
 -- name: ListEvents :many
 SELECT * FROM events

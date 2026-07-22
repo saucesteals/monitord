@@ -9,7 +9,6 @@ import (
 )
 
 type Event struct {
-	ID          int64
 	MonitorName string
 	EventID     string
 	Title       string
