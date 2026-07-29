@@ -65,6 +65,10 @@ type Message struct {
 	Fields     []Field
 	Footer     string
 	FooterIcon string
+	// MuteMentions prevents drivers that support mentions from notifying their
+	// configured targets. Health failures and recoveries use this so only
+	// monitor-declared events page people.
+	MuteMentions bool
 	// Time is the notification timestamp. Zero means "now" at render.
 	Time time.Time
 }

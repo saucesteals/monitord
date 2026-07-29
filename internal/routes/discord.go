@@ -89,6 +89,9 @@ func (discordDriver) Deliver(ctx context.Context, routeOptions Options, monitorO
 	if err != nil {
 		return err
 	}
+	if msg.MuteMentions {
+		mentions = nil
+	}
 
 	return SendDiscord(ctx, routeOptions["url"], msg, mentions)
 }

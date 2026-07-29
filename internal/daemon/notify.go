@@ -70,12 +70,13 @@ func resultMessage(m storage.Monitor, result monitor.Result, status monitor.Resu
 	}
 
 	return routes.Message{
-		Title:   title,
-		Summary: summary,
-		Details: strings.TrimSpace(result.Details),
-		Level:   level,
-		Fields:  fields,
-		Footer:  m.Name.String(),
+		Title:        title,
+		Summary:      summary,
+		Details:      strings.TrimSpace(result.Details),
+		Level:        level,
+		Fields:       fields,
+		Footer:       m.Name.String(),
+		MuteMentions: true,
 	}
 }
 
