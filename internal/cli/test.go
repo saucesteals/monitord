@@ -16,7 +16,6 @@ import (
 	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/model"
 	"github.com/saucesteals/monitord/internal/monitor"
-	"github.com/saucesteals/monitord/internal/routes"
 	"github.com/spf13/cobra"
 )
 
@@ -165,7 +164,6 @@ func runOneTick(
 		Type: monitord.InboundHello,
 		Hello: &monitord.Hello{
 			Monitor: monitord.MonitorName(name.String()),
-			Routes:  testRouteNames(config.Deliveries),
 			Dir:     dir,
 			Network: monitord.Network{},
 		},
@@ -212,14 +210,14 @@ func runOneTick(
 			if msg.Event.ID != "" {
 				fmt.Printf("          id=%s\n", msg.Event.ID)
 			}
-			fmt.Printf("          would deliver to %d route(s)\n", len(config.Deliveries))
+			fmt.Printf("          would deliver to %d destination(s)\n", len(config.Deliveries))
 		case monitord.OutboundResult:
 			fmt.Printf("\n[result] %s: %s\n", msg.Result.Status, msg.Result.Summary)
 			if msg.Result.Details != "" {
 				fmt.Println(indent(msg.Result.Details))
 			}
 			if msg.Result.Status == monitord.StatusFailure {
-				fmt.Printf("would page %d route(s) on the failure edge\n", len(config.Deliveries))
+				fmt.Printf("would page %d destination(s) on the failure edge\n", len(config.Deliveries))
 			}
 
 			out := msg.Result.State
@@ -235,15 +233,6 @@ func runOneTick(
 	}
 
 	return nil, "", fmt.Errorf("monitor exited without reporting a result")
-}
-
-func testRouteNames(deliveries []routes.Delivery) []monitord.RouteName {
-	names := make([]monitord.RouteName, 0, len(deliveries))
-	for _, delivery := range deliveries {
-		names = append(names, monitord.RouteName(delivery.Route.String()))
-	}
-
-	return names
 }
 
 func compactJSON(raw json.RawMessage) string {

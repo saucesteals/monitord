@@ -73,13 +73,12 @@ clients: 1
 every: 5m
 ttl: 24h
 timeout: 30s
-routes:
-  - route: discord:alerts
-    options:
+deliveries:
+  - discord:
+      account: jarvis
+      channel_id: "CHANNEL_ID"
+      thread_id: "THREAD_ID" # optional
       mentions: user:USER_ID
-  - route: openclaw:concierge
-    options:
-      prompt: Reserve the item when it comes back in stock.
 ```
 
 Events render as Discord embeds. Add fields and an image when the notification should be useful without opening the listing:
@@ -105,7 +104,7 @@ r.Emit(monitord.Event{
 infra/install.sh
 
 monitord init
-monitord route create discord alerts --option url="$DISCORD_WEBHOOK_URL"
+monitord account set discord jarvis --token "$JARVIS_BOT_TOKEN"
 
 monitord new restock-alert
 $EDITOR ~/.monitord/monitors/restock-alert/{monitor.go,monitor.yaml}
@@ -158,42 +157,51 @@ monitord state clear restock-alert
 
 `Failure` notifications are edge-triggered from the result status: one message when a monitor starts failing and one when it recovers. Everything else is an `Event` — emitted with `r.Emit`, delivered immediately, one embed each. Give a repeating event a dedupe key to suppress it for an hour; without a key it always sends.
 
-Routes are local labels for notification backends:
+Each monitor owns its destinations directly in `monitor.yaml`; there is no shared route registry. A Discord delivery takes exactly one of these forms:
 
-```bash
-monitord route create discord alerts --option url="$DISCORD_WEBHOOK_URL"
-monitord route test discord:alerts
+```yaml
+deliveries:
+  - discord:
+      account: jarvis
+      channel_id: "CHANNEL_ID"
+      thread_id: "THREAD_ID" # optional
+      mentions: user:USER_ID
+
+  - discord:
+      webhook_url: "https://discord.com/api/webhooks/..."
+      thread_id: "THREAD_ID" # optional
 ```
 
-Assign routes and per-monitor options in `monitor.yaml`. A monitor may list any number of routes, including multiple routes of the same kind. Discord mentions accept `user:ID`, `role:ID`, `here`, `everyone`, comma-separated combinations, or `none`; they are sent through `allowed_mentions`, so scraped content cannot create surprise mass pings.
+`account` plus `channel_id` is mutually exclusive with `webhook_url`. `thread_id` and `mentions` work with either form; monitord appends a webhook's `thread_id` query parameter at send time. Discord mentions accept `user:ID`, `role:ID`, `here`, `everyone`, comma-separated combinations, or `none`; they are sent through `allowed_mentions`, so scraped content cannot create surprise mass pings.
 
-OpenClaw routes call the Gateway's `/hooks/agent` endpoint. The route stores hook settings; the monitor stores the prompt OpenClaw should follow when a notification fires:
+Account tokens are stored in macOS Keychain, never YAML or SQLite:
+
+```bash
+monitord account set discord jarvis --token "$DISCORD_BOT_TOKEN"
+monitord account list
+monitord account remove discord jarvis
+```
+
+Account-backed Discord and OpenClaw delivery currently require macOS; direct Discord webhook deliveries work on Linux too.
+
+OpenClaw stays agentic and continues to use named agent routes, because it carries reusable hook credentials and delivery policy rather than a Discord destination:
 
 ```bash
 monitord route create openclaw concierge \
-  --option token="$OPENCLAW_HOOK_TOKEN" \
-  --option agent-id=main \
-  --option deliver=true \
-  --option channel=discord \
-  --option to=user:USER_ID
+  --option account=main \
+  --option agent-id=main
 ```
 
-Then configure the monitor:
+Store that account once with `monitord account set openclaw main --token "$OPENCLAW_HOOK_TOKEN"`.
 
 ```yaml
-every: 30s
-ttl: 2h
 routes:
-  - route: discord:alerts
   - route: openclaw:concierge
     options:
-      prompt: >-
-        Reserve the table if the available slot matches the monitor alert.
+      prompt: Reserve the table if the monitor event matches the request.
 ```
 
-OpenClaw defaults to `http://127.0.0.1:18789/hooks/agent`; override it with `--option url=...`. Other supported route keys are `session-key`, `wake-mode`, `model`, `thinking`, and `timeout-seconds`.
-
-Route drivers own their accepted route and monitor option keys. Both sets are stored as JSON, so adding another delivery backend does not require another database column or CLI flag.
+`prompt` is required per monitor. The route defaults to `http://127.0.0.1:18789/hooks/agent`; configure a different gateway with `--option url=...`. It also accepts `agent-id`, `session-key`, `wake-mode`, `deliver`, `channel`, `to`, `model`, `thinking`, and `timeout-seconds`. `channel` and `to` require `deliver=true`.
 
 ## Install And Update
 
@@ -259,7 +267,7 @@ Main directories:
 - `infra`: installer, service runner, and README assets
 - `internal/daemon`: scheduler and worker supervision
 - `internal/storage`: SQLite persistence
-- `internal/routes`: notification routes
+- `internal/routes`: notification delivery
 - `internal/monitor`: scaffold, build, describe, and artifact lifecycle
 - `internal/model`: shared names, statuses, and validation
 - `examples/http-watch`: example monitor

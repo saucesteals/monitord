@@ -26,7 +26,7 @@ Clarify these points before writing code. Ask the requester only when the answer
 - How long should it live: set `ttl`, or use `persistent: true` only for long-lived infrastructure checks.
 - What state must it remember: previous status, last seen ID, last price, known hashes, auth/session data?
 - Does it need proxies: use them only for targets that rate-limit or block direct traffic.
-- Who should be notified or acted for: choose a route and its per-monitor route options.
+- Who should be notified or acted for: add an inline Discord delivery, or use an OpenClaw agent route.
 
 Default to a TTL. Temporary watches should expire by themselves.
 
@@ -101,8 +101,10 @@ every: 5m
 ttl: 24h
 timeout: 30s
 max_events: 20 # optional; per-tick event cap, default 20
-routes:
-  - route: discord:alerts
+deliveries:
+  - discord:
+      account: jarvis
+      channel_id: "CHANNEL_ID"
 ```
 
 Rules that matter:
@@ -150,7 +152,7 @@ Field reference:
 - `Color` is an explicit accent as `0xRRGGBB`; leave it zero to derive the colour from `Severity` (info/warn/critical).
 - `Author` adds an attribution line; `Footer`/`FooterIcon` override the default monitor-name footer.
 
-Emit as many events as a tick finds — each is delivered immediately, concurrently, and on its own. A tick is capped so a runaway monitor can't flood a route: past the cap, the rest are dropped and logged. The default is 20; raise or lower it per monitor with `max_events` in `monitor.yaml`.
+Emit as many events as a tick finds — each is delivered immediately, concurrently, and on its own. A tick is capped so a runaway monitor can't flood a destination: past the cap, the rest are dropped and logged. The default is 20; raise or lower it per monitor with `max_events` in `monitor.yaml`.
 
 ## State
 
@@ -178,58 +180,55 @@ func (s *State) MigrateState(from int, raw json.RawMessage) error {
 
 If the shape changed and there is no migration, deploy refuses instead of silently dropping data. Either add a migration or clear state intentionally.
 
-## Routes
+## Discord Deliveries
 
-```bash
-monitord route list
-monitord route create discord alerts --option url="$DISCORD_WEBHOOK_URL"
-monitord route test discord:alerts
-```
-
-Routes are named `<kind>:<name>`, for example `discord:alerts`. The route name is a local label; the webhook URL decides where the message lands. Webhook URLs are redacted from output and logs.
-
-Mentions can live on the route or be overridden per monitor in YAML:
-
-```bash
-monitord route create discord ops \
-  --option url="$DISCORD_WEBHOOK_URL" \
-  --option mentions=role:ROLE_ID
-```
+Every monitor owns its Discord destinations directly. There is no named route or webhook registry.
 
 ```yaml
-routes:
-  - route: discord:ops
-    options:
+deliveries:
+  - discord:
+      account: jarvis
+      channel_id: "CHANNEL_ID"
+      thread_id: "THREAD_ID" # optional
       mentions: user:USER_ID
+
+  - discord:
+      webhook_url: "https://discord.com/api/webhooks/..."
+      thread_id: "THREAD_ID" # optional
 ```
 
-The Discord `mentions` option accepts `user:ID`, `role:ID`, `here`, `everyone`, comma-separated combinations, or `none`. Mentions are also an allowlist: scraped content containing `@everyone` is rendered inert unless that mention was explicitly allowed.
+`account` plus `channel_id` is mutually exclusive with `webhook_url`. `thread_id` and `mentions` work with either form; monitord adds a webhook's `thread_id` query parameter at send time. An account's bot token lives in macOS Keychain, never YAML or SQLite:
 
-Prefer one route per destination webhook and per-monitor mention overrides for who gets pinged.
+```bash
+monitord account set discord jarvis --token "$JARVIS_BOT_TOKEN"
+monitord account list
+monitord account remove discord jarvis
+```
 
-## OpenClaw Routes
+For bot delivery, `channel_id` is required and `thread_id` is optional. A webhook URL is exclusive with `account` and `channel_id`. Account-backed Discord and OpenClaw delivery currently require macOS; direct Discord webhook deliveries work on Linux too.
 
-Use an OpenClaw route when a monitor hit should become an agent task, such as reserving a table, drafting a response, or checking out a matching item.
+`mentions` accepts `user:ID`, `role:ID`, `here`, `everyone`, comma-separated combinations, or `none`. Mentions are an allowlist: scraped content containing `@everyone` is inert unless explicitly allowed.
+
+## OpenClaw Agent Routes
+
+OpenClaw remains a named agent route, keeping reusable hook credentials and delivery policy out of monitor YAML:
 
 ```bash
 monitord route create openclaw concierge \
-  --option token="$OPENCLAW_HOOK_TOKEN" \
+  --option account=main \
   --option agent-id=main
 ```
 
+Store the hook token once with `monitord account set openclaw main --token "$OPENCLAW_HOOK_TOKEN"`.
+
 ```yaml
-every: 30s
-ttl: 2h
 routes:
-  - route: discord:alerts
   - route: openclaw:concierge
     options:
-      prompt: Reserve the table if the available slot matches the alert.
+      prompt: Act on a matching monitor event.
 ```
 
-OpenClaw routes call `POST /hooks/agent` using `Authorization: Bearer <token>`. The monitor's `prompt` option is sent first, then monitord appends the notification title, summary, URL, details, fields, level, and monitor name as context.
-
-Set route settings with repeatable `--option key=value` flags. OpenClaw supports `url`, `token`, `agent-id`, `session-key`, `wake-mode`, `deliver`, `channel`, `to`, `model`, `thinking`, and `timeout-seconds`. Only set `session-key` when OpenClaw hooks are configured to allow request session keys.
+`prompt` is required per monitor. The route defaults to `http://127.0.0.1:18789/hooks/agent`; override it with `--option url=...`. Other route options are `agent-id`, `session-key`, `wake-mode`, `deliver`, `channel`, `to`, `model`, `thinking`, and `timeout-seconds`. `channel` and `to` require `deliver=true`.
 
 ## Proxies
 
@@ -315,5 +314,5 @@ monitord daemon --interval 5s --concurrency 8
 - `ttl` is required unless `persistent: true` is set.
 - Slow checks need a larger `timeout` than the default 30s.
 - `monitord test` runs direct and sends no notifications. Deployed behavior can differ when proxies are attached.
-- Deploy fails when a route or proxy pool does not exist. Create routes and import proxy pools first.
+- Deploy fails when a configured Discord delivery is invalid or a proxy pool does not exist. Store any required bot account in Keychain and import proxy pools first.
 - State schema changes require a version bump and migration, or an intentional `monitord state clear`.

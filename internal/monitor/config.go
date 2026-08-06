@@ -34,15 +34,28 @@ type Config struct {
 }
 
 type fileConfig struct {
-	Description string      `yaml:"description"`
-	Clients     int         `yaml:"clients"`
-	Every       string      `yaml:"every"`
-	TTL         string      `yaml:"ttl"`
-	Timeout     string      `yaml:"timeout"`
-	Persistent  bool        `yaml:"persistent"`
-	MaxEvents   int         `yaml:"max_events"`
-	Proxies     string      `yaml:"proxies"`
-	Routes      []fileRoute `yaml:"routes"`
+	Description string         `yaml:"description"`
+	Clients     int            `yaml:"clients"`
+	Every       string         `yaml:"every"`
+	TTL         string         `yaml:"ttl"`
+	Timeout     string         `yaml:"timeout"`
+	Persistent  bool           `yaml:"persistent"`
+	MaxEvents   int            `yaml:"max_events"`
+	Proxies     string         `yaml:"proxies"`
+	Deliveries  []fileDelivery `yaml:"deliveries"`
+	Routes      []fileRoute    `yaml:"routes"`
+}
+
+type fileDelivery struct {
+	Discord *fileDiscord `yaml:"discord"`
+}
+
+type fileDiscord struct {
+	Account    string `yaml:"account"`
+	ChannelID  string `yaml:"channel_id"`
+	ThreadID   string `yaml:"thread_id"`
+	WebhookURL string `yaml:"webhook_url"`
+	Mentions   string `yaml:"mentions"`
 }
 
 type fileRoute struct {
@@ -123,22 +136,33 @@ func (raw fileConfig) validate() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	if len(raw.Routes) == 0 {
-		return Config{}, errors.New("at least one route is required")
+	if len(raw.Deliveries) == 0 && len(raw.Routes) == 0 {
+		return Config{}, errors.New("at least one delivery is required")
 	}
 
-	deliveries := make([]routes.Delivery, 0, len(raw.Routes))
-	seen := make(map[model.RouteName]struct{}, len(raw.Routes))
+	deliveries := make([]routes.Delivery, 0, len(raw.Deliveries)+len(raw.Routes))
+	for index, item := range raw.Deliveries {
+		if item.Discord == nil {
+			return Config{}, fmt.Errorf("deliveries[%d]: discord is required", index)
+		}
+		delivery := routes.Delivery{Discord: &routes.Discord{
+			Account:    strings.TrimSpace(item.Discord.Account),
+			ChannelID:  strings.TrimSpace(item.Discord.ChannelID),
+			ThreadID:   strings.TrimSpace(item.Discord.ThreadID),
+			WebhookURL: strings.TrimSpace(item.Discord.WebhookURL),
+			Mentions:   strings.TrimSpace(item.Discord.Mentions),
+		}}
+		if err := delivery.Validate(); err != nil {
+			return Config{}, fmt.Errorf("deliveries[%d]: %w", index, err)
+		}
+
+		deliveries = append(deliveries, delivery)
+	}
 	for index, item := range raw.Routes {
 		name, err := model.ParseRouteName(strings.TrimSpace(item.Route))
 		if err != nil {
 			return Config{}, fmt.Errorf("routes[%d]: %w", index, err)
 		}
-		if _, exists := seen[name]; exists {
-			return Config{}, fmt.Errorf("route %s is listed more than once", name)
-		}
-		seen[name] = struct{}{}
-
 		options, err := scalarOptions(item.Options)
 		if err != nil {
 			return Config{}, fmt.Errorf("route %s: %w", name, err)
@@ -159,21 +183,6 @@ func (raw fileConfig) validate() (Config, error) {
 	}, nil
 }
 
-func requiredDuration(field string, value string) (time.Duration, error) {
-	if strings.TrimSpace(value) == "" {
-		return 0, fmt.Errorf("%s is required", field)
-	}
-	duration, err := time.ParseDuration(value)
-	if err != nil {
-		return 0, fmt.Errorf("%s: %w", field, err)
-	}
-	if duration <= 0 {
-		return 0, fmt.Errorf("%s must be positive", field)
-	}
-
-	return duration, nil
-}
-
 func scalarOptions(raw map[string]any) (routes.Options, error) {
 	options := make(routes.Options, len(raw))
 	for key, value := range raw {
@@ -181,7 +190,6 @@ func scalarOptions(raw map[string]any) (routes.Options, error) {
 		if key == "" {
 			return nil, errors.New("route option names must not be empty")
 		}
-
 		switch typed := value.(type) {
 		case string:
 			options[key] = typed
@@ -203,4 +211,19 @@ func scalarOptions(raw map[string]any) (routes.Options, error) {
 	}
 
 	return options, nil
+}
+
+func requiredDuration(field string, value string) (time.Duration, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, fmt.Errorf("%s is required", field)
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", field, err)
+	}
+	if duration <= 0 {
+		return 0, fmt.Errorf("%s must be positive", field)
+	}
+
+	return duration, nil
 }

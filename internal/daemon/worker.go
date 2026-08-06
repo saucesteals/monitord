@@ -14,7 +14,6 @@ import (
 
 	monitord "github.com/saucesteals/monitord"
 	"github.com/saucesteals/monitord/internal/monitor"
-	"github.com/saucesteals/monitord/internal/routes"
 	"github.com/saucesteals/monitord/internal/storage"
 )
 
@@ -54,6 +53,10 @@ type tickOutput struct {
 
 // start launches a worker process and completes the handshake.
 func startWorker(ctx context.Context, logger *slog.Logger, m storage.Monitor, network monitord.Network) (*worker, error) {
+	if err := m.Definition.Validate(); err != nil {
+		return nil, fmt.Errorf("monitor artifact requires redeploy: %w", err)
+	}
+
 	cmd := exec.Command(m.BinaryPath, monitord.FlagWorker)
 	setMonitorProcessGroup(cmd)
 	// Proxies travel in the handshake, not the environment, so credentials
@@ -124,7 +127,6 @@ func (w *worker) handshake(ctx context.Context, logger *slog.Logger, m storage.M
 		Type: monitord.InboundHello,
 		Hello: &monitord.Hello{
 			Monitor: monitord.MonitorName(m.Name.String()),
-			Routes:  protocolRouteNames(m.Deliveries),
 			Dir:     m.SourceDir,
 			Network: network,
 		},
@@ -150,15 +152,6 @@ func (w *worker) handshake(ctx context.Context, logger *slog.Logger, m storage.M
 	w.clients = msg.Ready.Clients
 
 	return nil
-}
-
-func protocolRouteNames(deliveries []routes.Delivery) []monitord.RouteName {
-	names := make([]monitord.RouteName, 0, len(deliveries))
-	for _, delivery := range deliveries {
-		names = append(names, monitord.RouteName(delivery.Route.String()))
-	}
-
-	return names
 }
 
 // tick sends one run to the worker and consumes messages until its result.

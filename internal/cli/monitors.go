@@ -129,16 +129,19 @@ func (c *CLI) deploy(target string) error {
 		req.Current = existing.State
 		req.CurrentVersion = existing.StateVersion
 	}
-
 	for _, delivery := range monitorConfig.Deliveries {
-		selectedRoute, err := store.GetRoute(ctx, delivery.Route)
+		if delivery.Discord != nil {
+			continue
+		}
+		route, err := store.GetRoute(ctx, delivery.Route)
 		if err != nil {
 			return err
 		}
-		if err := routes.ValidateMonitor(selectedRoute.Kind, delivery.Options); err != nil {
+		if err := routes.ValidateMonitor(route.Kind, delivery.Options); err != nil {
 			return fmt.Errorf("route %s: %w", delivery.Route, err)
 		}
 	}
+
 	if monitorConfig.ProxyPool != "" {
 		// Resolved now so a missing pool fails the deploy, not the first tick.
 		if _, err := store.GetProxyPool(ctx, monitorConfig.ProxyPool); err != nil {
@@ -171,19 +174,7 @@ func (c *CLI) deploy(target string) error {
 	}
 	fmt.Println()
 	for _, delivery := range built.Deliveries {
-		selectedRoute, err := store.GetRoute(ctx, delivery.Route)
-		if err != nil {
-			return err
-		}
-		description, err := routes.DescribeMonitor(selectedRoute.Kind, delivery.Options)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("route    %s", delivery.Route)
-		if description != "" {
-			fmt.Printf(" (%s)", truncate(description, 80))
-		}
-		fmt.Println()
+		fmt.Printf("delivery %s\n", truncate(delivery.Describe(), 80))
 	}
 	if req.CurrentVersion != 0 && req.CurrentVersion != built.StateVersion {
 		fmt.Printf("state migrated v%d -> v%d\n", req.CurrentVersion, built.StateVersion)
@@ -407,21 +398,9 @@ func (c *CLI) inspect(rawName string) error {
 	fmt.Printf("name: %s\n", m.Name)
 	fmt.Printf("status: %s\n", m.Status)
 	fmt.Printf("proxies: %s\n", orDash(m.ProxyPool.String()))
-	fmt.Println("routes:")
+	fmt.Println("deliveries:")
 	for _, delivery := range m.Deliveries {
-		route, err := store.GetRoute(context.Background(), delivery.Route)
-		if err != nil {
-			return err
-		}
-		description, err := routes.DescribeMonitor(route.Kind, delivery.Options)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("  - %s", delivery.Route)
-		if description != "" {
-			fmt.Printf(": %s", description)
-		}
-		fmt.Println()
+		fmt.Printf("  - %s\n", delivery.Describe())
 	}
 	fmt.Printf("clients: %d\n", m.Definition.Clients)
 	fmt.Printf("every: %s\n", time.Duration(m.IntervalSeconds)*time.Second)
@@ -490,7 +469,7 @@ func indentJSON(raw json.RawMessage) string {
 func deliveryNames(deliveries []routes.Delivery) string {
 	names := make([]string, 0, len(deliveries))
 	for _, delivery := range deliveries {
-		names = append(names, delivery.Route.String())
+		names = append(names, delivery.Describe())
 	}
 
 	return strings.Join(names, ",")

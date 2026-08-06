@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
-
-	"github.com/saucesteals/monitord/internal/model"
 )
 
 // color returns the embed accent for a level.
@@ -29,74 +29,7 @@ func (l Level) color() int {
 	}
 }
 
-type discordDriver struct{}
-
-const discordKind model.RouteKind = "discord"
-
-func init() {
-	Register(discordDriver{})
-}
-
-func (discordDriver) Kind() model.RouteKind {
-	return discordKind
-}
-
-func (discordDriver) PrepareRoute(options Options) (Options, error) {
-	if err := validateOptionKeys(options, "url", "mentions"); err != nil {
-		return nil, err
-	}
-	if strings.TrimSpace(options["url"]) == "" {
-		return nil, fmt.Errorf("discord route option url is required")
-	}
-	if _, err := ParseMentions(options["mentions"]); err != nil {
-		return nil, err
-	}
-
-	return options, nil
-}
-
-func (discordDriver) ValidateMonitor(options Options) error {
-	if err := validateOptionKeys(options, "mentions"); err != nil {
-		return err
-	}
-	_, err := ResolveMentions(options["mentions"], nil)
-
-	return err
-}
-
-func (discordDriver) DescribeRoute(options Options) string {
-	return fmt.Sprintf("pings=%s %s", orDefault(options["mentions"], "-"), RedactURL(options["url"]))
-}
-
-func (discordDriver) DescribeMonitor(options Options) string {
-	if options["mentions"] == "" {
-		return ""
-	}
-
-	return "pings=" + options["mentions"]
-}
-
-func (discordDriver) TestOptions() Options {
-	return nil
-}
-
-func (discordDriver) Deliver(ctx context.Context, routeOptions Options, monitorOptions Options, msg Message) error {
-	mentions, err := ParseMentions(routeOptions["mentions"])
-	if err != nil {
-		return err
-	}
-	mentions, err = ResolveMentions(monitorOptions["mentions"], mentions)
-	if err != nil {
-		return err
-	}
-	if msg.MuteMentions {
-		mentions = nil
-	}
-
-	return SendDiscord(ctx, routeOptions["url"], msg, mentions)
-}
-
-// MentionKind identifies who a route pings.
+// MentionKind identifies who a delivery pings.
 type MentionKind string
 
 const (
@@ -110,7 +43,7 @@ const (
 	MentionEveryone MentionKind = "everyone"
 )
 
-// Mention is one target a route pings when it fires.
+// Mention is one target a delivery pings when it fires.
 type Mention struct {
 	Kind MentionKind
 	ID   string
@@ -202,27 +135,8 @@ func FormatMentions(mentions []Mention) string {
 	return strings.Join(specs, ",")
 }
 
-// MentionNone is the override that silences a monitor on a route that would
-// otherwise ping someone.
+// MentionNone silences a delivery's mention list.
 const MentionNone = "none"
-
-// ResolveMentions picks who a notification pings.
-//
-// An empty override inherits the route's mentions, which is what a monitor
-// deployed without an opinion should do. "none" pings nobody, so a monitor can
-// stay quiet on a route that pings a role by default. Anything else replaces
-// the route's list, which is how two monitors on one channel ping two different
-// people without needing two routes for the same webhook.
-func ResolveMentions(override string, routeMentions []Mention) ([]Mention, error) {
-	switch strings.TrimSpace(override) {
-	case "":
-		return routeMentions, nil
-	case MentionNone:
-		return nil, nil
-	default:
-		return ParseMentions(override)
-	}
-}
 
 // allowedMentions constrains which pings Discord will honour in a payload.
 //
@@ -288,9 +202,19 @@ const (
 	maxFooter      = 2048
 )
 
-// SendDiscord sends a monitor notification to a Discord webhook, pinging only
-// the route's configured mentions.
+// SendDiscord sends a monitor notification to a Discord webhook.
 func SendDiscord(ctx context.Context, webhookURL string, msg Message, mentions []Mention) error {
+	return sendDiscord(ctx, webhookURL, "", msg, mentions)
+}
+
+// SendDiscordBot sends a monitor notification to a Discord channel as a bot.
+func SendDiscordBot(ctx context.Context, token string, channelID string, msg Message, mentions []Mention) error {
+	endpoint := "https://discord.com/api/v10/channels/" + channelID + "/messages"
+
+	return sendDiscord(ctx, endpoint, "Bot "+token, msg, mentions)
+}
+
+func sendDiscord(ctx context.Context, endpoint string, authorization string, msg Message, mentions []Mention) error {
 	body, err := json.Marshal(discordPayload{
 		Content:         renderMentions(mentions),
 		Embeds:          []embed{buildEmbed(msg)},
@@ -300,24 +224,74 @@ func SendDiscord(ctx context.Context, webhookURL string, msg Message, mentions [
 		return fmt.Errorf("encode discord payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build discord request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "monitord/0")
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send discord webhook %s: %w", RedactURL(webhookURL), err)
+		return fmt.Errorf("send discord notification: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("discord webhook %s returned HTTP %d", RedactURL(webhookURL), resp.StatusCode)
+		return fmt.Errorf("discord returned HTTP %d", resp.StatusCode)
 	}
 
 	return nil
+}
+
+func validateDiscordWebhookURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("parse discord webhook_url: %w", err)
+	}
+	if u.Scheme != "https" || u.Host != "discord.com" {
+		return errors.New("discord webhook_url must use https://discord.com")
+	}
+	if u.Query().Has("thread_id") {
+		return errors.New("discord webhook_url must not include thread_id; set thread_id beside it")
+	}
+	parts := strings.Split(strings.Trim(path.Clean(u.Path), "/"), "/")
+	if len(parts) != 4 || parts[0] != "api" || parts[1] != "webhooks" || !isSnowflake(parts[2]) || parts[3] == "" {
+		return errors.New("invalid Discord webhook_url")
+	}
+
+	return nil
+}
+
+func withDiscordThreadID(raw string, threadID string) (string, error) {
+	if threadID == "" {
+		return raw, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("parse discord webhook_url: %w", err)
+	}
+	query := u.Query()
+	query.Set("thread_id", threadID)
+	u.RawQuery = query.Encode()
+
+	return u.String(), nil
+}
+
+func isAccountName(value string) bool {
+	if len(value) == 0 || len(value) > 64 {
+		return false
+	}
+	for _, r := range value {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+			return false
+		}
+	}
+
+	return true
 }
 
 // buildEmbed renders a message as a single Discord embed.
@@ -421,7 +395,7 @@ func renderMentions(mentions []Mention) string {
 	return strings.Join(rendered, " ")
 }
 
-// allowFor builds an allowlist matching exactly the route's mentions. Parse is
+// allowFor builds an allowlist matching exactly the delivery's mentions. Parse is
 // a non-nil empty slice by default, which tells Discord to honour no mention it
 // finds in the text.
 func allowFor(mentions []Mention) allowedMentions {
@@ -461,7 +435,7 @@ func isSnowflake(value string) bool {
 	return true
 }
 
-// RedactURL redacts write-only route capability URLs for logs and CLI output.
+// RedactURL redacts write-only webhook capability URLs for logs and CLI output.
 func RedactURL(raw string) string {
 	parsed, err := url.Parse(raw)
 	if err != nil {

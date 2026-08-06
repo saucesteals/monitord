@@ -128,7 +128,7 @@ func validateDir(req Request) (string, error) {
 		return "", err
 	}
 	if len(req.Config.Deliveries) == 0 {
-		return "", errors.New("monitor requires at least one route")
+		return "", errors.New("monitor requires at least one delivery")
 	}
 
 	dir, err := filepath.Abs(req.Dir)

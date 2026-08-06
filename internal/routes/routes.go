@@ -3,6 +3,7 @@ package routes
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,13 +13,148 @@ import (
 	"github.com/saucesteals/monitord/internal/model"
 )
 
-// Options is persisted configuration owned by a route driver.
+// Delivery is one monitor-owned notification destination.
+type Delivery struct {
+	Discord *Discord        `json:"discord,omitempty"`
+	Route   model.RouteName `json:"route,omitempty"`
+	Options Options         `json:"options,omitempty"`
+}
+
+// Options is persisted configuration owned by an agent route driver.
 type Options map[string]string
 
-// Delivery binds one stored route to its per-monitor options.
-type Delivery struct {
-	Route   model.RouteName `json:"route"`
-	Options Options         `json:"options,omitempty"`
+// Discord is a Discord bot or webhook destination. Account plus ChannelID are
+// mutually exclusive with WebhookURL. Bot credentials are loaded from Keychain.
+type Discord struct {
+	Account    string `json:"account,omitempty"`
+	ChannelID  string `json:"channel_id,omitempty"`
+	ThreadID   string `json:"thread_id,omitempty"`
+	WebhookURL string `json:"webhook_url,omitempty"`
+	Mentions   string `json:"mentions,omitempty"`
+}
+
+// Validate reports whether d has exactly one usable Discord destination.
+func (d Delivery) Validate() error {
+	if d.Discord != nil {
+		if d.Route != "" {
+			return errors.New("discord delivery cannot also name an agent route")
+		}
+		if len(d.Options) != 0 {
+			return errors.New("discord delivery cannot include route options")
+		}
+
+		return d.Discord.Validate()
+	}
+
+	return d.Route.Validate()
+}
+
+// Validate reports whether d has exactly one usable Discord destination.
+func (d Discord) Validate() error {
+	d.Account = strings.TrimSpace(d.Account)
+	d.ChannelID = strings.TrimSpace(d.ChannelID)
+	d.ThreadID = strings.TrimSpace(d.ThreadID)
+	d.WebhookURL = strings.TrimSpace(d.WebhookURL)
+
+	if _, err := ParseMentions(d.Mentions); err != nil {
+		return err
+	}
+	if d.ThreadID != "" && !isSnowflake(d.ThreadID) {
+		return fmt.Errorf("invalid discord thread_id %q", d.ThreadID)
+	}
+
+	switch {
+	case d.Account != "" && d.WebhookURL != "":
+		return errors.New("discord account and webhook_url are mutually exclusive")
+	case d.Account == "" && d.WebhookURL == "":
+		return errors.New("discord requires account or webhook_url")
+	case d.WebhookURL != "":
+		if d.ChannelID != "" {
+			return errors.New("discord webhook_url is mutually exclusive with channel_id")
+		}
+		if err := validateDiscordWebhookURL(d.WebhookURL); err != nil {
+			return err
+		}
+	case d.Account == "":
+		return errors.New("discord account is required with channel_id")
+	case !isAccountName(d.Account):
+		return fmt.Errorf("invalid discord account %q", d.Account)
+	case !isSnowflake(d.ChannelID):
+		return errors.New("discord channel_id is required and must be a Discord ID")
+	}
+
+	return nil
+}
+
+// Describe returns non-secret destination details for CLI output.
+func (d Delivery) Describe() string {
+	if d.Discord == nil {
+		return d.Route.String()
+	}
+	if d.Discord.WebhookURL != "" {
+		return "discord webhook " + RedactURL(d.Discord.WebhookURL)
+	}
+
+	target := d.Discord.ChannelID
+	if d.Discord.ThreadID != "" {
+		target = d.Discord.ThreadID
+	}
+
+	return fmt.Sprintf("discord account=%s channel=%s", d.Discord.Account, target)
+}
+
+// DeliverDiscord sends msg to a direct Discord destination.
+func DeliverDiscord(ctx context.Context, delivery Delivery, msg Message) error {
+	if delivery.Discord == nil {
+		return errors.New("delivery is not direct Discord")
+	}
+	if err := delivery.Discord.Validate(); err != nil {
+		return err
+	}
+
+	mentions, err := ParseMentions(delivery.Discord.Mentions)
+	if err != nil {
+		return err
+	}
+	if msg.MuteMentions {
+		mentions = nil
+	}
+
+	if delivery.Discord.WebhookURL != "" {
+		webhookURL, err := withDiscordThreadID(delivery.Discord.WebhookURL, delivery.Discord.ThreadID)
+		if err != nil {
+			return err
+		}
+
+		return SendDiscord(ctx, webhookURL, msg, mentions)
+	}
+
+	token, err := AccountToken(ctx, "discord", delivery.Discord.Account)
+	if err != nil {
+		return err
+	}
+	target := delivery.Discord.ChannelID
+	if delivery.Discord.ThreadID != "" {
+		target = delivery.Discord.ThreadID
+	}
+
+	return SendDiscordBot(ctx, token, target, msg, mentions)
+}
+
+// CloneDeliveries returns an independently mutable delivery list.
+func CloneDeliveries(deliveries []Delivery) []Delivery {
+	cloned := make([]Delivery, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		copy := delivery
+		if delivery.Discord != nil {
+			discord := *delivery.Discord
+			copy.Discord = &discord
+		}
+		copy.Options = CloneOptions(delivery.Options)
+		cloned = append(cloned, copy)
+	}
+
+	return cloned
 }
 
 // Level selects a notification's accent colour.
@@ -29,7 +165,7 @@ const (
 	LevelInfo Level = "info"
 	// LevelSuccess is a healthy or recovered state.
 	LevelSuccess Level = "success"
-	// LevelWarn is a warning.
+	// LevelWarn is a warning event.
 	LevelWarn Level = "warn"
 	// LevelFailure is a failed check.
 	LevelFailure Level = "failure"
@@ -51,7 +187,7 @@ type Author struct {
 	IconURL string
 }
 
-// Message is a route-neutral monitor notification.
+// Message is a destination-neutral monitor notification.
 type Message struct {
 	Title      string
 	Summary    string
@@ -61,19 +197,17 @@ type Message struct {
 	Thumbnail  string
 	Author     Author
 	Level      Level
-	Color      int // explicit accent as 0xRRGGBB; zero derives from Level
+	Color      int
 	Fields     []Field
 	Footer     string
 	FooterIcon string
-	// MuteMentions prevents drivers that support mentions from notifying their
-	// configured targets. Health failures and recoveries use this so only
-	// monitor-declared events page people.
+	// MuteMentions prevents health failures and recoveries from paging people.
 	MuteMentions bool
-	// Time is the notification timestamp. Zero means "now" at render.
+	// Time is the notification timestamp. Zero means now at render time.
 	Time time.Time
 }
 
-// Driver owns validation, display, and delivery for one route kind.
+// Driver owns validation and delivery for an agent route backend.
 type Driver interface {
 	Kind() model.RouteKind
 	PrepareRoute(Options) (Options, error)
@@ -89,7 +223,7 @@ var (
 	drivers   = make(map[model.RouteKind]Driver)
 )
 
-// Register makes a route driver available to storage, the CLI, and the daemon.
+// Register makes an agent route driver available to storage and the CLI.
 func Register(driver Driver) {
 	driversMu.Lock()
 	defer driversMu.Unlock()
@@ -104,7 +238,7 @@ func Register(driver Driver) {
 	drivers[kind] = driver
 }
 
-// PrepareRoute applies driver defaults and validates persisted route options.
+// PrepareRoute validates one persisted agent route.
 func PrepareRoute(kind model.RouteKind, options Options) (Options, error) {
 	driver, err := getDriver(kind)
 	if err != nil {
@@ -114,7 +248,7 @@ func PrepareRoute(kind model.RouteKind, options Options) (Options, error) {
 	return driver.PrepareRoute(CloneOptions(options))
 }
 
-// ValidateMonitor checks per-monitor options against the selected driver.
+// ValidateMonitor validates a monitor's agent route options.
 func ValidateMonitor(kind model.RouteKind, options Options) error {
 	driver, err := getDriver(kind)
 	if err != nil {
@@ -124,7 +258,7 @@ func ValidateMonitor(kind model.RouteKind, options Options) error {
 	return driver.ValidateMonitor(options)
 }
 
-// DescribeRoute renders non-secret route configuration for CLI output.
+// DescribeRoute renders non-secret agent route configuration.
 func DescribeRoute(kind model.RouteKind, options Options) (string, error) {
 	driver, err := getDriver(kind)
 	if err != nil {
@@ -134,7 +268,7 @@ func DescribeRoute(kind model.RouteKind, options Options) (string, error) {
 	return driver.DescribeRoute(options), nil
 }
 
-// DescribeMonitor renders per-monitor route options for CLI output.
+// DescribeMonitor renders monitor-owned agent route options.
 func DescribeMonitor(kind model.RouteKind, options Options) (string, error) {
 	driver, err := getDriver(kind)
 	if err != nil {
@@ -144,7 +278,7 @@ func DescribeMonitor(kind model.RouteKind, options Options) (string, error) {
 	return driver.DescribeMonitor(options), nil
 }
 
-// Deliver sends one notification through the selected route driver.
+// Deliver sends one notification through an agent route driver.
 func Deliver(ctx context.Context, kind model.RouteKind, routeOptions Options, monitorOptions Options, msg Message) error {
 	driver, err := getDriver(kind)
 	if err != nil {
@@ -157,7 +291,7 @@ func Deliver(ctx context.Context, kind model.RouteKind, routeOptions Options, mo
 	return driver.Deliver(ctx, routeOptions, monitorOptions, msg)
 }
 
-// Test sends a driver-owned test notification.
+// Test sends a driver-owned agent route test notification.
 func Test(ctx context.Context, kind model.RouteKind, routeOptions Options, msg Message) error {
 	driver, err := getDriver(kind)
 	if err != nil {
@@ -172,19 +306,6 @@ func CloneOptions(options Options) Options {
 	cloned := make(Options, len(options))
 	for key, value := range options {
 		cloned[NormalizeOptionKey(key)] = value
-	}
-
-	return cloned
-}
-
-// CloneDeliveries returns an independently mutable delivery list.
-func CloneDeliveries(deliveries []Delivery) []Delivery {
-	cloned := make([]Delivery, 0, len(deliveries))
-	for _, delivery := range deliveries {
-		cloned = append(cloned, Delivery{
-			Route:   delivery.Route,
-			Options: CloneOptions(delivery.Options),
-		})
 	}
 
 	return cloned

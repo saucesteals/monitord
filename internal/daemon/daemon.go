@@ -34,7 +34,7 @@ const (
 	// maxEventsPerTick is the default cap on how many events one tick may
 	// deliver, used when a monitor sets no max_events. Emission order wins: the
 	// first N send, the rest are dropped and logged. An unbounded stream would
-	// let one bad tick flood a route.
+	// let one bad tick flood a destination.
 	maxEventsPerTick = 20
 	// maxEventConcurrency bounds in-flight event deliveries per tick, keeping
 	// bursts from tripping a webhook's rate limit.

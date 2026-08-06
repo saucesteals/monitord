@@ -25,7 +25,7 @@ type openClawDriver struct{}
 
 type openClawConfig struct {
 	URL            string
-	Token          string
+	Account        string
 	AgentID        string
 	SessionKey     string
 	WakeMode       string
@@ -64,7 +64,7 @@ func (openClawDriver) PrepareRoute(options Options) (Options, error) {
 		options["url"] = defaultOpenClawHookURL
 	}
 	if err := validateOptionKeys(options,
-		"url", "token", "agent_id", "session_key", "wake_mode", "deliver",
+		"url", "account", "agent_id", "session_key", "wake_mode", "deliver",
 		"channel", "to", "model", "thinking", "timeout_seconds"); err != nil {
 		return nil, err
 	}
@@ -145,7 +145,12 @@ func (openClawDriver) Deliver(ctx context.Context, routeOptions Options, monitor
 		return err
 	}
 
-	return sendOpenClaw(ctx, cfg, monitorOptions["prompt"], msg)
+	token, err := AccountToken(ctx, "openclaw", cfg.Account)
+	if err != nil {
+		return err
+	}
+
+	return sendOpenClaw(ctx, cfg, token, monitorOptions["prompt"], msg)
 }
 
 func parseOpenClawConfig(options Options) (openClawConfig, error) {
@@ -160,7 +165,7 @@ func parseOpenClawConfig(options Options) (openClawConfig, error) {
 
 	cfg := openClawConfig{
 		URL:            strings.TrimSpace(options["url"]),
-		Token:          strings.TrimSpace(options["token"]),
+		Account:        strings.TrimSpace(options["account"]),
 		AgentID:        strings.TrimSpace(options["agent_id"]),
 		SessionKey:     strings.TrimSpace(options["session_key"]),
 		WakeMode:       strings.TrimSpace(options["wake_mode"]),
@@ -174,8 +179,8 @@ func parseOpenClawConfig(options Options) (openClawConfig, error) {
 	if cfg.URL == "" {
 		return openClawConfig{}, errors.New("openclaw route option url is required")
 	}
-	if cfg.Token == "" {
-		return openClawConfig{}, errors.New("openclaw route option token is required")
+	if !isAccountName(cfg.Account) {
+		return openClawConfig{}, fmt.Errorf("invalid openclaw account %q", cfg.Account)
 	}
 	if !cfg.Deliver && (cfg.Channel != "" || cfg.To != "") {
 		return openClawConfig{}, errors.New("openclaw route options channel/to require deliver=true")
@@ -216,7 +221,7 @@ func parseOptionalSeconds(value string) (int64, error) {
 	return int64(duration / time.Second), nil
 }
 
-func sendOpenClaw(ctx context.Context, cfg openClawConfig, prompt string, msg Message) error {
+func sendOpenClaw(ctx context.Context, cfg openClawConfig, token string, prompt string, msg Message) error {
 	body, err := json.Marshal(openClawAgentPayload{
 		Message:        renderOpenClawMessage(prompt, msg),
 		Name:           openClawRunName(msg),
@@ -238,7 +243,7 @@ func sendOpenClaw(ctx context.Context, cfg openClawConfig, prompt string, msg Me
 	if err != nil {
 		return fmt.Errorf("build openclaw request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "monitord/0")
 

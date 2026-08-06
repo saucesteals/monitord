@@ -15,7 +15,7 @@ import (
 	"github.com/saucesteals/monitord/internal/storage"
 )
 
-// notification pairs a rendered message with the routes that should receive it.
+// notification pairs a rendered message with the destinations that should receive it.
 type notification struct {
 	Deliveries []routes.Delivery
 	Message    routes.Message
@@ -156,7 +156,7 @@ func (r *tickRun) record() {
 
 // reportHealth pages once on a health edge. Events already delivered live during
 // execute; the result only drives failure and recovery notifications, edge-
-// triggered off the last status the routes were told about.
+// triggered off the last status the destinations were told about.
 func (r *tickRun) reportHealth() {
 	m := r.monitor
 	if r.status == m.NotifiedStatus {
@@ -198,7 +198,7 @@ func (r *tickRun) finalize() {
 }
 
 // notify is the tick's single send primitive: skip suppressed events, fan the
-// message out to every route, log the event for history and dedupe, and record
+// message out to every destination, log the event for history and dedupe, and record
 // the notified status once it lands. It is safe for concurrent use, so events
 // deliver in parallel through it.
 func (r *tickRun) notify(note notification) {
@@ -262,8 +262,8 @@ func (r *tickRun) notify(note notification) {
 	}
 }
 
-// fanOut delivers the message to every route concurrently, returning one message
-// per route that failed.
+// fanOut delivers the message to every destination concurrently, returning one
+// error string per failed delivery.
 func (r *tickRun) fanOut(ctx context.Context, note notification) []string {
 	errCh := make(chan string, len(note.Deliveries))
 	var wg sync.WaitGroup
@@ -272,7 +272,7 @@ func (r *tickRun) fanOut(ctx context.Context, note notification) []string {
 		go func(delivery routes.Delivery) {
 			defer wg.Done()
 			if err := r.daemon.deliverRoute(ctx, delivery, note.Message); err != nil {
-				errCh <- fmt.Sprintf("%s: %v", delivery.Route, err)
+				errCh <- fmt.Sprintf("%s: %v", delivery.Describe(), err)
 			}
 		}(delivery)
 	}
@@ -301,7 +301,7 @@ func (r *tickRun) recordErrs(errs []string) {
 
 // dispatcher delivers a tick's events as the worker streams them: concurrently,
 // bounded by a per-tick cap and a concurrency limit, so reading the next worker
-// frame never blocks and a runaway monitor can't flood a route.
+// frame never blocks and a runaway monitor can't flood a destination.
 type dispatcher struct {
 	monitor storage.Monitor
 	logger  *slog.Logger
