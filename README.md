@@ -10,7 +10,7 @@
 [![SQLite](https://img.shields.io/badge/State-SQLite-3f7f5f?style=flat)](https://sqlite.org/)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-lightgrey)]()
 
-**Monitoring** | **Typed State** | **Long-Lived Workers** | **Discord Alerts** | **CLI Ops**
+**Monitoring** | **Typed State** | **Long-Lived Workers** | **Discord Alerts** | **OpenClaw Tasks** | **CLI Ops**
 
 </div>
 
@@ -27,6 +27,7 @@ Use it when cron is too stateless and a full job platform is too much.
 - Lifecycle: `test`, `deploy`, schedule, expire, inspect, and remove monitors through one CLI.
 - Workers: deployed monitors run as long-lived worker processes, so HTTP clients, sessions, and caches can survive between ticks.
 - Discord: send rich embeds for alerts, failure edges, recoveries, and deduped per-target events.
+- OpenClaw: turn monitor hits into agent tasks with a per-monitor prompt and notification context.
 - Proxies: import proxy pools once, then assign managed proxy clients at deploy time without putting credentials in source.
 
 ## Code
@@ -171,7 +172,17 @@ deliveries:
       thread_id: "THREAD_ID" # optional
 ```
 
-`account` plus `channel_id` is mutually exclusive with `webhook_url`. Set a bot account once with `monitord account set discord NAME --token "$DISCORD_BOT_TOKEN"`; its token lives in macOS Keychain. `thread_id` and `mentions` work with either form; monitord adds a webhook's thread query parameter at send time. Discord mentions accept `user:ID`, `role:ID`, `here`, `everyone`, comma-separated combinations, or `none`; they are sent through `allowed_mentions`, so scraped content cannot create surprise mass pings.
+`account` plus `channel_id` is mutually exclusive with `webhook_url`. `thread_id` and `mentions` work with either form; monitord appends a webhook's `thread_id` query parameter at send time. Discord mentions accept `user:ID`, `role:ID`, `here`, `everyone`, comma-separated combinations, or `none`; they are sent through `allowed_mentions`, so scraped content cannot create surprise mass pings.
+
+Account tokens are stored in macOS Keychain, never YAML or SQLite:
+
+```bash
+monitord account set discord jarvis --token "$DISCORD_BOT_TOKEN"
+monitord account list
+monitord account remove discord jarvis
+```
+
+Account-backed Discord and OpenClaw delivery currently require macOS; direct Discord webhook deliveries work on Linux too.
 
 OpenClaw stays agentic and continues to use named agent routes, because it carries reusable hook credentials and delivery policy rather than a Discord destination:
 
@@ -189,6 +200,8 @@ routes:
     options:
       prompt: Reserve the table if the monitor event matches the request.
 ```
+
+`prompt` is required per monitor. The route defaults to `http://127.0.0.1:18789/hooks/agent`; configure a different gateway with `--option url=...`. It also accepts `agent-id`, `session-key`, `wake-mode`, `deliver`, `channel`, `to`, `model`, `thinking`, and `timeout-seconds`. `channel` and `to` require `deliver=true`.
 
 ## Install And Update
 

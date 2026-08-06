@@ -197,13 +197,15 @@ deliveries:
       thread_id: "THREAD_ID" # optional
 ```
 
-`account` plus `channel_id` is mutually exclusive with `webhook_url`. An account's bot token lives in macOS Keychain, never YAML or SQLite:
+`account` plus `channel_id` is mutually exclusive with `webhook_url`. `thread_id` and `mentions` work with either form; monitord adds a webhook's `thread_id` query parameter at send time. An account's bot token lives in macOS Keychain, never YAML or SQLite:
 
 ```bash
 monitord account set discord jarvis --token "$JARVIS_BOT_TOKEN"
+monitord account list
+monitord account remove discord jarvis
 ```
 
-For bot delivery, `channel_id` is required and `thread_id` is optional. A webhook URL is exclusive with `account` and `channel_id`; `thread_id` works for webhooks too and monitord adds the query parameter at send time.
+For bot delivery, `channel_id` is required and `thread_id` is optional. A webhook URL is exclusive with `account` and `channel_id`. Account-backed Discord and OpenClaw delivery currently require macOS; direct Discord webhook deliveries work on Linux too.
 
 `mentions` accepts `user:ID`, `role:ID`, `here`, `everyone`, comma-separated combinations, or `none`. Mentions are an allowlist: scraped content containing `@everyone` is inert unless explicitly allowed.
 
@@ -225,6 +227,8 @@ routes:
     options:
       prompt: Act on a matching monitor event.
 ```
+
+`prompt` is required per monitor. The route defaults to `http://127.0.0.1:18789/hooks/agent`; override it with `--option url=...`. Other route options are `agent-id`, `session-key`, `wake-mode`, `deliver`, `channel`, `to`, `model`, `thinking`, and `timeout-seconds`. `channel` and `to` require `deliver=true`.
 
 ## Proxies
 
