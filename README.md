@@ -176,6 +176,18 @@ need expiry: every tick reloads state from the database.
 
 `Failure` notifications are edge-triggered from the result status: one message when a monitor starts failing and one when it recovers. Everything else is an `Event` — emitted with `r.Emit`, delivered immediately, one embed each. Every event needs a stable ID; repeats of the same ID are suppressed for one hour and kept in event history. `Emit` returns an error for invalid output, and an ignored error still fails the tick.
 
+The delivery's YAML `mentions` are the default. An event can override them with
+a typed allowlist: nil inherits the default, an empty `Mentions{}` suppresses
+all pings, and a populated value replaces the default.
+
+```go
+r.Emit(monitord.Event{
+	ID:       "listing:" + pair.ID,
+	Title:    "new listing",
+	Mentions: &monitord.Mentions{Everyone: true},
+})
+```
+
 Each monitor owns its destinations directly in `monitor.yaml`; there is no shared route registry. A Discord delivery takes exactly one of these forms:
 
 ```yaml

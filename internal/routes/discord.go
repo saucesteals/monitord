@@ -80,6 +80,10 @@ func ParseMention(value string) (Mention, error) {
 
 // ParseMentions reads a comma-separated list of mention specs.
 func ParseMentions(value string) ([]Mention, error) {
+	if strings.TrimSpace(value) == MentionNone {
+		return nil, nil
+	}
+
 	var mentions []Mention
 	for _, part := range strings.Split(value, ",") {
 		if strings.TrimSpace(part) == "" {

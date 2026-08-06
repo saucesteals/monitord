@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	monitor "github.com/saucesteals/monitord"
 	"github.com/saucesteals/monitord/internal/model"
 )
 
@@ -112,7 +113,7 @@ func DeliverDiscord(ctx context.Context, delivery Delivery, msg Message) error {
 		return err
 	}
 
-	mentions, err := ParseMentions(delivery.Discord.Mentions)
+	mentions, err := discordMentions(delivery.Discord.Mentions, msg.Mentions)
 	if err != nil {
 		return err
 	}
@@ -139,6 +140,28 @@ func DeliverDiscord(ctx context.Context, delivery Delivery, msg Message) error {
 	}
 
 	return SendDiscordBot(ctx, token, target, msg, mentions)
+}
+
+func discordMentions(defaults string, override *monitor.Mentions) ([]Mention, error) {
+	if override == nil {
+		return ParseMentions(defaults)
+	}
+
+	mentions := make([]Mention, 0, len(override.Users)+len(override.Roles)+2)
+	for _, id := range override.Users {
+		mentions = append(mentions, Mention{Kind: MentionUser, ID: id})
+	}
+	for _, id := range override.Roles {
+		mentions = append(mentions, Mention{Kind: MentionRole, ID: id})
+	}
+	if override.Here {
+		mentions = append(mentions, Mention{Kind: MentionHere})
+	}
+	if override.Everyone {
+		mentions = append(mentions, Mention{Kind: MentionEveryone})
+	}
+
+	return mentions, nil
 }
 
 // CloneDeliveries returns an independently mutable delivery list.
@@ -201,6 +224,9 @@ type Message struct {
 	Fields     []Field
 	Footer     string
 	FooterIcon string
+	// Mentions overrides the delivery's configured mentions. Nil inherits the
+	// delivery default; an empty value suppresses all pings for this message.
+	Mentions *monitor.Mentions
 	// MuteMentions prevents health failures and recoveries from paging people.
 	MuteMentions bool
 	// Time is the notification timestamp. Zero means now at render time.
