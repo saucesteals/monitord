@@ -230,20 +230,22 @@ func (r *tickRun) notify(note notification) {
 	errs := r.fanOut(ctx, note)
 	delivered := len(errs) == 0
 
-	// Every event has a stable ID, so alert history and future dedupe checks use
-	// one row per (monitor, id). Health pages do not carry an event ID.
-	if err := r.daemon.store.RecordEvent(ctx, storage.Event{
-		MonitorName: r.monitor.Name,
-		EventID:     note.ID,
-		Title:       note.Message.Title,
-		Summary:     note.Message.Summary,
-		URL:         note.Message.URL,
-		Severity:    string(note.Message.Level),
-		SentAt:      now,
-		Delivered:   delivered,
-		Error:       strings.Join(errs, "; "),
-	}); err != nil {
-		r.daemon.logger.Error("record event failed", "monitor", r.monitor.Name, "error", err)
+	// Only emitted events have IDs and belong in event history. Health
+	// notifications are represented by their runs and notified status instead.
+	if note.ID != "" {
+		if err := r.daemon.store.RecordEvent(ctx, storage.Event{
+			MonitorName: r.monitor.Name,
+			EventID:     note.ID,
+			Title:       note.Message.Title,
+			Summary:     note.Message.Summary,
+			URL:         note.Message.URL,
+			Severity:    string(note.Message.Level),
+			SentAt:      now,
+			Delivered:   delivered,
+			Error:       strings.Join(errs, "; "),
+		}); err != nil {
+			r.daemon.logger.Error("record event failed", "monitor", r.monitor.Name, "error", err)
+		}
 	}
 
 	if !delivered {

@@ -122,7 +122,7 @@ A tick does two separate jobs: it returns a health `Result`, and along the way i
 
 - `monitord.Success(...)`: the check ran and the watched thing is healthy. Silent.
 - `monitord.Failure(...)`: the check itself broke. Pages on the failure edge and again on recovery, not every tick.
-- `r.Emit(event)`: something worth reporting happened. Each event needs a stable ID, is its own Discord embed, and is delivered the moment it is emitted.
+- `r.Emit(event)`: something worth reporting happened. Each event needs a stable ID, is its own Discord embed, and is delivered the moment it is emitted. It returns an error for invalid output; an ignored error still fails the tick.
 
 Return `Failure` for broken checks (unreachable target, bad response, auth failure, unparseable data). Emit an `Event` for every noteworthy finding (restock, threshold crossed, new listing, content change) and return `Success`. A tick can emit many events — one per finding — and each is sent live and independently of the result. Deliveries run concurrently, so events are not guaranteed to arrive in emission order.
 

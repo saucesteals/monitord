@@ -155,7 +155,7 @@ monitord state clear restock-alert
 
 ## Notifications
 
-`Failure` notifications are edge-triggered from the result status: one message when a monitor starts failing and one when it recovers. Everything else is an `Event` — emitted with `r.Emit`, delivered immediately, one embed each. Give a repeating event a dedupe key to suppress it for an hour; without a key it always sends.
+`Failure` notifications are edge-triggered from the result status: one message when a monitor starts failing and one when it recovers. Everything else is an `Event` — emitted with `r.Emit`, delivered immediately, one embed each. Every event needs a stable ID; repeats of the same ID are suppressed for one hour and kept in event history. `Emit` returns an error for invalid output, and an ignored error still fails the tick.
 
 Each monitor owns its destinations directly in `monitor.yaml`; there is no shared route registry. A Discord delivery takes exactly one of these forms:
 
