@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/saucesteals/monitord/internal/model"
 	"github.com/saucesteals/monitord/internal/routes"
@@ -13,7 +15,7 @@ import (
 func (c *CLI) newRouteCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "route",
-		Short: "Manage notification routes",
+		Short: "Manage agent delivery routes",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return requireSubcommand("route", "create, list, test")
 		},
@@ -27,44 +29,27 @@ func (c *CLI) newRouteCmd() *cobra.Command {
 	return cmd
 }
 
-func (c *CLI) routeStore() (*storage.Store, error) {
-	store, _, err := c.store()
-	if err != nil {
-		return nil, err
-	}
-
-	return store, nil
-}
-
 func (c *CLI) newRouteCreateCmd() *cobra.Command {
-	var opts routeCreateOptions
+	var options []string
 
 	cmd := &cobra.Command{
-		Use:   "create KIND NAME",
-		Short: "Create or update a route",
+		Use:   "create openclaw NAME",
+		Short: "Create or update an OpenClaw agent route",
 		Args:  exactArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
-			store, err := c.routeStore()
-			if err != nil {
-				return err
-			}
-			defer func() { _ = store.Close() }()
-
-			return routeCreate(store, args[0], args[1], opts)
+			return c.createOpenClawRoute(args[0], args[1], options)
 		},
 	}
-	cmd.Flags().StringArrayVar(&opts.Options, "option", nil, "route setting as key=value (repeatable)")
-	cmd.Flags().StringArrayVar(&opts.OptionFiles, "option-file", nil, "route setting read from key=path (repeatable)")
+	cmd.Flags().StringArrayVar(&options, "option", nil, "route setting as key=value (repeatable)")
 
 	return cmd
 }
 
-type routeCreateOptions struct {
-	Options     []string
-	OptionFiles []string
-}
+func (c *CLI) createOpenClawRoute(rawKind string, rawName string, values []string) error {
+	if rawKind != "openclaw" {
+		return fmt.Errorf("only openclaw agent routes are supported")
+	}
 
-func routeCreate(store *storage.Store, rawKind string, rawName string, opts routeCreateOptions) error {
 	kind, err := model.ParseRouteKind(rawKind)
 	if err != nil {
 		return err
@@ -73,106 +58,110 @@ func routeCreate(store *storage.Store, rawKind string, rawName string, opts rout
 	if err != nil {
 		return err
 	}
-
-	route, err := buildRoute(name, kind, opts)
+	options, err := readRouteOptions(values)
 	if err != nil {
 		return err
-	}
-	if err := store.UpsertRoute(context.Background(), route); err != nil {
-		return err
-	}
-
-	description, err := routes.DescribeRoute(route.Kind, route.Options)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("route %s created\n", route.Name)
-	fmt.Printf("config %s\n", description)
-
-	return nil
-}
-
-func buildRoute(name model.RouteName, kind model.RouteKind, opts routeCreateOptions) (storage.Route, error) {
-	options, err := readRouteOptions(opts.Options, opts.OptionFiles)
-	if err != nil {
-		return storage.Route{}, err
 	}
 	options, err = routes.PrepareRoute(kind, options)
 	if err != nil {
-		return storage.Route{}, err
+		return err
 	}
 
-	return storage.Route{Name: name, Kind: kind, Options: options}, nil
+	store, _, err := c.store()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+
+	if err := store.UpsertRoute(context.Background(), storage.Route{
+		Name:    name,
+		Kind:    kind,
+		Options: options,
+	}); err != nil {
+		return err
+	}
+
+	fmt.Printf("agent route %s created\n", name)
+
+	return nil
 }
 
 func (c *CLI) newRouteListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
-		Short: "List routes",
+		Short: "List agent routes",
 		Args:  noArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			store, err := c.routeStore()
+			store, _, err := c.store()
 			if err != nil {
 				return err
 			}
 			defer func() { _ = store.Close() }()
 
-			return routeList(store)
+			items, err := store.ListRoutes(context.Background())
+			if err != nil {
+				return err
+			}
+			for _, item := range items {
+				description, err := routes.DescribeRoute(item.Kind, item.Options)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("%-28s %s\n", item.Name, description)
+			}
+
+			return nil
 		},
 	}
-}
-
-func routeList(store *storage.Store) error {
-	items, err := store.ListRoutes(context.Background())
-	if err != nil {
-		return err
-	}
-	for _, item := range items {
-		description, err := routes.DescribeRoute(item.Kind, item.Options)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("%-28s %-12s %s\n", item.Name, item.Kind, description)
-	}
-
-	return nil
 }
 
 func (c *CLI) newRouteTestCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "test ROUTE",
-		Short: "Send a test notification",
+		Short: "Send an agent route test",
 		Args:  exactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			store, err := c.routeStore()
+			name, err := model.ParseRouteName(args[0])
+			if err != nil {
+				return err
+			}
+			store, _, err := c.store()
 			if err != nil {
 				return err
 			}
 			defer func() { _ = store.Close() }()
 
-			return routeTest(store, args[0])
+			route, err := store.GetRoute(context.Background(), name)
+			if err != nil {
+				return err
+			}
+			if err := routes.Test(context.Background(), route.Kind, route.Options, routes.Message{
+				Title:   "monitord route test",
+				Summary: "test notification from monitord",
+			}); err != nil {
+				return err
+			}
+
+			fmt.Printf("sent test notification to %s\n", route.Name)
+
+			return nil
 		},
 	}
 }
 
-func routeTest(store *storage.Store, rawName string) error {
-	name, err := model.ParseRouteName(rawName)
-	if err != nil {
-		return err
-	}
-	route, err := store.GetRoute(context.Background(), name)
-	if err != nil {
-		return err
-	}
-	msg := routes.Message{
-		Title:   "monitord route test",
-		Summary: "test notification from monitord",
-	}
-	if err := routes.Test(context.Background(), route.Kind, route.Options, msg); err != nil {
-		return err
+func readRouteOptions(values []string) (routes.Options, error) {
+	options := make(routes.Options, len(values))
+	for _, raw := range values {
+		key, value, ok := strings.Cut(raw, "=")
+		key = routes.NormalizeOptionKey(key)
+		if !ok || key == "" {
+			return nil, errors.New("route options must use key=value")
+		}
+		if _, exists := options[key]; exists {
+			return nil, fmt.Errorf("route option %q was provided more than once", key)
+		}
+		options[key] = value
 	}
 
-	fmt.Printf("sent test notification to %s\n", route.Name)
-
-	return nil
+	return options, nil
 }

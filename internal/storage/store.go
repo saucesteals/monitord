@@ -32,7 +32,7 @@ type Store struct {
 	q  *db.Queries
 }
 
-// Route is a named notification sink.
+// Route is a named agentic notification sink. Discord deliveries are inline.
 type Route struct {
 	Name      model.RouteName
 	Kind      model.RouteKind
@@ -157,9 +157,7 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// ---- routes ----
-
-// UpsertRoute creates or updates a notification route.
+// UpsertRoute creates or updates an agent route.
 func (s *Store) UpsertRoute(ctx context.Context, route Route) error {
 	if err := route.Name.Validate(); err != nil {
 		return err
@@ -173,17 +171,10 @@ func (s *Store) UpsertRoute(ctx context.Context, route Route) error {
 		return err
 	}
 	now := toMs(time.Now().UTC())
-
-	return s.q.UpsertRoute(ctx, db.UpsertRouteParams{
-		Name:      route.Name.String(),
-		Kind:      route.Kind.String(),
-		Config:    configJSON,
-		CreatedAt: now,
-		UpdatedAt: now,
-	})
+	return s.q.UpsertRoute(ctx, db.UpsertRouteParams{Name: route.Name.String(), Kind: route.Kind.String(), Config: configJSON, CreatedAt: now, UpdatedAt: now})
 }
 
-// ListRoutes returns all notification routes.
+// ListRoutes returns all agent routes.
 func (s *Store) ListRoutes(ctx context.Context) ([]Route, error) {
 	rows, err := s.q.ListRoutes(ctx)
 	if err != nil {
@@ -191,17 +182,16 @@ func (s *Store) ListRoutes(ctx context.Context) ([]Route, error) {
 	}
 	out := make([]Route, 0, len(rows))
 	for _, row := range rows {
-		r, err := toRoute(row)
+		route, err := toRoute(row)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, r)
+		out = append(out, route)
 	}
-
 	return out, nil
 }
 
-// GetRoute loads a route by name.
+// GetRoute loads one agent route by name.
 func (s *Store) GetRoute(ctx context.Context, name model.RouteName) (Route, error) {
 	if err := name.Validate(); err != nil {
 		return Route{}, err
@@ -213,7 +203,6 @@ func (s *Store) GetRoute(ctx context.Context, name model.RouteName) (Route, erro
 	if err != nil {
 		return Route{}, err
 	}
-
 	return toRoute(row)
 }
 
@@ -228,7 +217,7 @@ func (s *Store) UpsertMonitor(ctx context.Context, m Monitor) error {
 		return errors.New("monitor requires at least one delivery")
 	}
 	for _, delivery := range m.Deliveries {
-		if err := delivery.Route.Validate(); err != nil {
+		if err := delivery.Validate(); err != nil {
 			return err
 		}
 	}
@@ -450,7 +439,7 @@ func (s *Store) ExpireMonitor(ctx context.Context, name model.MonitorName, now t
 	return nil
 }
 
-// MarkNotified records the status a monitor's routes were last told about.
+// MarkNotified records the status a monitor's destinations were last told about.
 func (s *Store) MarkNotified(ctx context.Context, name model.MonitorName, status monitor.ResultStatus) error {
 	if err := s.q.MarkNotified(ctx, db.MarkNotifiedParams{NotifiedStatus: status.String(), Name: name.String()}); err != nil {
 		return fmt.Errorf("mark notified for %s: %w", name, err)
@@ -789,16 +778,15 @@ func toRoute(r db.Route) (Route, error) {
 	if err != nil {
 		return Route{}, err
 	}
-	opts, err := decodeOptions(r.Config)
+	options, err := decodeOptions(r.Config)
 	if err != nil {
 		return Route{}, fmt.Errorf("parse config for route %s: %w", name, err)
 	}
-	opts, err = routes.PrepareRoute(kind, opts)
+	options, err = routes.PrepareRoute(kind, options)
 	if err != nil {
 		return Route{}, fmt.Errorf("invalid config for route %s: %w", name, err)
 	}
-
-	return Route{Name: name, Kind: kind, Options: opts, CreatedAt: fromMs(r.CreatedAt), UpdatedAt: fromMs(r.UpdatedAt)}, nil
+	return Route{Name: name, Kind: kind, Options: options, CreatedAt: fromMs(r.CreatedAt), UpdatedAt: fromMs(r.UpdatedAt)}, nil
 }
 
 func toMonitor(m db.Monitor) (Monitor, error) {
@@ -958,7 +946,6 @@ func encodeOptions(options routes.Options) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal route options: %w", err)
 	}
-
 	return string(raw), nil
 }
 
@@ -970,7 +957,6 @@ func decodeOptions(raw string) (routes.Options, error) {
 	if err := json.Unmarshal([]byte(raw), &options); err != nil {
 		return nil, fmt.Errorf("unmarshal route options: %w", err)
 	}
-
 	return options, nil
 }
 

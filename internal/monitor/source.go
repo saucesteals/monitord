@@ -112,6 +112,8 @@ clients: 1
 every: 5m
 ttl: 24h
 timeout: 30s
-routes:
-  - route: discord:alerts
+deliveries:
+  - discord:
+      account: jarvis
+      channel_id: "CHANNEL_ID"
 `

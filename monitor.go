@@ -45,8 +45,6 @@ type Runner[S any] func(context.Context, *Run[S]) Result
 type Run[S any] struct {
 	// Monitor is the deployed monitor name.
 	Monitor MonitorName
-	// Routes are the monitor's configured notification routes.
-	Routes []RouteName
 	// RunID identifies this tick.
 	RunID string
 	// Deadline is when the daemon will abandon this tick, if set.
@@ -211,7 +209,6 @@ func tick[S any](runner Runner[S], w *worker, t Tick, out *stream) error {
 
 	run := &Run[S]{
 		Monitor:  w.hello.Monitor,
-		Routes:   append([]RouteName(nil), w.hello.Routes...),
 		RunID:    t.RunID,
 		Deadline: t.Deadline,
 		State:    state,
@@ -301,7 +298,7 @@ func (r *Run[S]) Logf(level LogLevel, format string, args ...any) {
 	r.Log(level, fmt.Sprintf(format, args...))
 }
 
-// Emit sends one notification event to the monitor's routes. Events are delivered
+// Emit sends one notification event to the monitor's configured destinations. Events are delivered
 // immediately, in the order emitted, independent of the tick's final result.
 func (r *Run[S]) Emit(event Event) {
 	_ = r.stream.event(event)

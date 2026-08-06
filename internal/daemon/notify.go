@@ -110,9 +110,11 @@ func eventLevel(severity monitor.Severity) routes.Level {
 	}
 }
 
-// deliverRoute sends one rendered message to a single route, merging the route's
-// stored config with the monitor's per-route options.
+// deliverRoute sends one rendered message to a monitor-owned delivery.
 func (d *Daemon) deliverRoute(ctx context.Context, delivery routes.Delivery, msg routes.Message) error {
+	if delivery.Discord != nil {
+		return routes.DeliverDiscord(ctx, delivery, msg)
+	}
 	route, err := d.store.GetRoute(ctx, delivery.Route)
 	if err != nil {
 		return err
@@ -124,7 +126,7 @@ func (d *Daemon) deliverRoute(ctx context.Context, delivery routes.Delivery, msg
 func deliveryNames(deliveries []routes.Delivery) string {
 	names := make([]string, 0, len(deliveries))
 	for _, delivery := range deliveries {
-		names = append(names, delivery.Route.String())
+		names = append(names, delivery.Describe())
 	}
 
 	return strings.Join(names, ",")

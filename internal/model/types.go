@@ -105,14 +105,10 @@ func (n MonitorName) Validate() error {
 }
 
 // String returns the raw route kind.
-func (k RouteKind) String() string {
-	return string(k)
-}
+func (k RouteKind) String() string { return string(k) }
 
 // String returns the raw route name.
-func (n RouteName) String() string {
-	return string(n)
-}
+func (n RouteName) String() string { return string(n) }
 
 // String returns the raw monitor status.
 func (s MonitorStatus) String() string {
@@ -137,7 +133,6 @@ func (p PoolName) Validate() error {
 }
 
 // Validate checks whether a route kind is safe for storage and route names.
-// Driver registration determines whether the kind is supported at runtime.
 func (k RouteKind) Validate() error {
 	if !validName(string(k)) {
 		return fmt.Errorf("invalid route kind %q", k)

@@ -10,9 +10,9 @@ import (
 // Protocol is the monitord worker wire version. The daemon refuses artifacts
 // built against a different version.
 //
-// v3 replaced the result-attached alert and the separate event stream with a
-// single immediately-delivered Event, so v2 artifacts must be redeployed.
-const Protocol = 3
+// v4 removes route names from the worker handshake. Deliveries are daemon-owned
+// monitor configuration, so existing artifacts must be redeployed.
+const Protocol = 4
 
 // Executable flags implementing the monitord worker contract.
 const (
@@ -61,9 +61,6 @@ const (
 // MonitorName identifies a deployed monitor.
 type MonitorName string
 
-// RouteName identifies a daemon-owned notification route.
-type RouteName string
-
 // Definition describes a monitor to monitord at deploy time.
 type Definition struct {
 	Name        string `json:"name,omitempty"`
@@ -89,7 +86,6 @@ type Network struct {
 // Hello is the first message the daemon sends to a worker.
 type Hello struct {
 	Monitor MonitorName `json:"monitor"`
-	Routes  []RouteName `json:"routes"`
 	// Dir is the monitor's source directory and working directory, so a
 	// monitor can read config or data files that live beside its source.
 	Dir     string  `json:"dir,omitempty"`
@@ -282,15 +278,6 @@ func (h Hello) Validate() error {
 	if h.Monitor == "" {
 		return errors.New("hello monitor name is required")
 	}
-	if len(h.Routes) == 0 {
-		return errors.New("hello requires at least one route")
-	}
-	for _, route := range h.Routes {
-		if route == "" {
-			return errors.New("hello routes must not be empty")
-		}
-	}
-
 	return nil
 }
 
@@ -430,6 +417,3 @@ func (s Severity) String() string { return string(s) }
 
 // String returns the raw monitor name.
 func (n MonitorName) String() string { return string(n) }
-
-// String returns the raw route name.
-func (n RouteName) String() string { return string(n) }
