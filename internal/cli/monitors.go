@@ -370,7 +370,7 @@ func until(t *time.Time) string {
 func (c *CLI) newInspectCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "inspect NAME",
-		Short: "Show full monitor details",
+		Short: "Show monitor details",
 		Args:  exactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			return c.inspect(args[0])
@@ -417,7 +417,7 @@ func (c *CLI) inspect(rawName string) error {
 	fmt.Printf("total_runs: %d (%d failed)\n", m.TotalRuns, m.TotalFailures)
 	fmt.Printf("state_version: %d\n", m.StateVersion)
 	fmt.Printf("state_revision: %d\n", m.StateRevision)
-	fmt.Printf("state: %s\n", indentJSON(m.State))
+	fmt.Printf("state: %d bytes (use `monitord state get %s`)\n", len(m.State), m.Name)
 
 	return nil
 }

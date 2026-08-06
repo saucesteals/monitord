@@ -230,9 +230,8 @@ func (r *tickRun) notify(note notification) {
 	errs := r.fanOut(ctx, note)
 	delivered := len(errs) == 0
 
-	// Log identified events only — one row per (monitor, id), the alert history
-	// and the source future dedupe checks read from. Health pages and anonymous
-	// always-send notifications carry no id, so they don't belong in the table.
+	// Only emitted events have IDs and belong in event history. Health
+	// notifications are represented by their runs and notified status instead.
 	if note.ID != "" {
 		if err := r.daemon.store.RecordEvent(ctx, storage.Event{
 			MonitorName: r.monitor.Name,

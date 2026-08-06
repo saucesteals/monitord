@@ -207,9 +207,7 @@ func runOneTick(
 			fmt.Printf("[%s] %s\n", msg.Log.Level, msg.Log.Message)
 		case monitord.OutboundEvent:
 			fmt.Printf("[event/%s] %s: %s\n", msg.Event.Severity, msg.Event.Title, msg.Event.Summary)
-			if msg.Event.ID != "" {
-				fmt.Printf("          id=%s\n", msg.Event.ID)
-			}
+			fmt.Printf("          id=%s\n", msg.Event.ID)
 			fmt.Printf("          would deliver to %d destination(s)\n", len(config.Deliveries))
 		case monitord.OutboundResult:
 			fmt.Printf("\n[result] %s: %s\n", msg.Result.Status, msg.Result.Summary)
