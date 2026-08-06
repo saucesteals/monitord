@@ -278,10 +278,10 @@ Use `monitord stats <name>` after deploying interval-sensitive monitors. A monit
 ## Notification Behavior
 
 - Failure notifications are edge-triggered: one message when a monitor starts failing and one when it recovers. This comes from the result status alone.
-- Events are delivered immediately and concurrently, so they may arrive out of emission order. An event with a dedupe key is suppressed for one hour after it sends; without a key it always sends.
+- Events are delivered immediately and concurrently, so they may arrive out of emission order. Every event needs a stable ID; repeats of the same ID are suppressed for one hour after sending.
 - Redeploy rolls the worker to the new artifact on the next tick; in-flight ticks finish on the old artifact.
 
-This means a monitor can run frequently without adding manual "only alert once" logic: give repeating events a stable dedupe key and let the daemon suppress them, and let failure edges handle themselves.
+This means a monitor can run frequently without adding manual "only alert once" logic: derive every event ID from the source object or state transition, let the daemon suppress repeats, and let failure edges handle themselves.
 
 ## Install And Update
 
