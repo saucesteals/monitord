@@ -153,6 +153,25 @@ echo '{"in_stock":false}' | monitord state set restock-alert -
 monitord state clear restock-alert
 ```
 
+### Controlled simulation
+
+To stop a monitor, edit its state, and restart it from that exact state, expire
+it first. Expiry stops scheduling but retains both the source and state;
+deploying the monitor reactivates it.
+
+```bash
+monitord expire restock-alert
+monitord state get restock-alert > /tmp/restock-alert-state.json
+$EDITOR /tmp/restock-alert-state.json
+monitord state set restock-alert /tmp/restock-alert-state.json
+monitord test restock-alert --stored-state # optional: preview without delivery
+monitord deploy restock-alert
+```
+
+This is useful for a controlled simulation, such as removing a known item from
+state so the next live tick naturally rediscovers it. Normal state edits do not
+need expiry: every tick reloads state from the database.
+
 ## Notifications
 
 `Failure` notifications are edge-triggered from the result status: one message when a monitor starts failing and one when it recovers. Everything else is an `Event` — emitted with `r.Emit`, delivered immediately, one embed each. Every event needs a stable ID; repeats of the same ID are suppressed for one hour and kept in event history. `Emit` returns an error for invalid output, and an ignored error still fails the tick.
