@@ -273,6 +273,25 @@ Use `monitord runs <name> --failed` to find the pattern, then `monitord runs <na
 
 Use `monitord test <name> --stored-state` to rerun the current source against the state the deployed monitor actually has.
 
+### Controlled simulation
+
+Use this stop-edit-start sequence when a simulation must begin from a precise
+state. `expire` stops scheduling without deleting source or state; `deploy`
+reactivates the monitor.
+
+```bash
+monitord expire <name>
+monitord state get <name> > /tmp/<name>-state.json
+$EDITOR /tmp/<name>-state.json
+monitord state set <name> /tmp/<name>-state.json
+monitord test <name> --stored-state # optional: preview without delivery
+monitord deploy <name>
+```
+
+For example, remove a known listing from a monitor's stored state, then deploy
+it so the next live tick naturally finds and alerts on that listing. Do not use
+this for ordinary state surgery: every tick reloads the current database state.
+
 Use `monitord stats <name>` after deploying interval-sensitive monitors. A monitor can be healthy while quietly missing its desired cadence; stats show observed interval and tick latency.
 
 ## Notification Behavior
