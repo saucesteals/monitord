@@ -212,7 +212,10 @@ type Author struct {
 
 // Message is a destination-neutral monitor notification.
 type Message struct {
-	Title      string
+	Title string
+	// Message is a compact notification preview. Direct Discord deliveries put
+	// it in top-level content ahead of any configured mention.
+	Message    string
 	Summary    string
 	Details    string
 	URL        string

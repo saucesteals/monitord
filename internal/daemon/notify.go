@@ -21,6 +21,7 @@ func eventMessage(m storage.Monitor, it monitor.Event) routes.Message {
 
 	return routes.Message{
 		Title:      it.Title,
+		Message:    it.Message,
 		Summary:    it.Summary,
 		Details:    strings.TrimSpace(it.Details),
 		URL:        it.URL,

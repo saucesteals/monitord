@@ -188,8 +188,9 @@ type embed struct {
 }
 
 type discordPayload struct {
-	// Content carries only the mentions. Mentions inside an embed do not
-	// notify anyone, so the ping has to live out here.
+	// Content carries the compact notification preview followed by mentions.
+	// Mentions inside an embed do not notify anyone, so the ping has to live
+	// out here.
 	Content         string          `json:"content,omitempty"`
 	Embeds          []embed         `json:"embeds,omitempty"`
 	AllowedMentions allowedMentions `json:"allowed_mentions"`
@@ -198,6 +199,7 @@ type discordPayload struct {
 // Discord's documented limits.
 const (
 	maxTitle       = 256
+	maxContent     = 2000
 	maxDescription = 4096
 	maxFieldName   = 256
 	maxFieldValue  = 1024
@@ -220,7 +222,7 @@ func SendDiscordBot(ctx context.Context, token string, channelID string, msg Mes
 
 func sendDiscord(ctx context.Context, endpoint string, authorization string, msg Message, mentions []Mention) error {
 	body, err := json.Marshal(discordPayload{
-		Content:         renderMentions(mentions),
+		Content:         renderContent(msg.Message, mentions),
 		Embeds:          []embed{buildEmbed(msg)},
 		AllowedMentions: allowFor(mentions),
 	})
@@ -397,6 +399,27 @@ func renderMentions(mentions []Mention) string {
 	}
 
 	return strings.Join(rendered, " ")
+}
+
+// renderContent puts the human-readable notification preview before the ping,
+// which keeps Discord's notification preview useful while still allowing the
+// configured mention to notify the intended audience.
+func renderContent(message string, mentions []Mention) string {
+	message = strings.TrimSpace(message)
+	ping := renderMentions(mentions)
+	if message == "" {
+		return truncate(ping, maxContent)
+	}
+	if ping == "" {
+		return truncate(message, maxContent)
+	}
+
+	messageLimit := maxContent - len(ping) - 1
+	if messageLimit <= 0 {
+		return truncate(ping, maxContent)
+	}
+
+	return truncate(message, messageLimit) + "\n" + ping
 }
 
 // allowFor builds an allowlist matching exactly the delivery's mentions. Parse is

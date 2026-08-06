@@ -199,8 +199,11 @@ type Event struct {
 	// Severity is a shortcut for the accent colour. Color overrides it.
 	Severity Severity `json:"severity,omitempty"`
 	// Color is an explicit accent as 0xRRGGBB. Zero derives it from severity.
-	Color     int    `json:"color,omitempty"`
-	Title     string `json:"title"`
+	Color int    `json:"color,omitempty"`
+	Title string `json:"title"`
+	// Message is a compact notification preview. Direct Discord deliveries put
+	// it in the top-level message content, ahead of any configured mention.
+	Message   string `json:"message,omitempty"`
 	Summary   string `json:"summary,omitempty"`
 	Details   string `json:"details,omitempty"`
 	URL       string `json:"url,omitempty"`
