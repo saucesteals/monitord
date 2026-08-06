@@ -32,6 +32,7 @@ func eventMessage(m storage.Monitor, it monitor.Event) routes.Message {
 		Fields:     toFields(it.Fields),
 		Footer:     footer,
 		FooterIcon: it.FooterIcon,
+		Mentions:   it.Mentions,
 		Time:       it.Time,
 	}
 }

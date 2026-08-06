@@ -124,6 +124,18 @@ A tick does two separate jobs: it returns a health `Result`, and along the way i
 - `monitord.Failure(...)`: the check itself broke. Pages on the failure edge and again on recovery, not every tick.
 - `r.Emit(event)`: something worth reporting happened. Each event needs a stable ID, is its own Discord embed, and is delivered the moment it is emitted. It returns an error for invalid output; an ignored error still fails the tick.
 
+An event's optional typed `Mentions` overrides YAML delivery mentions only for
+that event. Nil inherits the delivery default; `&monitord.Mentions{}` suppresses
+all pings; a populated value replaces the default:
+
+```go
+Mentions: &monitord.Mentions{
+	Everyone: true,
+	Users:    []string{"USER_ID"},
+	Roles:    []string{"ROLE_ID"},
+},
+```
+
 Return `Failure` for broken checks (unreachable target, bad response, auth failure, unparseable data). Emit an `Event` for every noteworthy finding (restock, threshold crossed, new listing, content change) and return `Success`. A tick can emit many events — one per finding — and each is sent live and independently of the result. Deliveries run concurrently, so events are not guaranteed to arrive in emission order.
 
 ## Building Events
@@ -147,6 +159,7 @@ r.Emit(monitord.Event{
 Field reference:
 
 - `ID` is required and is the event's stable identity: repeats of the same ID are suppressed for one hour, so a target that stays down pings once, not every tick. Derive it from the source object's immutable identifier or the state transition it represents.
+- `Mentions` overrides delivery-level mentions for one event. Use `Everyone`, `Here`, `Users`, and `Roles`; a nil pointer inherits the YAML default and an empty value disables pings.
 - `Fields` are labelled values — `Inline: true` for short comparable values, false for longer values such as URLs, IDs, snippets, or explanations. Field values accept Discord markdown and are truncated to Discord limits.
 - `Image` renders a large image below the body; `Thumbnail` a small corner image.
 - `Color` is an explicit accent as `0xRRGGBB`; leave it zero to derive the colour from `Severity` (info/warn/critical).

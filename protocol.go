@@ -161,6 +161,31 @@ type Author struct {
 	IconURL string `json:"icon_url,omitempty"`
 }
 
+// Mentions selects who a Discord event pings. A nil event Mentions field
+// inherits the delivery's YAML mentions; a non-nil empty value sends no ping.
+type Mentions struct {
+	Users    []string `json:"users,omitempty"`
+	Roles    []string `json:"roles,omitempty"`
+	Everyone bool     `json:"everyone,omitempty"`
+	Here     bool     `json:"here,omitempty"`
+}
+
+// Validate reports whether every mention target is a Discord snowflake.
+func (m Mentions) Validate() error {
+	for _, id := range m.Users {
+		if !isSnowflake(id) {
+			return fmt.Errorf("invalid mention user %q", id)
+		}
+	}
+	for _, id := range m.Roles {
+		if !isSnowflake(id) {
+			return fmt.Errorf("invalid mention role %q", id)
+		}
+	}
+
+	return nil
+}
+
 // Event is one notification a monitor emits during a tick. It maps directly onto
 // a Discord embed and is delivered on its own the moment it is emitted,
 // independent of the tick's final result. Build it as a plain struct literal.
@@ -168,6 +193,9 @@ type Event struct {
 	// ID is the event's stable identity. Repeats of the same ID are suppressed
 	// for the dedupe window and recorded as one alert history entry.
 	ID string `json:"id"`
+	// Mentions overrides the delivery's YAML mentions for this event. Nil
+	// inherits the delivery default; an empty value explicitly sends no ping.
+	Mentions *Mentions `json:"mentions,omitempty"`
 	// Severity is a shortcut for the accent colour. Color overrides it.
 	Severity Severity `json:"severity,omitempty"`
 	// Color is an explicit accent as 0xRRGGBB. Zero derives it from severity.
@@ -366,11 +394,29 @@ func (i Event) Validate() error {
 	if strings.TrimSpace(i.ID) == "" {
 		return errors.New("event id is required")
 	}
+	if i.Mentions != nil {
+		if err := i.Mentions.Validate(); err != nil {
+			return err
+		}
+	}
 	if i.Severity != "" {
 		return i.Severity.Validate()
 	}
 
 	return nil
+}
+
+func isSnowflake(value string) bool {
+	if len(value) < 5 || len(value) > 25 {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+
+	return true
 }
 
 // Validate reports whether the result is usable.
