@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -165,8 +166,8 @@ type Author struct {
 // independent of the tick's final result. Build it as a plain struct literal.
 type Event struct {
 	// ID is the event's stable identity. Repeats of the same ID are suppressed
-	// for the dedupe window; an empty ID always sends.
-	ID string `json:"id,omitempty"`
+	// for the dedupe window and recorded as one alert history entry.
+	ID string `json:"id"`
 	// Severity is a shortcut for the accent colour. Color overrides it.
 	Severity Severity `json:"severity,omitempty"`
 	// Color is an explicit accent as 0xRRGGBB. Zero derives it from severity.
@@ -362,6 +363,9 @@ func (l Log) Validate() error {
 // substitutes a visible per-field fallback so a broken event still delivers and
 // flags itself inline rather than vanishing.
 func (i Event) Validate() error {
+	if strings.TrimSpace(i.ID) == "" {
+		return errors.New("event id is required")
+	}
 	if i.Severity != "" {
 		return i.Severity.Validate()
 	}

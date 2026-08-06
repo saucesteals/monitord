@@ -57,9 +57,9 @@ type Run[S any] struct {
 	stream  *stream
 	dir     string
 
-	mu      sync.Mutex
-	saved   json.RawMessage
-	saveErr error
+	mu     sync.Mutex
+	saved  json.RawMessage
+	runErr error
 }
 
 // Main implements the monitord executable contract and never returns.
@@ -223,11 +223,11 @@ func tick[S any](runner Runner[S], w *worker, t Tick, out *stream) error {
 	}
 
 	run.mu.Lock()
-	saveErr, saved := run.saveErr, run.saved
+	runErr, saved := run.runErr, run.saved
 	run.mu.Unlock()
 
-	if saveErr != nil {
-		result = Failuref("save state: %v", saveErr)
+	if runErr != nil {
+		result = Failure(runErr.Error())
 	} else {
 		result.State = saved
 		result.Revision = t.Revision
@@ -281,7 +281,9 @@ func (r *Run[S]) Save() {
 	defer r.mu.Unlock()
 
 	if err != nil {
-		r.saveErr = err
+		if r.runErr == nil {
+			r.runErr = fmt.Errorf("save state: %w", err)
+		}
 
 		return
 	}
@@ -298,10 +300,27 @@ func (r *Run[S]) Logf(level LogLevel, format string, args ...any) {
 	r.Log(level, fmt.Sprintf(format, args...))
 }
 
-// Emit sends one notification event to the monitor's configured destinations. Events are delivered
-// immediately, in the order emitted, independent of the tick's final result.
-func (r *Run[S]) Emit(event Event) {
-	_ = r.stream.event(event)
+// Emit sends one notification event to the monitor's configured destinations.
+// Events are delivered immediately, in the order emitted, independent of the
+// tick's final result. An emission error also fails the tick if ignored.
+func (r *Run[S]) Emit(event Event) error {
+	if err := r.stream.event(event); err != nil {
+		err = fmt.Errorf("emit event: %w", err)
+		r.recordError(err)
+
+		return err
+	}
+
+	return nil
+}
+
+func (r *Run[S]) recordError(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.runErr == nil {
+		r.runErr = err
+	}
 }
 
 // stream writes framed monitor protocol messages to stdout.

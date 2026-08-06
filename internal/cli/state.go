@@ -32,7 +32,7 @@ func (c *CLI) newStateCmd() *cobra.Command {
 func (c *CLI) newStateGetCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "get NAME",
-		Short: "Print stored monitor state",
+		Short: "Print stored monitor state as JSON",
 		Args:  exactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			return c.stateGet(args[0])
@@ -116,8 +116,7 @@ func (c *CLI) stateSet(rawName string, source string) error {
 		return err
 	}
 
-	fmt.Printf("state updated for %s (version %d)\n", name, m.StateVersion)
-	fmt.Println(indentJSON(canonical))
+	fmt.Printf("state updated for %s (version %d, %d bytes)\n", name, m.StateVersion, len(canonical))
 
 	return nil
 }
@@ -161,8 +160,7 @@ func (c *CLI) stateClear(rawName string) error {
 		return err
 	}
 
-	fmt.Printf("state cleared for %s\n", name)
-	fmt.Println(indentJSON(defaults))
+	fmt.Printf("state cleared for %s (version %d, %d bytes)\n", name, m.StateVersion, len(defaults))
 
 	return nil
 }

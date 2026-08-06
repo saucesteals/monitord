@@ -106,8 +106,8 @@ type Run struct {
 	StateRevision int64
 }
 
-// Event is one identified event a monitor emitted: the alert history and the
-// dedupe source in one, keyed by (MonitorName, EventID).
+// Event is one monitor event: the alert history and dedupe source in one,
+// keyed by (MonitorName, EventID).
 type Event struct {
 	MonitorName model.MonitorName
 	EventID     string
@@ -595,8 +595,8 @@ func (s *Store) UpdateRunNotification(ctx context.Context, runID string, sent bo
 
 // EventSuppressed reports whether an event id was delivered within the window.
 func (s *Store) EventSuppressed(ctx context.Context, name model.MonitorName, eventID string, after time.Time) (bool, error) {
-	if eventID == "" {
-		return false, nil
+	if strings.TrimSpace(eventID) == "" {
+		return false, errors.New("event id is required")
 	}
 
 	return s.q.EventSuppressed(ctx, db.EventSuppressedParams{
@@ -606,9 +606,13 @@ func (s *Store) EventSuppressed(ctx context.Context, name model.MonitorName, eve
 	})
 }
 
-// RecordEvent upserts an identified event: one row per (monitor, event id),
-// updated with each send, for history and dedupe.
+// RecordEvent upserts an event: one row per (monitor, event id), updated with
+// each send, for history and dedupe.
 func (s *Store) RecordEvent(ctx context.Context, e Event) error {
+	if strings.TrimSpace(e.EventID) == "" {
+		return errors.New("event id is required")
+	}
+
 	if err := s.q.UpsertEvent(ctx, db.UpsertEventParams{
 		MonitorName: e.MonitorName.String(),
 		EventID:     e.EventID,

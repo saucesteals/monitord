@@ -122,7 +122,7 @@ A tick does two separate jobs: it returns a health `Result`, and along the way i
 
 - `monitord.Success(...)`: the check ran and the watched thing is healthy. Silent.
 - `monitord.Failure(...)`: the check itself broke. Pages on the failure edge and again on recovery, not every tick.
-- `r.Emit(event)`: something worth reporting happened. Each event is its own Discord embed, delivered the moment it is emitted.
+- `r.Emit(event)`: something worth reporting happened. Each event needs a stable ID, is its own Discord embed, and is delivered the moment it is emitted.
 
 Return `Failure` for broken checks (unreachable target, bad response, auth failure, unparseable data). Emit an `Event` for every noteworthy finding (restock, threshold crossed, new listing, content change) and return `Success`. A tick can emit many events — one per finding — and each is sent live and independently of the result. Deliveries run concurrently, so events are not guaranteed to arrive in emission order.
 
@@ -146,7 +146,7 @@ r.Emit(monitord.Event{
 
 Field reference:
 
-- `ID` is the event's identity: repeats of the same id are suppressed for one hour, so a target that stays down pings once, not every tick. An empty id always sends.
+- `ID` is required and is the event's stable identity: repeats of the same ID are suppressed for one hour, so a target that stays down pings once, not every tick. Derive it from the source object's immutable identifier or the state transition it represents.
 - `Fields` are labelled values — `Inline: true` for short comparable values, false for longer values such as URLs, IDs, snippets, or explanations. Field values accept Discord markdown and are truncated to Discord limits.
 - `Image` renders a large image below the body; `Thumbnail` a small corner image.
 - `Color` is an explicit accent as `0xRRGGBB`; leave it zero to derive the colour from `Severity` (info/warn/critical).
