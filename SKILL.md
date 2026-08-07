@@ -146,6 +146,7 @@ An event is one Discord embed, written as a plain struct literal.
 r.Emit(monitord.Event{
 	ID:       "down:" + target.Name,
 	Title:    target.Name + " is unhealthy",
+	Message:  target.Name + " is returning HTTP 503",
 	Summary:  "HTTP 503 from health endpoint",
 	Severity: monitord.SeverityWarn,
 	URL:      target.URL,
@@ -160,6 +161,7 @@ Field reference:
 
 - `ID` is required and is the event's stable identity: repeats of the same ID are suppressed for one hour, so a target that stays down pings once, not every tick. Derive it from the source object's immutable identifier or the state transition it represents.
 - `Mentions` overrides delivery-level mentions for one event. Use `Everyone`, `Here`, `Users`, and `Roles`; a nil pointer inherits the YAML default and an empty value disables pings.
+- `Message` is a compact notification preview. For Discord deliveries it comes first in the top-level message content, with the configured mention on the next line. Keep it brief; Discord limits combined content and mentions to 2,000 characters.
 - `Fields` are labelled values — `Inline: true` for short comparable values, false for longer values such as URLs, IDs, snippets, or explanations. Field values accept Discord markdown and are truncated to Discord limits.
 - `Image` renders a large image below the body; `Thumbnail` a small corner image.
 - `Color` is an explicit accent as `0xRRGGBB`; leave it zero to derive the colour from `Severity` (info/warn/critical).

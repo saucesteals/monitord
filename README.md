@@ -53,9 +53,10 @@ func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
 
 	if inStock && !wasInStock {
 		r.Emit(monitord.Event{
-			ID:    "instock",
-			Title: "back in stock",
-			URL:   "https://example.com/product",
+			ID:      "instock",
+			Title:   "back in stock",
+			Message: "Everyday Hoodie, medium — $68",
+			URL:     "https://example.com/product",
 		})
 
 		return monitord.Success("back in stock")
@@ -97,6 +98,12 @@ r.Emit(monitord.Event{
 	},
 })
 ```
+
+Use an event's optional `Message` for the compact notification preview. Direct
+Discord deliveries put it in the top-level message content, with any configured
+mention on the next line; the embed still carries the full event details. Keep
+it brief—the combined message content and mention are limited to Discord's
+2,000 characters.
 
 ## CLI
 
@@ -184,6 +191,7 @@ all pings, and a populated value replaces the default.
 r.Emit(monitord.Event{
 	ID:       "listing:" + pair.ID,
 	Title:    "new listing",
+	Message:  "M3 MacBook Pro — $1,200",
 	Mentions: &monitord.Mentions{Everyone: true},
 })
 ```
