@@ -154,9 +154,10 @@ func (r *tickRun) record() {
 	r.daemon.logger.Info("monitor tick complete", "monitor", r.monitor.Name, "status", r.status, "next_due", nextDue)
 }
 
-// reportHealth pages once on a health edge. Events already delivered live during
-// execute; the result only drives failure and recovery notifications, edge-
-// triggered off the last status the destinations were told about.
+// reportHealth pages after the configured number of consecutive failures, then
+// again on recovery. Events already delivered live during execute; the result
+// only drives failure and recovery notifications, based on the last status the
+// destinations were told about.
 func (r *tickRun) reportHealth() {
 	m := r.monitor
 	if r.status == m.NotifiedStatus {
@@ -176,6 +177,8 @@ func (r *tickRun) reportHealth() {
 	failures := m.ConsecutiveFailures + 1
 	if r.status == monitor.StatusSuccess {
 		failures = 0
+	} else if failures < int64(m.Definition.FailureThreshold) {
+		return
 	}
 	r.notify(notification{
 		Deliveries: routes.CloneDeliveries(m.Deliveries),

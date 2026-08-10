@@ -84,6 +84,7 @@ func Build(ctx context.Context, paths config.Paths, req Request) (storage.Monito
 	def.Description = req.Config.Description
 	def.Clients = req.Config.Clients
 	def.Persistent = req.Config.Persistent
+	def.FailureThreshold = req.Config.FailureThreshold
 	if err := def.Validate(); err != nil {
 		return storage.Monitor{}, err
 	}

@@ -112,6 +112,7 @@ clients: 1
 every: 5m
 ttl: 24h
 timeout: 30s
+failure_threshold: 3 # alert after three consecutive failed ticks
 deliveries:
   - discord:
       account: jarvis

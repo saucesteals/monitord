@@ -74,6 +74,7 @@ clients: 1
 every: 5m
 ttl: 24h
 timeout: 30s
+failure_threshold: 3 # optional; alert after three consecutive failed ticks
 deliveries:
   - discord:
       account: jarvis
@@ -181,7 +182,7 @@ need expiry: every tick reloads state from the database.
 
 ## Notifications
 
-`Failure` notifications are edge-triggered from the result status: one message when a monitor starts failing and one when it recovers. Everything else is an `Event` — emitted with `r.Emit`, delivered immediately, one embed each. Every event needs a stable ID; repeats of the same ID are suppressed for one hour and kept in event history. `Emit` returns an error for invalid output, and an ignored error still fails the tick.
+`Failure` notifications require three consecutive failed ticks by default, then remain edge-triggered: one message when a monitor starts failing and one when it recovers. Set `failure_threshold: 1` for immediate alerting. Everything else is an `Event` — emitted with `r.Emit`, delivered immediately, one embed each. Every event needs a stable ID; repeats of the same ID are suppressed for one hour and kept in event history. `Emit` returns an error for invalid output, and an ignored error still fails the tick.
 
 The delivery's YAML `mentions` are the default. An event can override them with
 a typed allowlist: nil inherits the default, an empty `Mentions{}` suppresses

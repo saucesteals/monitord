@@ -20,12 +20,13 @@ const ConfigFileName = "monitor.yaml"
 
 // Config is the validated runtime configuration loaded from monitor.yaml.
 type Config struct {
-	Description string
-	Clients     int
-	Every       time.Duration
-	TTL         time.Duration
-	Timeout     time.Duration
-	Persistent  bool
+	Description      string
+	Clients          int
+	Every            time.Duration
+	TTL              time.Duration
+	Timeout          time.Duration
+	Persistent       bool
+	FailureThreshold int
 	// MaxEvents caps how many events one tick may deliver. Zero means the
 	// daemon default.
 	MaxEvents  int
@@ -34,16 +35,17 @@ type Config struct {
 }
 
 type fileConfig struct {
-	Description string         `yaml:"description"`
-	Clients     int            `yaml:"clients"`
-	Every       string         `yaml:"every"`
-	TTL         string         `yaml:"ttl"`
-	Timeout     string         `yaml:"timeout"`
-	Persistent  bool           `yaml:"persistent"`
-	MaxEvents   int            `yaml:"max_events"`
-	Proxies     string         `yaml:"proxies"`
-	Deliveries  []fileDelivery `yaml:"deliveries"`
-	Routes      []fileRoute    `yaml:"routes"`
+	Description      string         `yaml:"description"`
+	Clients          int            `yaml:"clients"`
+	Every            string         `yaml:"every"`
+	TTL              string         `yaml:"ttl"`
+	Timeout          string         `yaml:"timeout"`
+	Persistent       bool           `yaml:"persistent"`
+	FailureThreshold int            `yaml:"failure_threshold"`
+	MaxEvents        int            `yaml:"max_events"`
+	Proxies          string         `yaml:"proxies"`
+	Deliveries       []fileDelivery `yaml:"deliveries"`
+	Routes           []fileRoute    `yaml:"routes"`
 }
 
 type fileDelivery struct {
@@ -106,6 +108,13 @@ func (raw fileConfig) validate() (Config, error) {
 
 	if raw.MaxEvents < 0 {
 		return Config{}, errors.New("max_events cannot be negative")
+	}
+	failureThreshold := raw.FailureThreshold
+	if failureThreshold == 0 {
+		failureThreshold = 3
+	}
+	if failureThreshold < 0 {
+		return Config{}, errors.New("failure_threshold must be positive")
 	}
 
 	every, err := requiredDuration("every", raw.Every)
@@ -171,15 +180,16 @@ func (raw fileConfig) validate() (Config, error) {
 	}
 
 	return Config{
-		Description: strings.TrimSpace(raw.Description),
-		Clients:     clients,
-		Every:       every,
-		TTL:         ttl,
-		Timeout:     timeout,
-		Persistent:  raw.Persistent,
-		MaxEvents:   raw.MaxEvents,
-		ProxyPool:   proxyPool,
-		Deliveries:  deliveries,
+		Description:      strings.TrimSpace(raw.Description),
+		Clients:          clients,
+		Every:            every,
+		TTL:              ttl,
+		Timeout:          timeout,
+		Persistent:       raw.Persistent,
+		FailureThreshold: failureThreshold,
+		MaxEvents:        raw.MaxEvents,
+		ProxyPool:        proxyPool,
+		Deliveries:       deliveries,
 	}, nil
 }
 
