@@ -405,6 +405,7 @@ func (c *CLI) inspect(rawName string) error {
 	fmt.Printf("clients: %d\n", m.Definition.Clients)
 	fmt.Printf("every: %s\n", time.Duration(m.IntervalSeconds)*time.Second)
 	fmt.Printf("timeout: %s\n", time.Duration(m.TimeoutSeconds)*time.Second)
+	fmt.Printf("failure_threshold: %d\n", m.Definition.FailureThreshold)
 	fmt.Printf("created: %s\n", formatTime(m.CreatedAt))
 	fmt.Printf("updated: %s\n", formatTime(m.UpdatedAt))
 	fmt.Printf("next_due: %s\n", formatTime(m.NextDueAt))

@@ -71,6 +71,9 @@ type Definition struct {
 	Clients int `json:"clients,omitempty"`
 	// Persistent disables TTL expiry for this monitor.
 	Persistent bool `json:"persistent,omitempty"`
+	// FailureThreshold is the number of consecutive failed ticks required before
+	// the daemon sends a failure alert. One preserves immediate alerting.
+	FailureThreshold int `json:"failure_threshold,omitempty"`
 	// Protocol is set by the SDK and verified by the daemon.
 	Protocol int `json:"protocol"`
 	// StateVersion is set by the SDK from the monitor's state type.
@@ -289,6 +292,9 @@ func (d Definition) WithDefaults() Definition {
 	if d.Protocol == 0 {
 		d.Protocol = Protocol
 	}
+	if d.FailureThreshold == 0 {
+		d.FailureThreshold = 3
+	}
 
 	return d
 }
@@ -300,6 +306,9 @@ func (d Definition) Validate() error {
 	}
 	if d.Protocol != Protocol {
 		return fmt.Errorf("monitor speaks protocol %d, daemon speaks %d", d.Protocol, Protocol)
+	}
+	if d.FailureThreshold <= 0 {
+		return fmt.Errorf("failure threshold must be positive, got %d", d.FailureThreshold)
 	}
 
 	return nil

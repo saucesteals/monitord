@@ -100,6 +100,7 @@ clients: 1
 every: 5m
 ttl: 24h
 timeout: 30s
+failure_threshold: 3 # optional; alert after three consecutive failed ticks
 max_events: 20 # optional; per-tick event cap, default 20
 deliveries:
   - discord:
@@ -121,7 +122,7 @@ Rules that matter:
 A tick does two separate jobs: it returns a health `Result`, and along the way it emits zero or more `Event`s.
 
 - `monitord.Success(...)`: the check ran and the watched thing is healthy. Silent.
-- `monitord.Failure(...)`: the check itself broke. Pages on the failure edge and again on recovery, not every tick.
+- `monitord.Failure(...)`: the check itself broke. Alerts after three consecutive failed ticks by default, then again on recovery; set `failure_threshold: 1` for immediate alerting.
 - `r.Emit(event)`: something worth reporting happened. Each event needs a stable ID, is its own Discord embed, and is delivered the moment it is emitted. It returns an error for invalid output; an ignored error still fails the tick.
 
 An event's optional typed `Mentions` overrides YAML delivery mentions only for
@@ -311,7 +312,7 @@ Use `monitord stats <name>` after deploying interval-sensitive monitors. A monit
 
 ## Notification Behavior
 
-- Failure notifications are edge-triggered: one message when a monitor starts failing and one when it recovers. This comes from the result status alone.
+- Failure notifications alert after three consecutive failed ticks by default, then remain edge-triggered: one message when a monitor starts failing and one when it recovers. Set `failure_threshold: 1` for immediate alerting.
 - Events are delivered immediately and concurrently, so they may arrive out of emission order. Every event needs a stable ID; repeats of the same ID are suppressed for one hour after sending.
 - Redeploy rolls the worker to the new artifact on the next tick; in-flight ticks finish on the old artifact.
 

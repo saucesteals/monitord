@@ -802,6 +802,7 @@ func toMonitor(m db.Monitor) (Monitor, error) {
 	if err := json.Unmarshal([]byte(m.Definition), &def); err != nil {
 		return Monitor{}, fmt.Errorf("decode definition for %s: %w", name, err)
 	}
+	def = def.WithDefaults()
 	var deliveries []routes.Delivery
 	if err := json.Unmarshal([]byte(m.Deliveries), &deliveries); err != nil {
 		return Monitor{}, fmt.Errorf("decode deliveries for %s: %w", name, err)
