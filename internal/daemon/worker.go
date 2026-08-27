@@ -17,8 +17,13 @@ import (
 	"github.com/saucesteals/monitord/internal/storage"
 )
 
-// maxCapturedOutput bounds per-run stdout/stderr retained for the runs table.
-const maxCapturedOutput = 64 * 1024
+const (
+	// maxProtocolMessage bounds one worker protocol frame accepted by the
+	// daemon. Saved state travels in result frames before being persisted.
+	maxProtocolMessage = 1024 * 1024
+	// maxCapturedOutput bounds per-run stdout/stderr retained for the runs table.
+	maxCapturedOutput = 64 * 1024
+)
 
 // handshakeTimeout bounds how long a freshly started worker may take to accept
 // its network assignment.
@@ -90,7 +95,7 @@ func startWorker(ctx context.Context, logger *slog.Logger, m storage.Monitor, ne
 		stdout:     bufio.NewScanner(stdout),
 		exit:       make(chan error, 1),
 	}
-	w.stdout.Buffer(make([]byte, 0, 64*1024), maxCapturedOutput)
+	w.stdout.Buffer(make([]byte, 0, 64*1024), maxProtocolMessage)
 
 	pgid, err := monitorProcessGroup(cmd)
 	if err != nil {

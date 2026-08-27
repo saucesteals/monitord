@@ -26,6 +26,11 @@ import (
 // ErrStateConflict is returned when stored state moved on since a tick read it.
 var ErrStateConflict = errors.New("state revision conflict")
 
+const (
+	runHistoryRetention = 7 * 24 * time.Hour
+	runPruneBatchSize   = 1000
+)
+
 // Store owns SQLite access for monitord, over sqlc-generated queries.
 type Store struct {
 	db *sql.DB
@@ -481,8 +486,8 @@ func (s *Store) RecordRun(ctx context.Context, run Run, nextDue time.Time) error
 	}
 	if err := qtx.PruneRunsBefore(ctx, db.PruneRunsBeforeParams{
 		MonitorName: run.MonitorName.String(),
-		Cutoff:      toMs(run.FinishedAt.Add(-7 * 24 * time.Hour)),
-		Lim:         1000,
+		Cutoff:      toMs(run.FinishedAt.Add(-runHistoryRetention)),
+		Lim:         runPruneBatchSize,
 	}); err != nil {
 		return fmt.Errorf("prune runs for %s: %w", run.MonitorName, err)
 	}
