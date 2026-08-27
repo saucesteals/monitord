@@ -33,6 +33,7 @@ type Querier interface {
 	ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, error)
 	MarkNotified(ctx context.Context, arg MarkNotifiedParams) error
 	PruneEvents(ctx context.Context, sentAt int64) (int64, error)
+	PruneRunsBefore(ctx context.Context, arg PruneRunsBeforeParams) error
 	SaveMonitorState(ctx context.Context, arg SaveMonitorStateParams) (int64, error)
 	SelectDueMonitors(ctx context.Context, arg SelectDueMonitorsParams) ([]Monitor, error)
 	SetMonitorState(ctx context.Context, arg SetMonitorStateParams) (int64, error)

@@ -16,3 +16,12 @@ LIMIT sqlc.arg(lim);
 
 -- name: UpdateRunNotification :execrows
 UPDATE runs SET notified = ?, notify_error = ? WHERE id = ?;
+
+-- name: PruneRunsBefore :exec
+DELETE FROM runs WHERE id IN (
+    SELECT id FROM runs
+    WHERE runs.monitor_name = sqlc.arg(monitor_name)
+        AND runs.started_at < sqlc.arg(cutoff)
+    ORDER BY runs.started_at
+    LIMIT sqlc.arg(lim)
+);

@@ -479,6 +479,13 @@ func (s *Store) RecordRun(ctx context.Context, run Run, nextDue time.Time) error
 	}); err != nil {
 		return fmt.Errorf("insert run %s: %w", run.ID, err)
 	}
+	if err := qtx.PruneRunsBefore(ctx, db.PruneRunsBeforeParams{
+		MonitorName: run.MonitorName.String(),
+		Cutoff:      toMs(run.FinishedAt.Add(-7 * 24 * time.Hour)),
+		Lim:         1000,
+	}); err != nil {
+		return fmt.Errorf("prune runs for %s: %w", run.MonitorName, err)
+	}
 
 	var failed int64
 	if run.Status == monitor.StatusFailure {

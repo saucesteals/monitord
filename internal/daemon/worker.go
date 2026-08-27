@@ -18,7 +18,7 @@ import (
 )
 
 // maxCapturedOutput bounds per-run stdout/stderr retained for the runs table.
-const maxCapturedOutput = 1024 * 1024
+const maxCapturedOutput = 64 * 1024
 
 // handshakeTimeout bounds how long a freshly started worker may take to accept
 // its network assignment.
@@ -178,13 +178,13 @@ func (w *worker) tick(ctx context.Context, logger *slog.Logger, m storage.Monito
 
 			return out, err
 		}
-		captured.Write(append(line, '\n'))
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 
 		var msg monitord.Outbound
 		if err := json.Unmarshal(line, &msg); err != nil {
+			captured.Write(append(line, '\n'))
 			out.Stdout = captured.String()
 
 			return out, fmt.Errorf("decode worker message: %w", err)
@@ -199,6 +199,7 @@ func (w *worker) tick(ctx context.Context, logger *slog.Logger, m storage.Monito
 
 			return out, fmt.Errorf("worker reported run %s while %s was active", msg.RunID, t.RunID)
 		}
+		captured.Write(capturedMessage(msg))
 
 		w.consume(logger, m, msg, &out, emit)
 		if msg.Type == monitord.OutboundResult {
@@ -207,6 +208,24 @@ func (w *worker) tick(ctx context.Context, logger *slog.Logger, m storage.Monito
 			return out, nil
 		}
 	}
+}
+
+// capturedMessage strips state from result frames before retaining worker
+// protocol output. State is persisted separately by the store and can be much
+// larger than the useful run summary.
+func capturedMessage(msg monitord.Outbound) []byte {
+	if msg.Type == monitord.OutboundResult {
+		result := *msg.Result
+		result.State = nil
+		msg.Result = &result
+	}
+
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return nil
+	}
+
+	return append(payload, '\n')
 }
 
 func (w *worker) consume(logger *slog.Logger, m storage.Monitor, msg monitord.Outbound, out *tickOutput, emit func(monitord.Event)) {
