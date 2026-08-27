@@ -119,6 +119,27 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 	return items, nil
 }
 
+const pruneRunsBefore = `-- name: PruneRunsBefore :exec
+DELETE FROM runs WHERE id IN (
+    SELECT id FROM runs
+    WHERE runs.monitor_name = ?1
+        AND runs.started_at < ?2
+    ORDER BY runs.started_at
+    LIMIT ?3
+)
+`
+
+type PruneRunsBeforeParams struct {
+	MonitorName string
+	Cutoff      int64
+	Lim         int64
+}
+
+func (q *Queries) PruneRunsBefore(ctx context.Context, arg PruneRunsBeforeParams) error {
+	_, err := q.db.ExecContext(ctx, pruneRunsBefore, arg.MonitorName, arg.Cutoff, arg.Lim)
+	return err
+}
+
 const updateRunNotification = `-- name: UpdateRunNotification :execrows
 UPDATE runs SET notified = ?, notify_error = ? WHERE id = ?
 `

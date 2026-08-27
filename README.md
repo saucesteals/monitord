@@ -137,6 +137,11 @@ monitord rm restock-alert --purge
 
 `--root PATH` may appear anywhere in CLI arguments and defaults to `$MONITORD_ROOT` or `~/.monitord`.
 
+Run history is retained for seven days. Pruning happens incrementally as new
+runs are recorded, while lifetime run and failure counts remain on the monitor.
+Captured stdout and stderr are limited to 64 KiB per run; durable monitor state
+is stored separately and is not duplicated in captured output.
+
 ## State
 
 State is decoded by the monitor binary itself. Deploy validates stored state against the new struct before accepting a new artifact, so schema drift fails early instead of silently dropping data.

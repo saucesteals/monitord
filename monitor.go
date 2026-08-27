@@ -27,6 +27,7 @@
 package monitord
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -56,6 +57,7 @@ type Run[S any] struct {
 	clients *Clients
 	stream  *stream
 	dir     string
+	input   json.RawMessage
 
 	mu     sync.Mutex
 	saved  json.RawMessage
@@ -215,6 +217,7 @@ func tick[S any](runner Runner[S], w *worker, t Tick, out *stream) error {
 		clients:  w.clients,
 		dir:      w.hello.Dir,
 		stream:   out.forRun(t.RunID),
+		input:    t.State,
 	}
 
 	result := safeRun(ctx, runner, run)
@@ -284,6 +287,11 @@ func (r *Run[S]) Save() {
 		if r.runErr == nil {
 			r.runErr = fmt.Errorf("save state: %w", err)
 		}
+
+		return
+	}
+	if bytes.Equal(raw, r.input) {
+		r.saved = nil
 
 		return
 	}
