@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
-	"github.com/saucesteals/monitord/internal/model"
 	"github.com/saucesteals/monitord/internal/monitor"
 	"github.com/spf13/cobra"
 )
@@ -40,19 +40,14 @@ func (c *CLI) newStateGetCmd() *cobra.Command {
 	}
 }
 
-func (c *CLI) stateGet(rawName string) error {
-	name, err := model.ParseMonitorName(rawName)
-	if err != nil {
-		return err
-	}
-
+func (c *CLI) stateGet(selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
 
-	m, err := store.GetMonitor(context.Background(), name)
+	m, err := store.GetDeployment(context.Background(), selector)
 	if err != nil {
 		return err
 	}
@@ -77,12 +72,7 @@ func (c *CLI) newStateSetCmd() *cobra.Command {
 	}
 }
 
-func (c *CLI) stateSet(rawName string, source string) error {
-	name, err := model.ParseMonitorName(rawName)
-	if err != nil {
-		return err
-	}
-
+func (c *CLI) stateSet(selector string, source string) error {
 	raw, err := readStateFile(source)
 	if err != nil {
 		return err
@@ -101,22 +91,22 @@ func (c *CLI) stateSet(rawName string, source string) error {
 	defer func() { _ = store.Close() }()
 
 	ctx := context.Background()
-	m, err := store.GetMonitor(ctx, name)
+	m, err := store.GetRuntimeDeployment(ctx, selector)
 	if err != nil {
 		return err
 	}
 
 	// Hold the edit to the monitor's own struct. Storing unvalidated JSON would
 	// fail every subsequent tick, with nothing able to overwrite it.
-	canonical, err := monitor.ValidateState(ctx, m.BinaryPath, m.SourceDir, raw, m.StateVersion)
+	canonical, err := monitor.ValidateState(ctx, m.ArtifactPath, filepath.Dir(m.ArtifactPath), raw, m.StateVersion)
 	if err != nil {
-		return fmt.Errorf("state from %s rejected by %s: %w", source, name, err)
+		return fmt.Errorf("state from %s rejected by %s: %w", source, m.Name, err)
 	}
-	if err := store.SetMonitorState(ctx, name, canonical, m.StateVersion); err != nil {
+	if _, err := store.ReplaceState(ctx, m.ID, m.StateRevision, canonical, m.StateVersion); err != nil {
 		return err
 	}
 
-	fmt.Printf("state updated for %s (version %d, %d bytes)\n", name, m.StateVersion, len(canonical))
+	fmt.Printf("state updated for %s (version %d, %d bytes)\n", m.Name, m.StateVersion, len(canonical))
 
 	return nil
 }
@@ -132,12 +122,7 @@ func (c *CLI) newStateClearCmd() *cobra.Command {
 	}
 }
 
-func (c *CLI) stateClear(rawName string) error {
-	name, err := model.ParseMonitorName(rawName)
-	if err != nil {
-		return err
-	}
-
+func (c *CLI) stateClear(selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
@@ -145,22 +130,22 @@ func (c *CLI) stateClear(rawName string) error {
 	defer func() { _ = store.Close() }()
 
 	ctx := context.Background()
-	m, err := store.GetMonitor(ctx, name)
+	m, err := store.GetRuntimeDeployment(ctx, selector)
 	if err != nil {
 		return err
 	}
 
 	// Empty input makes the monitor report its own defaults, so a cleared
 	// monitor starts from the same state a fresh deploy would.
-	defaults, err := monitor.ValidateState(ctx, m.BinaryPath, m.SourceDir, nil, m.StateVersion)
+	defaults, err := monitor.ValidateState(ctx, m.ArtifactPath, filepath.Dir(m.ArtifactPath), nil, m.StateVersion)
 	if err != nil {
 		return err
 	}
-	if err := store.SetMonitorState(ctx, name, defaults, m.StateVersion); err != nil {
+	if _, err := store.ReplaceState(ctx, m.ID, m.StateRevision, defaults, m.StateVersion); err != nil {
 		return err
 	}
 
-	fmt.Printf("state cleared for %s (version %d, %d bytes)\n", name, m.StateVersion, len(defaults))
+	fmt.Printf("state cleared for %s (version %d, %d bytes)\n", m.Name, m.StateVersion, len(defaults))
 
 	return nil
 }

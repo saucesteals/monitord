@@ -16,6 +16,7 @@ import (
 var (
 	ErrGenerationFenced = errors.New("worker generation is fenced")
 	ErrSequenceConflict = errors.New("transaction sequence conflict")
+	ErrMissingSequence  = errors.New("transaction sequence is behind ledger")
 	ErrPayloadConflict  = errors.New("transaction payload conflict")
 )
 
@@ -107,6 +108,9 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 		return TransactionACK{}, ErrGenerationFenced
 	}
 	if frame.Sequence != lastSequence+1 {
+		if frame.Sequence <= lastSequence {
+			return TransactionACK{}, fmt.Errorf("%w: got %d, ledger advanced to %d", ErrMissingSequence, frame.Sequence, lastSequence)
+		}
 		return TransactionACK{}, fmt.Errorf("%w: got %d, want %d", ErrSequenceConflict, frame.Sequence, lastSequence+1)
 	}
 	if frame.BaseStateRevision != stateRevision {
@@ -240,7 +244,6 @@ func lookupTransaction(ctx context.Context, tx *sql.Tx, frame TransactionFrame) 
 	if err := json.Unmarshal(ackPayload, &ack); err != nil {
 		return TransactionACK{}, false, fmt.Errorf("decode stored transaction ack: %w", err)
 	}
-	ack.Status = "replayed"
 	return ack, true, nil
 }
 
@@ -275,16 +278,27 @@ func insertOutboxEvent(ctx context.Context, tx *sql.Tx, frame TransactionFrame, 
 			event_id, payload, payload_hash, created_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, event.OutboxID, frame.DeploymentID,
 		frame.Generation, frame.Sequence, event.EventID, event.Payload, payloadHash[:], toMs(now)); err != nil {
+		// Event IDs identify immutable source occurrences across transactions.
+		// An inclusive replay with identical content coalesces; reusing the ID
+		// for different content is a fatal application conflict.
+		var storedHash []byte
+		lookupErr := tx.QueryRowContext(ctx, `SELECT payload_hash FROM outbox_events WHERE deployment_id=? AND event_id=?`, frame.DeploymentID, event.EventID).Scan(&storedHash)
+		if lookupErr == nil && bytes.Equal(storedHash, payloadHash[:]) {
+			return nil
+		}
+		if lookupErr == nil {
+			return fmt.Errorf("event %q: %w", event.EventID, ErrPayloadConflict)
+		}
 		return fmt.Errorf("insert outbox event %q: %w", event.EventID, err)
 	}
 	for _, delivery := range event.Deliveries {
 		renderedHash := sha256.Sum256(delivery.RenderedPayload)
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO outbox_deliveries (
-				outbox_id, destination_id, destination_revision,
+				outbox_id, destination_id, destination_revision, destination_deployment_id,
 				rendered_payload, payload_hash, next_attempt_at
-			) VALUES (?, ?, ?, ?, ?, ?)`, event.OutboxID, delivery.DestinationID,
-			delivery.DestinationRevision, delivery.RenderedPayload, renderedHash[:], toMs(now)); err != nil {
+			) VALUES (?, ?, ?, ?, ?, ?, ?)`, event.OutboxID, delivery.DestinationID,
+			delivery.DestinationRevision, frame.DeploymentID, delivery.RenderedPayload, renderedHash[:], toMs(now)); err != nil {
 			return fmt.Errorf("insert delivery %q: %w", delivery.DestinationID, err)
 		}
 	}
@@ -301,24 +315,42 @@ func validateFrame(frame TransactionFrame) error {
 	if len(frame.NextState) == 0 || !json.Valid(frame.NextState) {
 		return errors.New("transaction frame state is not valid JSON")
 	}
+	checkpointSources := make(map[string]struct{}, len(frame.Checkpoints))
 	for _, checkpoint := range frame.Checkpoints {
 		if checkpoint.Source == "" || !json.Valid(checkpoint.Value) {
 			return errors.New("transaction frame contains an invalid checkpoint")
 		}
+		if _, exists := checkpointSources[checkpoint.Source]; exists {
+			return fmt.Errorf("transaction frame repeats checkpoint %q", checkpoint.Source)
+		}
+		checkpointSources[checkpoint.Source] = struct{}{}
 	}
+	eventIDs := make(map[string]struct{}, len(frame.Events))
+	outboxIDs := make(map[string]struct{}, len(frame.Events))
 	for _, event := range frame.Events {
 		if event.OutboxID == "" || event.EventID == "" || !json.Valid(event.Payload) {
 			return errors.New("transaction frame contains an invalid event")
 		}
+		if _, exists := eventIDs[event.EventID]; exists {
+			return fmt.Errorf("transaction frame repeats event %q", event.EventID)
+		}
+		if _, exists := outboxIDs[event.OutboxID]; exists {
+			return fmt.Errorf("transaction frame repeats outbox id %q", event.OutboxID)
+		}
+		eventIDs[event.EventID], outboxIDs[event.OutboxID] = struct{}{}, struct{}{}
+		destinations := make(map[string]struct{}, len(event.Deliveries))
 		for _, delivery := range event.Deliveries {
 			if delivery.DestinationID == "" || delivery.DestinationRevision < 1 || !json.Valid(delivery.RenderedPayload) {
 				return errors.New("transaction frame contains an invalid delivery")
 			}
+			if _, exists := destinations[delivery.DestinationID]; exists {
+				return fmt.Errorf("event %q repeats destination %q", event.EventID, delivery.DestinationID)
+			}
+			destinations[delivery.DestinationID] = struct{}{}
 		}
 	}
-	wantHash := HashTransactionFrame(frame)
-	if !bytes.Equal(frame.PayloadHash[:], wantHash[:]) {
-		return errors.New("transaction frame payload hash does not match its contents")
+	if frame.PayloadHash == ([sha256.Size]byte{}) {
+		return errors.New("transaction frame payload hash is missing")
 	}
 	return nil
 }

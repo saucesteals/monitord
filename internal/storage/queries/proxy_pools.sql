@@ -15,9 +15,6 @@ ON CONFLICT(name) DO UPDATE SET
 -- name: DeleteProxyPool :exec
 DELETE FROM proxy_pools WHERE name = ?;
 
--- name: CountMonitorsUsingPool :one
-SELECT count(*) FROM monitors WHERE proxy_pool = ?;
-
 -- name: GetProxyOffset :one
 SELECT offset FROM proxy_pools WHERE name = ?;
 

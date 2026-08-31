@@ -3,7 +3,9 @@ package monitord
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 )
 
 // NoState is the state type for monitors that keep no cross-tick data.
@@ -65,6 +67,9 @@ func decodeState[S any](raw json.RawMessage, from int) (*S, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(state); err != nil {
 		return nil, fmt.Errorf("decode state: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("decode state: trailing JSON value")
 	}
 
 	return state, nil

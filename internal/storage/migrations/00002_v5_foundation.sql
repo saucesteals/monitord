@@ -1,43 +1,43 @@
 -- +goose Up
 -- +goose StatementBegin
 
+CREATE TABLE artifacts (
+    id              TEXT PRIMARY KEY,
+    content_hash    TEXT NOT NULL UNIQUE,
+    path            TEXT NOT NULL,
+    describe_json   BLOB NOT NULL CHECK(json_valid(describe_json)),
+    created_at      INTEGER NOT NULL
+) STRICT;
+
 -- V5 deployment identity is deliberately independent of the implementation name.
 CREATE TABLE deployments (
     id                  TEXT PRIMARY KEY,
     name                TEXT NOT NULL UNIQUE,
     info_name           TEXT NOT NULL,
     source_dir          TEXT NOT NULL,
-    status              TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK(status IN ('active', 'expired', 'archived')),
     artifact_id         TEXT REFERENCES artifacts(id),
-    config_revision     INTEGER NOT NULL DEFAULT 1,
+    config_revision     INTEGER NOT NULL DEFAULT 1 CHECK(config_revision > 0),
     config_hash         TEXT NOT NULL,
-    active_generation   INTEGER NOT NULL DEFAULT 0,
-    state               BLOB NOT NULL,
-    state_version       INTEGER NOT NULL DEFAULT 1,
-    state_revision      INTEGER NOT NULL DEFAULT 0,
+    active_generation   INTEGER NOT NULL DEFAULT 0 CHECK(active_generation >= 0),
+    state               BLOB NOT NULL CHECK(json_valid(state)),
+    state_version       INTEGER NOT NULL DEFAULT 1 CHECK(state_version > 0),
+    state_revision      INTEGER NOT NULL DEFAULT 0 CHECK(state_revision >= 0),
     created_at          INTEGER NOT NULL,
     updated_at          INTEGER NOT NULL,
     expires_at          INTEGER,
     archived_at         INTEGER
 ) STRICT;
 
-CREATE TABLE artifacts (
-    id              TEXT PRIMARY KEY,
-    content_hash    TEXT NOT NULL UNIQUE,
-    path            TEXT NOT NULL,
-    describe_json   BLOB NOT NULL,
-    created_at      INTEGER NOT NULL
-) STRICT;
-
 CREATE TABLE deployment_generations (
     deployment_id       TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
-    generation          INTEGER NOT NULL,
+    generation          INTEGER NOT NULL CHECK(generation > 0),
     worker_token_hash   BLOB NOT NULL,
     artifact_id         TEXT NOT NULL REFERENCES artifacts(id),
-    config_revision     INTEGER NOT NULL,
+    config_revision     INTEGER NOT NULL CHECK(config_revision > 0),
     secret_fingerprint  BLOB NOT NULL,
-    status              TEXT NOT NULL,
-    last_transaction_seq INTEGER NOT NULL DEFAULT 0,
+    status              TEXT NOT NULL CHECK(status IN ('active', 'retired')),
+    last_transaction_seq INTEGER NOT NULL DEFAULT 0 CHECK(last_transaction_seq >= 0),
     started_at          INTEGER NOT NULL,
     retired_at          INTEGER,
     PRIMARY KEY (deployment_id, generation)
@@ -78,13 +78,13 @@ CREATE TABLE dedupe_claims (
 
 CREATE TABLE destination_bindings (
     id              TEXT NOT NULL,
-    revision        INTEGER NOT NULL,
+    revision        INTEGER NOT NULL CHECK(revision > 0),
     deployment_id   TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
-    config          BLOB NOT NULL,
+    config          BLOB NOT NULL CHECK(json_valid(config)),
     config_hash     BLOB NOT NULL,
     created_at      INTEGER NOT NULL,
     retired_at      INTEGER,
-    PRIMARY KEY (id, revision)
+    PRIMARY KEY (deployment_id, id, revision)
 ) STRICT;
 
 CREATE TABLE outbox_events (
@@ -93,7 +93,7 @@ CREATE TABLE outbox_events (
     generation      INTEGER NOT NULL,
     transaction_seq INTEGER NOT NULL,
     event_id        TEXT NOT NULL,
-    payload         BLOB NOT NULL,
+    payload         BLOB NOT NULL CHECK(json_valid(payload)),
     payload_hash    BLOB NOT NULL,
     created_at      INTEGER NOT NULL,
     UNIQUE (deployment_id, event_id),
@@ -105,10 +105,11 @@ CREATE TABLE outbox_deliveries (
     outbox_id              TEXT NOT NULL REFERENCES outbox_events(outbox_id) ON DELETE CASCADE,
     destination_id         TEXT NOT NULL,
     destination_revision   INTEGER NOT NULL,
-    rendered_payload       BLOB NOT NULL,
+    destination_deployment_id TEXT NOT NULL,
+    rendered_payload       BLOB NOT NULL CHECK(json_valid(rendered_payload)),
     payload_hash           BLOB NOT NULL,
-    status                 TEXT NOT NULL DEFAULT 'pending',
-    attempt_count          INTEGER NOT NULL DEFAULT 0,
+    status                 TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sending', 'delivered', 'dead')),
+    attempt_count          INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
     next_attempt_at        INTEGER NOT NULL,
     lease_owner            TEXT,
     lease_expires_at       INTEGER,
@@ -116,8 +117,37 @@ CREATE TABLE outbox_deliveries (
     last_error             TEXT NOT NULL DEFAULT '',
     dead_at                INTEGER,
     PRIMARY KEY (outbox_id, destination_id),
-    FOREIGN KEY (destination_id, destination_revision)
-        REFERENCES destination_bindings(id, revision)
+    FOREIGN KEY (destination_deployment_id, destination_id, destination_revision)
+        REFERENCES destination_bindings(deployment_id, id, revision),
+    CHECK(destination_deployment_id <> '')
+) STRICT;
+
+CREATE TABLE deployment_runs (
+    id                  TEXT PRIMARY KEY,
+    deployment_id       TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    generation          INTEGER NOT NULL,
+    child_name          TEXT NOT NULL,
+    kind                TEXT NOT NULL CHECK(kind IN ('poll', 'continuous')),
+    status              TEXT NOT NULL CHECK(status IN ('running', 'success', 'failure', 'canceled')),
+    started_at          INTEGER NOT NULL,
+    finished_at         INTEGER,
+    summary             TEXT NOT NULL DEFAULT '',
+    error               TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (deployment_id, generation)
+        REFERENCES deployment_generations(deployment_id, generation) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE deployment_health (
+    deployment_id       TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    child_name          TEXT NOT NULL,
+    generation          INTEGER NOT NULL,
+    status              TEXT NOT NULL CHECK(status IN ('healthy', 'degraded', 'failed', 'stopped')),
+    summary             TEXT NOT NULL DEFAULT '',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_failures >= 0),
+    updated_at          INTEGER NOT NULL,
+    PRIMARY KEY (deployment_id, child_name),
+    FOREIGN KEY (deployment_id, generation)
+        REFERENCES deployment_generations(deployment_id, generation) ON DELETE CASCADE
 ) STRICT;
 
 CREATE INDEX outbox_deliveries_ready
@@ -127,6 +157,11 @@ CREATE INDEX transactions_committed
     ON transactions(deployment_id, generation, committed_at);
 CREATE INDEX dedupe_claims_expiry
     ON dedupe_claims(expires_at);
+CREATE INDEX deployment_runs_history
+    ON deployment_runs(deployment_id, started_at DESC);
+CREATE INDEX outbox_deliveries_lease
+    ON outbox_deliveries(status, lease_expires_at)
+    WHERE status = 'sending';
 
 -- +goose StatementEnd
 
@@ -134,6 +169,8 @@ CREATE INDEX dedupe_claims_expiry
 -- +goose StatementBegin
 DROP TABLE outbox_deliveries;
 DROP TABLE outbox_events;
+DROP TABLE deployment_health;
+DROP TABLE deployment_runs;
 DROP TABLE destination_bindings;
 DROP TABLE dedupe_claims;
 DROP TABLE transactions;

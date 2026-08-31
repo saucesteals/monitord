@@ -39,6 +39,12 @@ func fingerprintDir(dir string) (string, error) {
 
 			return nil
 		}
+		// Secrets and local VCS/tooling metadata are generation inputs, never
+		// artifact content. Relevant .env changes are tracked by the daemon's
+		// exact-key secret fingerprint instead.
+		if entry.Name() == ".env" || strings.HasPrefix(entry.Name(), ".env.") {
+			return nil
+		}
 
 		rel, err := filepath.Rel(dir, path)
 		if err != nil {
@@ -56,7 +62,7 @@ func fingerprintDir(dir string) (string, error) {
 		return "", fmt.Errorf("fingerprint monitor dir: %w", err)
 	}
 
-	return hex.EncodeToString(sum.Sum(nil))[:16], nil
+	return hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 // PruneArtifacts removes superseded artifacts for a monitor, keeping the live

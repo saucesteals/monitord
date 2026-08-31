@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/model"
@@ -52,7 +53,7 @@ func Scaffold(paths config.Paths, name model.MonitorName) (string, error) {
 		return "", fmt.Errorf("create monitor dir: %w", err)
 	}
 
-	source := scaffoldTemplate
+	source := strings.ReplaceAll(scaffoldTemplate, "MONITOR_NAME", name.String())
 	if err := os.WriteFile(filepath.Join(dir, "monitor.go"), []byte(source), 0o600); err != nil {
 		return "", fmt.Errorf("write monitor source: %w", err)
 	}
@@ -67,6 +68,8 @@ const scaffoldTemplate = `package main
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/saucesteals/monitord"
 	http "github.com/saucesteals/fhttp"
@@ -78,32 +81,29 @@ type State struct {
 }
 
 func main() {
-	monitord.Main(run)
+	monitord.Run(monitord.Define(
+		monitord.Info{Name: "MONITOR_NAME", Description: "HTTP status monitor"},
+		monitord.Every(5*time.Minute, check),
+	))
 }
 
-func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
+func check(ctx context.Context, session *monitord.Session[State]) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/", nil)
 	if err != nil {
-		return monitord.Failuref("build request: %v", err)
+		return fmt.Errorf("build request: %w", err)
 	}
 
-	resp, err := r.Client().Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return monitord.Failuref("request failed: %v", err)
+		return fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != r.State.LastStatus {
-		r.Logf(monitord.LogInfo, "status changed %d -> %d", r.State.LastStatus, resp.StatusCode)
-		r.State.LastStatus = resp.StatusCode
-		r.Save()
-	}
-
-	if resp.StatusCode >= 400 {
-		return monitord.Failuref("HTTP %d", resp.StatusCode)
-	}
-
-	return monitord.Successf("HTTP %d", resp.StatusCode)
+	return session.Commit(ctx, func(tx *monitord.Tx[State]) error {
+		tx.State.LastStatus = resp.StatusCode
+		if resp.StatusCode >= 400 { return tx.Emit(monitord.Event{ID: fmt.Sprintf("http:%d", resp.StatusCode), Title: fmt.Sprintf("HTTP %d", resp.StatusCode)}) }
+		return nil
+	})
 }
 `
 

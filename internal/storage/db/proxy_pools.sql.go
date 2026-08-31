@@ -5,21 +5,7 @@
 
 package db
 
-import (
-	"context"
-	"database/sql"
-)
-
-const countMonitorsUsingPool = `-- name: CountMonitorsUsingPool :one
-SELECT count(*) FROM monitors WHERE proxy_pool = ?
-`
-
-func (q *Queries) CountMonitorsUsingPool(ctx context.Context, proxyPool sql.NullString) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countMonitorsUsingPool, proxyPool)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
+import "context"
 
 const deleteProxyPool = `-- name: DeleteProxyPool :exec
 DELETE FROM proxy_pools WHERE name = ?

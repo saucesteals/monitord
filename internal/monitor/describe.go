@@ -39,19 +39,19 @@ func ValidateState(ctx context.Context, binaryPath string, dir string, state jso
 }
 
 // Describe reports a built monitor's definition and canonical state.
-func Describe(ctx context.Context, binaryPath string, dir string) (monitord.Describe, error) {
+func Describe(ctx context.Context, binaryPath string, dir string) (monitord.MonitorFrame, error) {
 	return describe(ctx, binaryPath, dir, monitord.DescribeInput{})
 }
 
 // describe runs the monitor's introspection entrypoint, piping stored state in
 // so the monitor's own types validate and migrate it.
-func describe(ctx context.Context, binaryPath string, dir string, input monitord.DescribeInput) (monitord.Describe, error) {
+func describe(ctx context.Context, binaryPath string, dir string, input monitord.DescribeInput) (monitord.MonitorFrame, error) {
 	ctx, cancel := context.WithTimeout(ctx, describeTimeout)
 	defer cancel()
 
 	payload, err := json.Marshal(input)
 	if err != nil {
-		return monitord.Describe{}, fmt.Errorf("encode describe input: %w", err)
+		return monitord.MonitorFrame{}, fmt.Errorf("encode describe input: %w", err)
 	}
 
 	cmd := exec.CommandContext(ctx, binaryPath, monitord.FlagDescribe)
@@ -63,12 +63,20 @@ func describe(ctx context.Context, binaryPath string, dir string, input monitord
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return monitord.Describe{}, fmt.Errorf("describe monitor: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return monitord.MonitorFrame{}, fmt.Errorf("describe monitor: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
-	var described monitord.Describe
-	if err := json.Unmarshal(stdout.Bytes(), &described); err != nil {
-		return monitord.Describe{}, fmt.Errorf("parse monitor description: %w", err)
+	var described monitord.MonitorFrame
+	decoder := json.NewDecoder(bytes.NewReader(stdout.Bytes()))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&described); err != nil {
+		return monitord.MonitorFrame{}, fmt.Errorf("parse monitor description: %w", err)
+	}
+	if err := described.Info.Validate(); err != nil {
+		return monitord.MonitorFrame{}, fmt.Errorf("invalid monitor description: %w", err)
+	}
+	if described.StateVersion < 1 || !json.Valid(described.State) {
+		return monitord.MonitorFrame{}, fmt.Errorf("invalid monitor description state")
 	}
 
 	return described, nil

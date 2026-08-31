@@ -117,9 +117,15 @@ func (raw fileConfig) validate() (Config, error) {
 		return Config{}, errors.New("failure_threshold must be positive")
 	}
 
-	every, err := requiredDuration("every", raw.Every)
-	if err != nil {
-		return Config{}, err
+	// Scheduling belongs to the V5 Go plan. Keep these decoded temporarily for
+	// the local test command, but deploy never persists or schedules from them.
+	var every time.Duration
+	var err error
+	if strings.TrimSpace(raw.Every) != "" {
+		every, err = requiredDuration("every", raw.Every)
+		if err != nil {
+			return Config{}, err
+		}
 	}
 	timeout := 30 * time.Second
 	if strings.TrimSpace(raw.Timeout) != "" {

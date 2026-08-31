@@ -46,12 +46,12 @@ func New() *cobra.Command {
 		c.newDeployCmd(),
 		c.newRunsCmd(),
 		c.newEventsCmd(),
-		c.newStatsCmd(),
 		c.newRemoveCmd(),
 		c.newListCmd(),
 		c.newInspectCmd(),
 		c.newStateCmd(),
 		c.newExpireCmd(),
+		c.newResumeCmd(),
 		c.newSkillCmd(),
 		c.newVersionCmd(),
 	)

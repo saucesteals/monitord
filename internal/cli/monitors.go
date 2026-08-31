@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -92,17 +93,24 @@ func (c *CLI) daemon(interval time.Duration, concurrency int) error {
 }
 
 func (c *CLI) newDeployCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "deploy NAME",
+	var name string
+	cmd := &cobra.Command{
+		Use:   "deploy [PATH]",
 		Short: "Build and deploy a monitor",
-		Args:  exactArgs(1),
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return c.deploy(args[0])
+			target := "."
+			if len(args) == 1 {
+				target = args[0]
+			}
+			return c.deploy(target, name)
 		},
 	}
+	cmd.Flags().StringVar(&name, "name", "", "deployment name (defaults to source directory)")
+	return cmd
 }
 
-func (c *CLI) deploy(target string) error {
+func (c *CLI) deploy(target, overrideName string) error {
 	store, paths, err := c.store()
 	if err != nil {
 		return err
@@ -113,13 +121,19 @@ func (c *CLI) deploy(target string) error {
 	if err != nil {
 		return err
 	}
+	if overrideName != "" {
+		monitorName, err = model.ParseMonitorName(overrideName)
+		if err != nil {
+			return err
+		}
+	}
 	monitorConfig, err := monitor.LoadConfig(dir)
 	if err != nil {
 		return err
 	}
 
 	ctx := context.Background()
-	existing, existingErr := store.GetMonitor(ctx, monitorName)
+	existing, existingErr := store.GetDeployment(ctx, monitorName.String())
 	req := monitor.Request{
 		Dir:    dir,
 		Name:   monitorName,
@@ -149,35 +163,51 @@ func (c *CLI) deploy(target string) error {
 		}
 	}
 
-	built, err := monitor.Build(ctx, paths, req)
+	built, err := monitor.BuildV5(ctx, paths, req)
 	if err != nil {
 		return err
 	}
-	if err := store.UpsertMonitor(ctx, built); err != nil {
+	artifact, err := store.PutArtifact(ctx, built.Artifact)
+	if err != nil {
 		return err
 	}
-	if pruned, err := monitor.PruneArtifacts(paths, built.Name, filepath.Base(built.ArtifactDir)); err != nil {
-		c.logger.Warn("artifact prune failed", "monitor", built.Name, "error", err)
-	} else if pruned > 0 {
-		fmt.Printf("pruned %d old artifact(s)\n", pruned)
+	configRaw, err := json.Marshal(monitorConfig)
+	if err != nil {
+		return err
 	}
-
-	fmt.Printf("deployed %s\n", built.Name)
-	fmt.Printf("source   %s\n", built.SourceDir)
-	fmt.Printf("artifact %s\n", built.ArtifactDir)
-	fmt.Printf("schedule every %s, timeout %s\n",
-		time.Duration(built.IntervalSeconds)*time.Second,
-		time.Duration(built.TimeoutSeconds)*time.Second)
-	fmt.Printf("clients  %d", built.Definition.Clients)
-	if built.ProxyPool != "" {
-		fmt.Printf(" from pool %s", built.ProxyPool)
+	configHash := fmt.Sprintf("%x", sha256.Sum256(configRaw))
+	var expires *time.Time
+	if !monitorConfig.Persistent {
+		v := time.Now().UTC().Add(monitorConfig.TTL)
+		expires = &v
 	}
-	fmt.Println()
-	for _, delivery := range built.Deliveries {
+	var deployed storage.Deployment
+	if existingErr == nil {
+		deployed, err = store.Redeploy(ctx, existing.ID, built.Description.Info.Name, dir, artifact.ID, configHash, expires)
+	} else if errors.Is(existingErr, storage.ErrNotFound) {
+		deployed, err = store.CreateDeployment(ctx, storage.CreateDeployment{Name: monitorName.String(), InfoName: built.Description.Info.Name, SourceDir: dir, ArtifactID: artifact.ID, ConfigHash: configHash, State: built.State, StateVersion: built.Description.StateVersion, ExpiresAt: expires})
+	} else {
+		return existingErr
+	}
+	if err != nil {
+		return err
+	}
+	for i, delivery := range monitorConfig.Deliveries {
+		raw, _ := json.Marshal(delivery)
+		if _, err = store.PutDestinationBinding(ctx, deployed.ID, fmt.Sprintf("destination-%d", i+1), raw); err != nil {
+			return err
+		}
+	}
+	if err = store.RetireDestinationBindingsExcept(ctx, deployed.ID, len(monitorConfig.Deliveries)); err != nil {
+		return err
+	}
+	fmt.Printf("deployed %s (%s)\n", deployed.Name, deployed.ID)
+	fmt.Printf("source   %s\nartifact %s\nplan     %s\n", dir, artifact.Path, built.Description.Plan.Kind)
+	for _, delivery := range monitorConfig.Deliveries {
 		fmt.Printf("delivery %s\n", truncate(delivery.Describe(), 80))
 	}
-	if req.CurrentVersion != 0 && req.CurrentVersion != built.StateVersion {
-		fmt.Printf("state migrated v%d -> v%d\n", req.CurrentVersion, built.StateVersion)
+	if req.CurrentVersion != 0 && req.CurrentVersion != built.Description.StateVersion {
+		fmt.Printf("state migrated v%d -> v%d\n", req.CurrentVersion, built.Description.StateVersion)
 	}
 
 	return nil
@@ -225,6 +255,7 @@ func (c *CLI) newMonitor(rawName string) error {
 // rm deletes a monitor, its runs, and its artifacts.
 func (c *CLI) newRemoveCmd() *cobra.Command {
 	var purge bool
+	var force bool
 
 	cmd := &cobra.Command{
 		Use:     "rm NAME",
@@ -232,64 +263,45 @@ func (c *CLI) newRemoveCmd() *cobra.Command {
 		Short:   "Delete a monitor",
 		Args:    exactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return c.rm(args[0], purge)
+			return c.rm(args[0], purge, force)
 		},
 	}
-	cmd.Flags().BoolVar(&purge, "purge", false, "also delete the monitor source directory")
+	cmd.Flags().BoolVar(&purge, "purge", false, "permanently delete archived deployment data")
+	cmd.Flags().BoolVar(&force, "force", false, "allow purge when queued deliveries remain")
 
 	return cmd
 }
 
-func (c *CLI) rm(rawName string, purge bool) error {
-	name, err := model.ParseMonitorName(rawName)
-	if err != nil {
-		return err
-	}
-
-	store, paths, err := c.store()
+func (c *CLI) rm(selector string, purge, force bool) error {
+	store, _, err := c.store()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
 
-	// A monitor can exist on disk without ever having been deployed, so a
-	// missing schedule is not fatal: the source still needs cleaning up.
-	deployed := true
-	if err := store.DeleteMonitor(context.Background(), name); err != nil {
-		if !strings.Contains(err.Error(), "not found") {
-			return err
-		}
-		deployed = false
-	}
-	if err := monitor.RemoveArtifacts(paths, name); err != nil {
+	d, err := store.GetDeployment(context.Background(), selector)
+	if err != nil {
 		return err
 	}
-
-	dir := paths.MonitorDir(name)
-	_, dirErr := os.Stat(dir)
-	onDisk := dirErr == nil
-
-	if !deployed && !onDisk {
-		return fmt.Errorf("monitor %s not found: no schedule and no directory at %s", name, dir)
-	}
-	if deployed {
-		fmt.Printf("removed %s (schedule, runs, artifacts)\n", name)
-	} else {
-		fmt.Printf("%s was not deployed; removed any artifacts\n", name)
-	}
-
-	switch {
-	case !onDisk:
-		// Nothing to purge.
-	case purge:
-		if err := os.RemoveAll(dir); err != nil {
-			return fmt.Errorf("purge source: %w", err)
+	if !purge {
+		if d.Status != "archived" {
+			err = store.ArchiveDeployment(context.Background(), d.ID)
 		}
-		fmt.Printf("purged source %s\n", dir)
-	default:
-		fmt.Printf("source kept at %s\n", dir)
+		if err == nil {
+			fmt.Printf("archived %s (%s)\n", d.Name, d.ID)
+		}
+		return err
 	}
-
+	if d.Status != "archived" {
+		return errors.New("archive deployment before purging")
+	}
+	if err = store.PurgeDeploymentSafe(context.Background(), d.ID, force); err != nil {
+		if strings.Contains(err.Error(), "queued deliveries") {
+			return errors.New("queued deliveries remain; retry later or use --force")
+		}
+		return err
+	}
+	fmt.Printf("purged %s (%s)\n", d.Name, d.ID)
 	return nil
 }
 
@@ -311,7 +323,7 @@ func (c *CLI) list() error {
 	}
 	defer func() { _ = store.Close() }()
 
-	monitors, err := store.ListMonitors(context.Background())
+	monitors, err := store.ListDeployments(context.Background())
 	if err != nil {
 		return err
 	}
@@ -321,50 +333,12 @@ func (c *CLI) list() error {
 		return nil
 	}
 
-	fmt.Printf("%-24s %-8s %-9s %-10s %-20s %s\n", "NAME", "STATUS", "HEALTH", "NEXT", "EXPIRES", "ROUTES")
+	fmt.Printf("%-24s %-34s %-10s %-20s\n", "NAME", "ID", "STATUS", "EXPIRES")
 	for _, m := range monitors {
-		fmt.Printf("%-24s %-8s %-9s %-10s %-20s %s\n",
-			m.Name, m.Status, health(m), until(m.NextDueAt), until(m.ExpiresAt), deliveryNames(m.Deliveries))
+		fmt.Printf("%-24s %-34s %-10s %-20s\n", m.Name, m.ID, m.Status, formatTime(m.ExpiresAt))
 	}
 
 	return nil
-}
-
-// health summarises a monitor's recent record for the list view.
-func health(m storage.Monitor) string {
-	switch {
-	case m.TotalRuns == 0:
-		return "-"
-	case m.ConsecutiveFailures > 0:
-		return fmt.Sprintf("fail x%d", m.ConsecutiveFailures)
-	case m.TotalFailures > 0:
-		return fmt.Sprintf("ok %.0f%%", float64(m.TotalRuns-m.TotalFailures)/float64(m.TotalRuns)*100)
-	default:
-		return "ok"
-	}
-}
-
-// until renders a timestamp as a relative duration, which is what matters when
-// scanning a schedule.
-func until(t *time.Time) string {
-	if t == nil {
-		return "never"
-	}
-
-	d := time.Until(*t)
-	if d < 0 {
-		return "due"
-	}
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
-	default:
-		return fmt.Sprintf("%dd", int(d.Hours()/24))
-	}
 }
 
 func (c *CLI) newInspectCmd() *cobra.Command {
@@ -378,44 +352,27 @@ func (c *CLI) newInspectCmd() *cobra.Command {
 	}
 }
 
-func (c *CLI) inspect(rawName string) error {
-	name, err := model.ParseMonitorName(rawName)
-	if err != nil {
-		return err
-	}
-
+func (c *CLI) inspect(selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
 
-	m, err := store.GetMonitor(context.Background(), name)
+	m, err := store.GetDeployment(context.Background(), selector)
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("name: %s\n", m.Name)
+	fmt.Printf("id: %s\nimplementation: %s\n", m.ID, m.InfoName)
 	fmt.Printf("status: %s\n", m.Status)
-	fmt.Printf("proxies: %s\n", orDash(m.ProxyPool.String()))
-	fmt.Println("deliveries:")
-	for _, delivery := range m.Deliveries {
-		fmt.Printf("  - %s\n", delivery.Describe())
-	}
-	fmt.Printf("clients: %d\n", m.Definition.Clients)
-	fmt.Printf("every: %s\n", time.Duration(m.IntervalSeconds)*time.Second)
-	fmt.Printf("timeout: %s\n", time.Duration(m.TimeoutSeconds)*time.Second)
-	fmt.Printf("failure_threshold: %d\n", m.Definition.FailureThreshold)
-	fmt.Printf("created: %s\n", formatTime(m.CreatedAt))
-	fmt.Printf("updated: %s\n", formatTime(m.UpdatedAt))
-	fmt.Printf("next_due: %s\n", formatTime(m.NextDueAt))
+	fmt.Printf("created: %s\n", m.CreatedAt.Format(time.RFC3339))
+	fmt.Printf("updated: %s\n", m.UpdatedAt.Format(time.RFC3339))
 	fmt.Printf("expires: %s\n", formatTime(m.ExpiresAt))
-	fmt.Printf("last_run: %s\n", formatTime(m.LastRunAt))
-	fmt.Printf("artifact: %s\n", m.ArtifactDir)
+	fmt.Printf("artifact: %s\n", m.ArtifactID)
 	fmt.Printf("source: %s\n", m.SourceDir)
-	fmt.Printf("last_status: %s\n", orDash(m.LastStatus.String()))
-	fmt.Printf("consecutive_failures: %d\n", m.ConsecutiveFailures)
-	fmt.Printf("total_runs: %d (%d failed)\n", m.TotalRuns, m.TotalFailures)
+	fmt.Printf("generation: %d\nconfig_revision: %d\n", m.ActiveGeneration, m.ConfigRevision)
 	fmt.Printf("state_version: %d\n", m.StateVersion)
 	fmt.Printf("state_revision: %d\n", m.StateRevision)
 	fmt.Printf("state: %d bytes (use `monitord state get %s`)\n", len(m.State), m.Name)
@@ -434,22 +391,48 @@ func (c *CLI) newExpireCmd() *cobra.Command {
 	}
 }
 
-func (c *CLI) expire(rawName string) error {
-	name, err := model.ParseMonitorName(rawName)
-	if err != nil {
-		return err
-	}
+func (c *CLI) newResumeCmd() *cobra.Command {
+	var ttl time.Duration
+	cmd := &cobra.Command{Use: "resume NAME_OR_ID", Short: "Resume an expired deployment", Args: exactArgs(1), RunE: func(_ *cobra.Command, args []string) error {
+		if ttl <= 0 {
+			return errors.New("--ttl must be positive")
+		}
+		store, _, err := c.store()
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		d, err := store.GetDeployment(context.Background(), args[0])
+		if err != nil {
+			return err
+		}
+		expires := time.Now().UTC().Add(ttl)
+		if err = store.ResumeDeployment(context.Background(), d.ID, &expires); err != nil {
+			return err
+		}
+		fmt.Printf("resumed %s (%s) until %s\n", d.Name, d.ID, expires.Format(time.RFC3339))
+		return nil
+	}}
+	cmd.Flags().DurationVar(&ttl, "ttl", 0, "fresh deployment lifetime")
+	_ = cmd.MarkFlagRequired("ttl")
+	return cmd
+}
 
+func (c *CLI) expire(rawName string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
 
-	if err := store.ExpireMonitor(context.Background(), name, time.Now().UTC()); err != nil {
+	d, err := store.GetDeployment(context.Background(), rawName)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("expired %s\n", name)
+	if err := store.ExpireDeployment(context.Background(), d.ID); err != nil {
+		return err
+	}
+	fmt.Printf("expired %s (%s)\n", d.Name, d.ID)
 
 	return nil
 }

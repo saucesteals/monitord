@@ -35,69 +35,57 @@ type State struct {
 func (State) StateVersion() int { return 1 }
 
 func main() {
-	monitord.Main(run)
+	monitord.Run(monitord.Define(monitord.Info{Name: "http-watch", Description: "Checks configured HTTP targets"}, monitord.Every(time.Minute, run)))
 }
 
-func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
-	targets, err := loadTargets(r.Path("targets.json"))
+func run(ctx context.Context, session *monitord.Session[State]) error {
+	targets, err := loadTargets("targets.json")
 	if err != nil {
-		return monitord.Failuref("load targets: %v", err)
+		return fmt.Errorf("load targets: %w", err)
 	}
-	if r.State.LastStatus == nil {
-		r.State.LastStatus = map[string]int{}
-	}
-
-	failed := 0
 	for _, target := range targets {
-		status, err := check(ctx, r, target)
+		status, err := check(ctx, target)
 		if err != nil {
-			failed++
-			r.Emit(monitord.Event{
-				Severity: monitord.SeverityCritical,
-				Title:    fmt.Sprintf("%s unreachable", target.Name),
-				Summary:  err.Error(),
-				// Keyed per target, so one flapping target does not drown out
-				// the others in the notification route.
-				ID: "unreachable:" + target.Name,
-			})
-
+			if err := session.Commit(ctx, func(tx *monitord.Tx[State]) error {
+				return tx.Emit(monitord.Event{
+					Severity: monitord.SeverityCritical,
+					Title:    fmt.Sprintf("%s unreachable", target.Name),
+					Summary:  err.Error(),
+					ID:       "unreachable:" + target.Name, DedupeKey: "unreachable:" + target.Name, DedupeFor: time.Minute,
+				})
+			}); err != nil {
+				return err
+			}
 			continue
 		}
-
-		if previous := r.State.LastStatus[target.Name]; previous != status {
-			r.Logf(monitord.LogInfo, "%s: %d -> %d", target.Name, previous, status)
-		}
-		r.State.LastStatus[target.Name] = status
-
-		if status >= 400 {
-			failed++
-			r.Emit(monitord.Event{
+		if err := session.Commit(ctx, func(tx *monitord.Tx[State]) error {
+			if tx.State.LastStatus == nil {
+				tx.State.LastStatus = map[string]int{}
+			}
+			tx.State.LastStatus[target.Name] = status
+			if status < 400 {
+				tx.State.LastOK = time.Now().UTC()
+				return nil
+			}
+			return tx.Emit(monitord.Event{
 				Severity: monitord.SeverityWarn,
 				Title:    fmt.Sprintf("%s returned HTTP %d", target.Name, status),
 				ID:       fmt.Sprintf("status:%s:%d", target.Name, status),
 			})
+		}); err != nil {
+			return err
 		}
 	}
-
-	if failed == 0 {
-		r.State.LastOK = time.Now().UTC()
-	}
-	r.Save()
-
-	if failed > 0 {
-		return monitord.Failuref("%d of %d targets unhealthy", failed, len(targets))
-	}
-
-	return monitord.Successf("all %d targets healthy", len(targets))
+	return nil
 }
 
-func check(ctx context.Context, r *monitord.Run[State], target Target) (int, error) {
+func check(ctx context.Context, target Target) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.URL, nil)
 	if err != nil {
 		return 0, err
 	}
 
-	resp, err := r.Client().Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, err
 	}

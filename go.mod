@@ -3,11 +3,12 @@ module github.com/saucesteals/monitord
 go 1.25.7
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/pressly/goose/v3 v3.27.2
 	github.com/saucesteals/fhttp v1.0.1
-	github.com/saucesteals/mimic v1.0.1
 	github.com/spf13/cobra v1.10.2
 	go.yaml.in/yaml/v3 v3.0.4
+	golang.org/x/crypto v0.52.0
 	modernc.org/sqlite v1.53.0
 )
 
@@ -26,7 +27,6 @@ require (
 	github.com/sethvargo/go-retry v0.3.0 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect

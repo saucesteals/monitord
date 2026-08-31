@@ -3,76 +3,63 @@ package cli
 import (
 	"context"
 	"fmt"
-	"time"
-
-	"github.com/saucesteals/monitord/internal/model"
 	"github.com/spf13/cobra"
+	"time"
 )
 
-// events lists the events a monitor has emitted, newest first.
 func (c *CLI) newEventsCmd() *cobra.Command {
 	var limit int
-	var failed bool
-	var since time.Duration
-
-	cmd := &cobra.Command{
-		Use:   "events NAME",
-		Short: "List a monitor's emitted events",
-		Args:  exactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return c.events(args[0], limit, failed, since)
-		},
-	}
-	cmd.Flags().IntVar(&limit, "limit", 20, "how many events to list")
-	cmd.Flags().BoolVar(&failed, "failed", false, "only show failed deliveries")
-	cmd.Flags().DurationVar(&since, "since", 0, "only events within this window, e.g. 24h")
-
+	var dead bool
+	var retry string
+	cmd := &cobra.Command{Use: "events NAME_OR_ID", Short: "Inspect durable event deliveries", Args: exactArgs(1), RunE: func(_ *cobra.Command, args []string) error { return c.events(args[0], limit, dead, retry) }}
+	cmd.Flags().IntVar(&limit, "limit", 20, "maximum rows")
+	cmd.Flags().BoolVar(&dead, "dead", false, "only dead-letter deliveries")
+	cmd.Flags().StringVar(&retry, "retry", "", "retry OUTBOX_ID/DESTINATION_ID")
 	return cmd
 }
-
-func (c *CLI) events(rawName string, limit int, failed bool, since time.Duration) error {
-	name, err := model.ParseMonitorName(rawName)
-	if err != nil {
-		return err
-	}
-
+func (c *CLI) events(selector string, limit int, dead bool, retry string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = store.Close() }()
-
-	var window time.Time
-	if since > 0 {
-		window = time.Now().Add(-since)
-	}
-	events, err := store.ListEvents(context.Background(), name, limit, failed, window)
+	defer store.Close()
+	ctx := context.Background()
+	d, err := store.GetDeployment(ctx, selector)
 	if err != nil {
 		return err
 	}
-	if len(events) == 0 {
-		fmt.Printf("%s: no events\n", name)
-
+	if retry != "" {
+		outbox, dest, ok := cutRetry(retry)
+		if !ok {
+			return fmt.Errorf("--retry must be OUTBOX_ID/DESTINATION_ID")
+		}
+		if err = store.RetryDeadDelivery(ctx, outbox, dest, time.Now().UTC()); err != nil {
+			return err
+		}
+		fmt.Printf("queued retry %s/%s\n", outbox, dest)
 		return nil
 	}
-
-	for _, e := range events {
-		mark := "✓"
-		if !e.Delivered {
-			mark = "✗"
-		}
-		title := e.Title
-		if title == "" {
-			title = "(no title)"
-		}
-		fmt.Printf("%s %-20s %s\n", mark, e.SentAt.Local().Format("Jan 02 15:04:05"), truncate(title, 80))
-		if e.URL != "" {
-			fmt.Printf("   %s\n", e.URL)
-		}
-		if !e.Delivered && e.Error != "" {
-			fmt.Printf("   error: %s\n", truncate(e.Error, 100))
+	rows, err := store.ListOutboxHistory(ctx, d.ID, limit, dead)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Printf("%s: no event deliveries\n", d.Name)
+		return nil
+	}
+	for _, v := range rows {
+		fmt.Printf("%-10s %-20s %-18s %s/%s\n", v.Status, v.CreatedAt.Local().Format("Jan 02 15:04:05"), v.EventID, v.OutboxID, v.DestinationID)
+		if v.LastError != "" {
+			fmt.Printf("  error: %s\n", truncate(v.LastError, 100))
 		}
 	}
-
 	return nil
+}
+func cutRetry(v string) (string, string, bool) {
+	for i := len(v) - 1; i >= 0; i-- {
+		if v[i] == '/' && i > 0 && i < len(v)-1 {
+			return v[:i], v[i+1:], true
+		}
+	}
+	return "", "", false
 }

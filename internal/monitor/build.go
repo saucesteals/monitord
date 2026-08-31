@@ -19,7 +19,6 @@ import (
 	monitord "github.com/saucesteals/monitord"
 	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/model"
-	"github.com/saucesteals/monitord/internal/routes"
 	"github.com/saucesteals/monitord/internal/storage"
 )
 
@@ -42,83 +41,49 @@ type Request struct {
 	CurrentVersion int
 }
 
-// Build compiles the monitor package, introspects the binary, and returns the
-// monitor record to persist.
-func Build(ctx context.Context, paths config.Paths, req Request) (storage.Monitor, error) {
+// V5Build is an immutable artifact plus deployment-local canonical state.
+// State is deliberately excluded from Artifact.Describe so redeploying the
+// same code never changes content-addressed artifact metadata.
+type V5Build struct {
+	Artifact    storage.Artifact
+	Description monitord.MonitorFrame
+	State       json.RawMessage
+}
+
+// BuildV5 compiles and describes an immutable V5 artifact without creating or
+// mutating a deployment. Callers persist Artifact first, then atomically create
+// or redeploy using State and Description.StateVersion.
+func BuildV5(ctx context.Context, paths config.Paths, req Request) (V5Build, error) {
 	dir, err := validateDir(req)
 	if err != nil {
-		return storage.Monitor{}, err
+		return V5Build{}, err
 	}
-
 	fingerprint, err := fingerprintDir(dir)
 	if err != nil {
-		return storage.Monitor{}, err
+		return V5Build{}, err
 	}
-
 	artifactDir := filepath.Join(paths.ArtifactDir(req.Name), fingerprint)
-	if err := os.MkdirAll(artifactDir, 0o700); err != nil {
-		return storage.Monitor{}, fmt.Errorf("create artifact dir: %w", err)
+	if err = os.MkdirAll(artifactDir, 0o700); err != nil {
+		return V5Build{}, fmt.Errorf("create artifact dir: %w", err)
 	}
-
-	// Resolve dependencies first so a hand-created or copied monitor directory
-	// builds without the author having to touch the shared go.mod.
-	if err := config.Tidy(ctx, paths); err != nil {
-		return storage.Monitor{}, err
+	if err = config.Tidy(ctx, paths); err != nil {
+		return V5Build{}, err
 	}
-
 	binaryPath := filepath.Join(artifactDir, "monitor")
-	if err := build(ctx, dir, binaryPath); err != nil {
-		return storage.Monitor{}, err
+	if err = build(ctx, dir, binaryPath); err != nil {
+		return V5Build{}, err
 	}
-
-	described, err := describe(ctx, binaryPath, dir, monitord.DescribeInput{
-		State:   req.Current,
-		Version: req.CurrentVersion,
-	})
+	description, err := describe(ctx, binaryPath, dir, monitord.DescribeInput{State: req.Current, Version: req.CurrentVersion})
 	if err != nil {
-		return storage.Monitor{}, err
+		return V5Build{}, err
 	}
-
-	def := described.Definition.WithDefaults()
-	def.Name = req.Name.String()
-	def.Description = req.Config.Description
-	def.Clients = req.Config.Clients
-	def.Persistent = req.Config.Persistent
-	def.FailureThreshold = req.Config.FailureThreshold
-	if err := def.Validate(); err != nil {
-		return storage.Monitor{}, err
+	state := append(json.RawMessage(nil), description.State...)
+	description.State = nil
+	describeJSON, err := json.Marshal(description)
+	if err != nil {
+		return V5Build{}, fmt.Errorf("encode V5 description: %w", err)
 	}
-
-	now := time.Now().UTC()
-	var expiresAt *time.Time
-	ttlSeconds := int64(req.Config.TTL.Seconds())
-	if req.Config.Persistent {
-		ttlSeconds = 0
-	} else {
-		expires := now.Add(req.Config.TTL)
-		expiresAt = &expires
-	}
-
-	return storage.Monitor{
-		Name:            req.Name,
-		SourceDir:       dir,
-		ArtifactDir:     artifactDir,
-		BinaryPath:      binaryPath,
-		Definition:      def,
-		State:           described.State,
-		StateVersion:    def.StateVersion,
-		IntervalSeconds: int64(req.Config.Every.Seconds()),
-		TTLSeconds:      ttlSeconds,
-		TimeoutSeconds:  int64(req.Config.Timeout.Seconds()),
-		MaxEvents:       int64(req.Config.MaxEvents),
-		ProxyPool:       req.Config.ProxyPool,
-		Deliveries:      routes.CloneDeliveries(req.Config.Deliveries),
-		Status:          model.MonitorStatusActive,
-		CreatedAt:       &now,
-		UpdatedAt:       &now,
-		ExpiresAt:       expiresAt,
-		NextDueAt:       &now,
-	}, nil
+	return V5Build{Artifact: storage.Artifact{ID: fingerprint, ContentHash: fingerprint, Path: binaryPath, Describe: describeJSON}, Description: description, State: state}, nil
 }
 
 func validateDir(req Request) (string, error) {
@@ -164,7 +129,10 @@ func build(ctx context.Context, dir string, binaryPath string) error {
 
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, ".")
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GOWORK=off")
+	// Builds are untrusted with respect to the daemon's credentials. Keep only
+	// the toolchain environment; monitor secrets are resolved after activation
+	// and never enter compiler subprocesses.
+	cmd.Env = append(Env(), "GOWORK=off")
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

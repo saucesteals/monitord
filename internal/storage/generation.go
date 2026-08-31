@@ -71,12 +71,15 @@ func (s *Store) ActivateGeneration(ctx context.Context, activation GenerationAct
 		if err != nil {
 			return ActiveGeneration{}, fmt.Errorf("retire active generation: %w", err)
 		}
-		if err := requireOneRow(result, "retire active generation"); err != nil {
-			return ActiveGeneration{}, err
-		}
+		// A manual state replacement may already have fenced this generation.
+		_, _ = result.RowsAffected()
 	}
 
-	nextGeneration := activeGeneration + 1
+	var maxGeneration int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation),0) FROM deployment_generations WHERE deployment_id=?`, activation.DeploymentID).Scan(&maxGeneration); err != nil {
+		return ActiveGeneration{}, fmt.Errorf("load latest generation: %w", err)
+	}
+	nextGeneration := maxGeneration + 1
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO deployment_generations (
 			deployment_id, generation, worker_token_hash, artifact_id,

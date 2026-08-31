@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/model"
 	"github.com/saucesteals/monitord/internal/monitor"
+	secretresolver "github.com/saucesteals/monitord/internal/secrets"
 	"github.com/spf13/cobra"
 )
 
@@ -81,19 +83,29 @@ func (c *CLI) test(target string, useStored bool) error {
 	if err != nil {
 		return err
 	}
-	def := described.Definition.WithDefaults()
-	def.Name = name.String()
-	def.Description = monitorConfig.Description
-	def.Clients = monitorConfig.Clients
-	def.Persistent = monitorConfig.Persistent
 	before := described.State
+	refs := make([]secretresolver.Ref, 0, len(described.Plan.SecretRefs()))
+	for _, ref := range described.Plan.SecretRefs() {
+		refs = append(refs, secretresolver.Ref{Group: ref.Group, Key: ref.Key, Required: ref.Required})
+	}
+	resolved, err := secretresolver.Resolve(refs, secretresolver.Sources{Root: paths.Root, MonitorDir: dir})
+	if err != nil {
+		return fmt.Errorf("resolve test secrets: %w", err)
+	}
+	workerSecrets := map[string]map[string]string{}
+	for _, value := range resolved {
+		if workerSecrets[value.Ref.Group] == nil {
+			workerSecrets[value.Ref.Group] = map[string]string{}
+		}
+		workerSecrets[value.Ref.Group][value.Ref.Key] = value.Value
+	}
 
 	if useStored {
 		store, _, err := c.store()
 		if err != nil {
 			return err
 		}
-		m, err := store.GetMonitor(ctx, name)
+		m, err := store.GetDeployment(ctx, name.String())
 		_ = store.Close()
 		if err != nil {
 			return fmt.Errorf("--stored-state: %w", err)
@@ -103,10 +115,10 @@ func (c *CLI) test(target string, useStored bool) error {
 		}
 	}
 
-	fmt.Printf("monitor  %s (clients %d, state v%d)\n", name, def.Clients, def.StateVersion)
+	fmt.Printf("monitor  %s (%s, state v%d)\n", name, described.Info.Name, described.StateVersion)
 	fmt.Printf("state in %s\n\n", compactJSON(before))
 
-	after, status, err := runOneTick(ctx, binaryPath, dir, name, before, monitorConfig)
+	after, status, err := runOneTick(ctx, binaryPath, dir, name, before, described.Plan, workerSecrets, monitorConfig)
 	if err != nil {
 		return err
 	}
@@ -115,7 +127,7 @@ func (c *CLI) test(target string, useStored bool) error {
 	if string(before) != string(after) && len(after) > 0 {
 		fmt.Println("state would be saved (differs from input)")
 	}
-	if status == monitord.StatusFailure {
+	if status == "failure" {
 		return fmt.Errorf("monitor tick failed")
 	}
 
@@ -129,8 +141,10 @@ func runOneTick(
 	dir string,
 	name model.MonitorName,
 	state json.RawMessage,
+	plan monitord.PlanDescription,
+	secrets map[string]map[string]string,
 	config monitor.Config,
-) (json.RawMessage, monitord.ResultStatus, error) {
+) (json.RawMessage, string, error) {
 	cmd := exec.CommandContext(ctx, binaryPath, monitord.FlagWorker)
 	cmd.Dir = dir
 	cmd.Env = monitor.Env()
@@ -149,7 +163,7 @@ func runOneTick(
 	}
 	defer func() { _ = cmd.Process.Kill() }()
 
-	send := func(msg monitord.Inbound) error {
+	send := func(msg monitord.V5Inbound) error {
 		payload, err := json.Marshal(msg)
 		if err != nil {
 			return err
@@ -159,27 +173,9 @@ func runOneTick(
 		return err
 	}
 
-	// A test runs direct, with no proxies, so the network assignment is empty.
-	if err := send(monitord.Inbound{
-		Type: monitord.InboundHello,
-		Hello: &monitord.Hello{
-			Monitor: monitord.MonitorName(name.String()),
-			Dir:     dir,
-			Network: monitord.Network{},
-		},
-	}); err != nil {
-		return nil, "", err
-	}
-
-	started := time.Now().UTC()
-	if err := send(monitord.Inbound{
-		Type: monitord.InboundTick,
-		Tick: &monitord.Tick{
-			RunID:     "test",
-			StartedAt: started,
-			Deadline:  started.Add(config.Timeout),
-			State:     state,
-		},
+	if err := send(monitord.V5Inbound{
+		Type:  "hello",
+		Hello: &monitord.V5Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: "local-test", DeploymentName: name.String(), Generation: 1, WorkerToken: "local-test-token", ArtifactHash: "local", ConfigHash: "local", State: state, Secrets: secrets},
 	}); err != nil {
 		return nil, "", err
 	}
@@ -187,13 +183,14 @@ func runOneTick(
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
+	current, revision, started, status := append(json.RawMessage(nil), state...), int64(0), false, "success"
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
 
-		var msg monitord.Outbound
+		var msg monitord.V5Outbound
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			fmt.Println(line)
 
@@ -201,36 +198,52 @@ func runOneTick(
 		}
 
 		switch msg.Type {
-		case monitord.OutboundReady:
-			fmt.Printf("ready (%d client(s))\n\n", msg.Ready.Clients)
-		case monitord.OutboundLog:
-			fmt.Printf("[%s] %s\n", msg.Log.Level, msg.Log.Message)
-		case monitord.OutboundEvent:
-			fmt.Printf("[event/%s] %s: %s\n", msg.Event.Severity, msg.Event.Title, msg.Event.Summary)
-			fmt.Printf("          id=%s\n", msg.Event.ID)
-			fmt.Printf("          would deliver to %d destination(s)\n", len(config.Deliveries))
-		case monitord.OutboundResult:
-			fmt.Printf("\n[result] %s: %s\n", msg.Result.Status, msg.Result.Summary)
-			if msg.Result.Details != "" {
-				fmt.Println(indent(msg.Result.Details))
+		case "monitor":
+			if err := send(monitord.V5Inbound{Type: "start", Start: &monitord.V5Start{Plan: plan}}); err != nil {
+				return nil, "", err
 			}
-			if msg.Result.Status == monitord.StatusFailure {
-				fmt.Printf("would page %d destination(s) on the failure edge\n", len(config.Deliveries))
+			started = true
+		case "ready":
+			fmt.Println("ready")
+		case "transaction":
+			if monitord.HashTransactionFrame(*msg.Transaction) != mustHash(msg.Transaction.PayloadHash) {
+				return nil, "", fmt.Errorf("worker transaction hash mismatch")
 			}
-
-			out := msg.Result.State
-			if len(out) == 0 {
-				out = state
+			for _, event := range msg.Transaction.Events {
+				fmt.Printf("[event/%s] %s: %s\n          id=%s\n          would deliver to %d destination(s)\n", event.Severity, event.Title, event.Summary, event.ID, len(config.Deliveries))
 			}
-
-			return out, msg.Result.Status, nil
+			current = append(current[:0], msg.Transaction.NextState...)
+			revision++
+			if err := send(monitord.V5Inbound{Type: "ack", Ack: &monitord.TransactionAck{DeploymentID: msg.Transaction.DeploymentID, Generation: msg.Transaction.Generation, Sequence: msg.Transaction.Sequence, PayloadHash: msg.Transaction.PayloadHash, ResultRevision: revision, Status: "accepted"}}); err != nil {
+				return nil, "", err
+			}
+			if plan.Kind == "continuous" && started {
+				_ = send(monitord.V5Inbound{Type: "stop", Stop: &monitord.V5Stop{Reason: "local test complete"}})
+				started = false
+			}
+		case "run":
+			if msg.Run.Phase == "finished" {
+				if msg.Run.Error != "" {
+					status = "failure"
+					fmt.Printf("[run] failed: %s\n", msg.Run.Error)
+				} else {
+					fmt.Println("[run] success")
+				}
+				_ = send(monitord.V5Inbound{Type: "stop", Stop: &monitord.V5Stop{Reason: "local test complete"}})
+			}
+		case "health":
+			fmt.Printf("[health/%s] %s %s\n", msg.Health.Child, msg.Health.Status, msg.Health.Message)
+		case "stopped":
+			_ = stdin.Close()
+			_ = cmd.Wait()
+			return current, status, nil
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, "", fmt.Errorf("read monitor output: %w", err)
 	}
 
-	return nil, "", fmt.Errorf("monitor exited without reporting a result")
+	return nil, "", fmt.Errorf("monitor exited without a stopped frame")
 }
 
 func compactJSON(raw json.RawMessage) string {
@@ -244,4 +257,11 @@ func compactJSON(raw json.RawMessage) string {
 	}
 
 	return out.String()
+}
+
+func mustHash(value string) [32]byte {
+	var out [32]byte
+	decoded, _ := hex.DecodeString(value)
+	copy(out[:], decoded)
+	return out
 }

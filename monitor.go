@@ -1,400 +1,252 @@
-// Package monitord is the authoring SDK for monitord monitors.
-//
-// A monitor is a Go package with a main function that hands its tick function
-// to Main. Scheduling and runtime configuration live in monitor.yaml:
-//
-//	type State struct {
-//		LastSeenID string `json:"last_seen_id"`
-//	}
-//
-//	func main() {
-//		monitord.Main(run)
-//	}
-//
-//	func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
-//		resp, err := r.Client().Do(req)
-//		...
-//		r.State.LastSeenID = id
-//		r.Save()
-//
-//		return monitord.Success("ok")
-//	}
-//
-// The compiled binary is a long-lived worker: monitord starts it once, hands it
-// its network assignment, and sends one tick per scheduled run over stdin. HTTP
-// clients and their connection pools live for the lifetime of the process, not
-// the tick.
+// Package monitord is the authoring SDK for durable monitord V5 monitors.
 package monitord
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"sync"
+	"regexp"
+	"sort"
 	"time"
 )
 
-// Runner performs one monitor tick.
-type Runner[S any] func(context.Context, *Run[S]) Result
-
-// Run is the authoring context for one scheduled tick.
-type Run[S any] struct {
-	// Monitor is the deployed monitor name.
-	Monitor MonitorName
-	// RunID identifies this tick.
-	RunID string
-	// Deadline is when the daemon will abandon this tick, if set.
-	Deadline time.Time
-	// State is the monitor's durable cross-tick state, loaded before the tick
-	// and persisted by the daemon when Save is called.
-	State *S
-
-	clients *Clients
-	stream  *stream
-	dir     string
-	input   json.RawMessage
-
-	mu     sync.Mutex
-	saved  json.RawMessage
-	runErr error
+type Info struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
 }
 
-// Main implements the monitord executable contract and never returns.
-func Main[S any](runner Runner[S]) {
-	if err := dispatch(runner, os.Args[1:], os.Stdin, os.Stdout); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
-}
+var infoNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
-func dispatch[S any](runner Runner[S], args []string, stdin io.Reader, stdout io.Writer) error {
-	def := Definition{}
-	def = def.WithDefaults()
-	def.StateVersion = stateVersion[S]()
-	if err := def.Validate(); err != nil {
-		return fmt.Errorf("invalid definition: %w", err)
+func (i Info) Validate() error {
+	if i.Name == "" {
+		return errors.New("monitor name is required")
 	}
-
-	if len(args) != 1 {
-		return errors.New("usage: monitor " + FlagDescribe + " | " + FlagWorker)
+	if len(i.Name) > 63 {
+		return fmt.Errorf("monitor name must be at most 63 bytes, got %d", len(i.Name))
 	}
-
-	switch args[0] {
-	case FlagDescribe:
-		return describe[S](def, stdin, stdout)
-	case FlagWorker:
-		return serve(runner, stdin, stdout)
-	default:
-		return fmt.Errorf("unknown flag %q", args[0])
+	if !infoNamePattern.MatchString(i.Name) {
+		return fmt.Errorf("monitor name %q must be lower-case kebab case", i.Name)
 	}
-}
-
-// describe reports the definition alongside canonical state. Stored state, if
-// piped in on stdin, is validated and migrated against the monitor's own types
-// so a bad or drifted state fails at deploy rather than at the first tick.
-func describe[S any](def Definition, stdin io.Reader, stdout io.Writer) error {
-	var input DescribeInput
-	if err := json.NewDecoder(stdin).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
-		return fmt.Errorf("decode describe input: %w", err)
-	}
-
-	state, err := decodeState[S](input.State, input.Version)
-	if err != nil {
-		return err
-	}
-	raw, err := encodeState(state)
-	if err != nil {
-		return err
-	}
-
-	if err := json.NewEncoder(stdout).Encode(Describe{
-		Definition: def,
-		State:      raw,
-	}); err != nil {
-		return fmt.Errorf("encode describe: %w", err)
-	}
-
 	return nil
 }
 
-// serve runs the worker loop: one handshake, then one tick per inbound message.
-func serve[S any](runner Runner[S], stdin io.Reader, stdout io.Writer) error {
-	out := newStream(stdout)
-	dec := json.NewDecoder(stdin)
+type Monitor[S any] interface {
+	Info() Info
+	Plan() Plan[S]
+}
+type definedMonitor[S any] struct {
+	info Info
+	plan Plan[S]
+}
 
-	worker, err := handshake(dec, out)
-	if err != nil {
-		return err
+func (m definedMonitor[S]) Info() Info                 { return m.info }
+func (m definedMonitor[S]) Plan() Plan[S]              { return m.plan }
+func Define[S any](info Info, plan Plan[S]) Monitor[S] { return definedMonitor[S]{info, plan} }
+
+// Run implements the V5 monitor executable contract and does not return.
+func Run[S any](monitor Monitor[S]) {
+	if err := dispatchMonitor(monitor); err != nil {
+		panic(err)
 	}
+}
 
-	for {
-		var msg Inbound
-		if err := dec.Decode(&msg); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
+type planKind uint8
+
+const (
+	planInvalid planKind = iota
+	planContinuous
+	planEvery
+	planNamed
+	planCombined
+)
+
+type Plan[S any] struct{ node *planNode[S] }
+type planNode[S any] struct {
+	kind       planKind
+	continuous ContinuousFunc[S]
+	check      CheckFunc[S]
+	interval   time.Duration
+	name       string
+	optional   bool
+	options    commonOptions
+	child      *planNode[S]
+	children   []*planNode[S]
+}
+type ContinuousFunc[S any] func(context.Context, *Session[S]) error
+type CheckFunc[S any] func(context.Context, *Session[S]) error
+type commonOptions struct {
+	secrets []SecretRef
+	timeout time.Duration
+	err     error
+}
+type ContinuousOption interface{ applyContinuous(*commonOptions) error }
+type ScheduleOption interface{ applySchedule(*commonOptions) error }
+type CommonOption interface {
+	ContinuousOption
+	ScheduleOption
+}
+type ChildOption interface{ applyChild(*childOptions) error }
+type childOptions struct{ optional bool }
+type optionFunc func(*commonOptions) error
+
+func (f optionFunc) applyContinuous(o *commonOptions) error { return f(o) }
+func (f optionFunc) applySchedule(o *commonOptions) error   { return f(o) }
+
+type childOptionFunc func(*childOptions) error
+
+func (f childOptionFunc) applyChild(o *childOptions) error { return f(o) }
+func WithTimeout(v time.Duration) CommonOption {
+	return optionFunc(func(o *commonOptions) error {
+		if v < 0 {
+			return errors.New("callback timeout cannot be negative")
+		}
+		o.timeout = v
+		return nil
+	})
+}
+func Optional() ChildOption {
+	return childOptionFunc(func(o *childOptions) error { o.optional = true; return nil })
+}
+func Continuous[S any](fn ContinuousFunc[S], opts ...ContinuousOption) Plan[S] {
+	n := &planNode[S]{kind: planContinuous, continuous: fn}
+	for _, o := range opts {
+		if o == nil {
+			n.options.err = errors.Join(n.options.err, errors.New("nil continuous option"))
+		} else {
+			n.options.err = errors.Join(n.options.err, o.applyContinuous(&n.options))
+		}
+	}
+	return Plan[S]{n}
+}
+func Every[S any](interval time.Duration, fn CheckFunc[S], opts ...ScheduleOption) Plan[S] {
+	n := &planNode[S]{kind: planEvery, interval: interval, check: fn}
+	for _, o := range opts {
+		if o == nil {
+			n.options.err = errors.Join(n.options.err, errors.New("nil schedule option"))
+		} else {
+			n.options.err = errors.Join(n.options.err, o.applySchedule(&n.options))
+		}
+	}
+	return Plan[S]{n}
+}
+func Named[S any](name string, p Plan[S], opts ...ChildOption) Plan[S] {
+	c := childOptions{}
+	var e error
+	for _, o := range opts {
+		if o == nil {
+			e = errors.Join(e, errors.New("nil child option"))
+		} else {
+			e = errors.Join(e, o.applyChild(&c))
+		}
+	}
+	return Plan[S]{&planNode[S]{kind: planNamed, name: name, optional: c.optional, child: p.node, options: commonOptions{err: e}}}
+}
+func Combined[S any](plans ...Plan[S]) Plan[S] {
+	n := &planNode[S]{kind: planCombined, children: make([]*planNode[S], len(plans))}
+	for i := range plans {
+		n.children[i] = plans[i].node
+	}
+	return Plan[S]{n}
+}
+
+type PlanDescription struct {
+	Kind     string            `json:"kind"`
+	Name     string            `json:"name,omitempty"`
+	Optional bool              `json:"optional,omitempty"`
+	Interval time.Duration     `json:"interval,omitempty"`
+	Timeout  time.Duration     `json:"timeout,omitempty"`
+	Secrets  []SecretRef       `json:"secrets,omitempty"`
+	Children []PlanDescription `json:"children,omitempty"`
+}
+
+func validateMonitor[S any](m Monitor[S]) (PlanDescription, error) {
+	if m == nil {
+		return PlanDescription{}, errors.New("monitor is nil")
+	}
+	if err := m.Info().Validate(); err != nil {
+		return PlanDescription{}, err
+	}
+	return normalizePlan(m.Plan(), false)
+}
+func normalizePlan[S any](p Plan[S], nested bool) (PlanDescription, error) {
+	if p.node == nil {
+		return PlanDescription{}, errors.New("plan is zero or invalid")
+	}
+	n := p.node
+	if n.options.err != nil {
+		return PlanDescription{}, n.options.err
+	}
+	refs, err := normalizeSecretRefs(n.options.secrets)
+	if err != nil {
+		return PlanDescription{}, err
+	}
+	d := PlanDescription{Timeout: n.options.timeout, Secrets: refs}
+	switch n.kind {
+	case planContinuous:
+		if n.continuous == nil {
+			return d, errors.New("continuous callback is nil")
+		}
+		d.Kind = "continuous"
+	case planEvery:
+		if n.check == nil {
+			return d, errors.New("poll callback is nil")
+		}
+		if n.interval <= 0 {
+			return d, errors.New("poll interval must be positive")
+		}
+		d.Kind = "every"
+		d.Interval = n.interval
+	case planNamed:
+		if len(n.name) > 63 || !infoNamePattern.MatchString(n.name) {
+			return d, fmt.Errorf("invalid child name %q", n.name)
+		}
+		c, e := normalizePlan(Plan[S]{n.child}, true)
+		if e != nil {
+			return d, fmt.Errorf("child %q: %w", n.name, e)
+		}
+		if c.Kind == "named" || c.Kind == "combined" {
+			return d, fmt.Errorf("child %q wraps unsupported %s plan", n.name, c.Kind)
+		}
+		d = PlanDescription{Kind: "named", Name: n.name, Optional: n.optional, Children: []PlanDescription{c}}
+	case planCombined:
+		if nested {
+			return d, errors.New("nested combined plans are unsupported")
+		}
+		if len(n.children) == 0 {
+			return d, errors.New("combined plan is empty")
+		}
+		d.Kind = "combined"
+		seen := map[string]struct{}{}
+		for _, cn := range n.children {
+			c, e := normalizePlan(Plan[S]{cn}, true)
+			if e != nil {
+				return d, e
 			}
-
-			return fmt.Errorf("decode inbound message: %w", err)
+			if c.Kind != "named" {
+				return d, errors.New("every combined child must be named")
+			}
+			if _, ok := seen[c.Name]; ok {
+				return d, fmt.Errorf("duplicate child name %q", c.Name)
+			}
+			seen[c.Name] = struct{}{}
+			d.Children = append(d.Children, c)
 		}
-		if err := msg.Validate(); err != nil {
-			return err
+	default:
+		return d, errors.New("unsupported plan shape")
+	}
+	return d, nil
+}
+func (d PlanDescription) SecretRefs() []SecretRef {
+	r := append([]SecretRef(nil), d.Secrets...)
+	for _, c := range d.Children {
+		r = append(r, c.SecretRefs()...)
+	}
+	r, _ = normalizeSecretRefs(r)
+	sort.Slice(r, func(i, j int) bool {
+		if r[i].Group == r[j].Group {
+			return r[i].Key < r[j].Key
 		}
-		if msg.Type != InboundTick {
-			return fmt.Errorf("unexpected %q message after handshake", msg.Type)
-		}
-		if err := tick(runner, worker, *msg.Tick, out); err != nil {
-			return err
-		}
-	}
-}
-
-// worker holds the runtime configuration established at handshake time and
-// reused by every tick.
-type worker struct {
-	hello   Hello
-	clients *Clients
-}
-
-func handshake(dec *json.Decoder, out *stream) (*worker, error) {
-	var msg Inbound
-	if err := dec.Decode(&msg); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, errors.New("worker stdin closed before handshake")
-		}
-
-		return nil, fmt.Errorf("decode handshake: %w", err)
-	}
-	if err := msg.Validate(); err != nil {
-		return nil, err
-	}
-	if msg.Type != InboundHello {
-		return nil, fmt.Errorf("expected %q handshake, got %q", InboundHello, msg.Type)
-	}
-
-	clients, err := newClients(msg.Hello.Network)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := out.write(Outbound{
-		Type:  OutboundReady,
-		Ready: &Ready{Clients: clients.Len()},
-	}); err != nil {
-		return nil, err
-	}
-
-	return &worker{
-		hello:   *msg.Hello,
-		clients: clients,
-	}, nil
-}
-
-func tick[S any](runner Runner[S], w *worker, t Tick, out *stream) error {
-	state, err := decodeState[S](t.State, 0)
-	if err != nil {
-		return out.result(t.RunID, Failuref("load state: %v", err))
-	}
-
-	ctx := context.Background()
-	var cancel context.CancelFunc
-	if t.Deadline.IsZero() {
-		ctx, cancel = context.WithCancel(ctx)
-	} else {
-		ctx, cancel = context.WithDeadline(ctx, t.Deadline)
-	}
-	defer cancel()
-
-	run := &Run[S]{
-		Monitor:  w.hello.Monitor,
-		RunID:    t.RunID,
-		Deadline: t.Deadline,
-		State:    state,
-		clients:  w.clients,
-		dir:      w.hello.Dir,
-		stream:   out.forRun(t.RunID),
-		input:    t.State,
-	}
-
-	result := safeRun(ctx, runner, run)
-	if result.Status == "" {
-		result.Status = StatusSuccess
-	}
-
-	run.mu.Lock()
-	runErr, saved := run.runErr, run.saved
-	run.mu.Unlock()
-
-	if runErr != nil {
-		result = Failure(runErr.Error())
-	} else {
-		result.State = saved
-		result.Revision = t.Revision
-	}
-
-	return out.result(t.RunID, result)
-}
-
-// safeRun converts a panicking tick into a failed result so one bad tick does
-// not take down a worker that other ticks still depend on.
-func safeRun[S any](ctx context.Context, runner Runner[S], run *Run[S]) (result Result) {
-	defer func() {
-		if r := recover(); r != nil {
-			result = Failuref("monitor panicked: %v", r)
-		}
-	}()
-
-	return runner(ctx, run)
-}
-
-// Client returns the next HTTP client in this worker's cycle. Each client is
-// pinned to one proxy and keeps its own connection pool warm across ticks.
-func (r *Run[S]) Client() *Client {
-	return r.clients.Next()
-}
-
-// Clients returns the worker's full client cycle, for monitors that need to
-// pick a specific client rather than round-robin.
-func (r *Run[S]) Clients() *Clients {
-	return r.clients
-}
-
-// Dir returns the monitor's source directory, which is also its working
-// directory. Use it to read files deployed alongside the monitor.
-func (r *Run[S]) Dir() string {
-	return r.dir
-}
-
-// Path joins one or more elements onto the monitor's directory.
-func (r *Run[S]) Path(elem ...string) string {
-	return filepath.Join(append([]string{r.dir}, elem...)...)
-}
-
-// Save records the current state to be persisted by the daemon when this tick
-// finishes. Later mutations are ignored unless Save is called again. A failure
-// to encode state fails the tick.
-func (r *Run[S]) Save() {
-	raw, err := encodeState(r.State)
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if err != nil {
-		if r.runErr == nil {
-			r.runErr = fmt.Errorf("save state: %w", err)
-		}
-
-		return
-	}
-	if bytes.Equal(raw, r.input) {
-		r.saved = nil
-
-		return
-	}
-	r.saved = raw
-}
-
-// Log emits a structured log line.
-func (r *Run[S]) Log(level LogLevel, message string) {
-	_ = r.stream.log(level, message)
-}
-
-// Logf emits a formatted structured log line.
-func (r *Run[S]) Logf(level LogLevel, format string, args ...any) {
-	r.Log(level, fmt.Sprintf(format, args...))
-}
-
-// Emit sends one notification event to the monitor's configured destinations.
-// Events are delivered immediately, in the order emitted, independent of the
-// tick's final result. An emission error also fails the tick if ignored.
-func (r *Run[S]) Emit(event Event) error {
-	if err := r.stream.event(event); err != nil {
-		err = fmt.Errorf("emit event: %w", err)
-		r.recordError(err)
-
-		return err
-	}
-
-	return nil
-}
-
-func (r *Run[S]) recordError(err error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.runErr == nil {
-		r.runErr = err
-	}
-}
-
-// stream writes framed monitor protocol messages to stdout.
-type stream struct {
-	enc   *json.Encoder
-	runID string
-	mu    *sync.Mutex
-}
-
-func newStream(w io.Writer) *stream {
-	return &stream{
-		enc: json.NewEncoder(w),
-		mu:  &sync.Mutex{},
-	}
-}
-
-// forRun returns a stream that stamps messages with a run ID, sharing the
-// underlying writer lock.
-func (s *stream) forRun(runID string) *stream {
-	return &stream{
-		enc:   s.enc,
-		runID: runID,
-		mu:    s.mu,
-	}
-}
-
-func (s *stream) log(level LogLevel, message string) error {
-	return s.write(Outbound{
-		Type: OutboundLog,
-		Log: &Log{
-			Level:   level,
-			Message: message,
-			Time:    time.Now().UTC(),
-		},
+		return r[i].Group < r[j].Group
 	})
-}
-
-func (s *stream) event(event Event) error {
-	if event.Severity == "" {
-		event.Severity = SeverityInfo
-	}
-	if event.Time.IsZero() {
-		event.Time = time.Now().UTC()
-	}
-
-	return s.write(Outbound{
-		Type:  OutboundEvent,
-		Event: &event,
-	})
-}
-
-func (s *stream) result(runID string, result Result) error {
-	return (&stream{enc: s.enc, runID: runID, mu: s.mu}).write(Outbound{
-		Type:   OutboundResult,
-		Result: &result,
-	})
-}
-
-func (s *stream) write(msg Outbound) error {
-	msg.RunID = s.runID
-	if err := msg.Validate(); err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.enc.Encode(msg)
+	return r
 }
