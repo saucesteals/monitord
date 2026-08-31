@@ -139,6 +139,7 @@ func Open(path string) (*Store, error) {
 	for _, pragma := range []string{
 		`PRAGMA busy_timeout = 5000`,
 		`PRAGMA journal_mode = WAL`,
+		`PRAGMA synchronous = FULL`,
 		`PRAGMA foreign_keys = ON`,
 	} {
 		if _, err := conn.ExecContext(context.Background(), pragma); err != nil {
