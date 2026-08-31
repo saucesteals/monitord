@@ -223,5 +223,8 @@ func (w Wallet) mapEventFor(t Transfer, watched Address) monitord.Event {
 	if equalAddress(t.From, watched) {
 		direction = "sent"
 	}
-	return monitord.Event{ID: t.ID(), Title: "Wallet transfer", Message: fmt.Sprintf("%s %s units", direction, t.Amount), Summary: fmt.Sprintf("%s -> %s", t.From, t.To), Details: fmt.Sprintf("chain=%s tx=%s", t.ChainID, t.TxHash)}
+	return monitord.Event{
+		ID: t.ID(), Title: "Wallet transfer", Body: fmt.Sprintf("%s %s units", direction, t.Amount),
+		Data: map[string]string{"from": string(t.From), "to": string(t.To), "chain": string(t.ChainID), "transaction": string(t.TxHash)},
+	}
 }

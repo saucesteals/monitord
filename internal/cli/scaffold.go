@@ -16,13 +16,13 @@ func (c *CLI) newNewMonitorCmd() *cobra.Command {
 		Use:   "new NAME",
 		Short: "Scaffold a monitor",
 		Args:  exactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return c.newMonitor(args[0])
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return c.newMonitor(cmd.Context(), args[0])
 		},
 	}
 }
 
-func (c *CLI) newMonitor(rawName string) error {
+func (c *CLI) newMonitor(ctx context.Context, rawName string) error {
 	name, err := model.ParseMonitorName(rawName)
 	if err != nil {
 		return err
@@ -37,7 +37,7 @@ func (c *CLI) newMonitor(rawName string) error {
 		return err
 	}
 	// Resolve the SDK now so the scaffold builds without any go.mod editing.
-	if err := config.Tidy(context.Background(), paths); err != nil {
+	if err := config.Tidy(ctx, paths); err != nil {
 		return err
 	}
 

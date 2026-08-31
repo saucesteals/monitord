@@ -13,20 +13,20 @@ func (c *CLI) newListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List deployed monitors",
 		Args:  noArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return c.list()
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return c.list(cmd.Context())
 		},
 	}
 }
 
-func (c *CLI) list() error {
+func (c *CLI) list(ctx context.Context) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
 
-	monitors, err := store.ListDeployments(context.Background())
+	monitors, err := store.ListDeployments(ctx)
 	if err != nil {
 		return err
 	}
@@ -49,20 +49,20 @@ func (c *CLI) newInspectCmd() *cobra.Command {
 		Use:   "inspect NAME",
 		Short: "Show monitor details",
 		Args:  exactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return c.inspect(args[0])
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return c.inspect(cmd.Context(), args[0])
 		},
 	}
 }
 
-func (c *CLI) inspect(selector string) error {
+func (c *CLI) inspect(ctx context.Context, selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
 
-	m, err := store.GetDeployment(context.Background(), selector)
+	m, err := store.GetDeployment(ctx, selector)
 	if err != nil {
 		return err
 	}

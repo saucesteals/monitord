@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,7 +14,10 @@ import (
 
 func (d *Daemon) reconcile(ctx context.Context) error {
 	now := time.Now().UTC()
-	_, _ = d.store.ExpireDueDeployments(ctx, now)
+	var reconcileErrs []error
+	if _, err := d.store.DeactivateDueDeployments(ctx, now); err != nil {
+		reconcileErrs = append(reconcileErrs, fmt.Errorf("deactivate deployments: %w", err))
+	}
 	deps, err := d.store.ListRuntimeDeployments(ctx)
 	if err != nil {
 		return err
@@ -23,23 +27,25 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 		active[dep.ID] = true
 		secretMap, fingerprint, err := d.resolveDeploymentSecrets(dep)
 		if err != nil {
-			return err
+			d.stopWorker(dep.ID, "secret resolution failed")
+			d.logger.Error("resolve worker secrets failed", "deployment", dep.Name, "error", err)
+			reconcileErrs = append(reconcileErrs, fmt.Errorf("resolve secrets for %s: %w", dep.Name, err))
+			continue
 		}
 		d.workersMu.Lock()
-		existing, next := d.workers[dep.ID], d.workerNextStart[dep.ID]
+		slot := d.workers[dep.ID]
+		var existing *worker
+		var next time.Time
+		if slot != nil {
+			existing = slot.worker
+			next = slot.nextStart
+		}
 		d.workersMu.Unlock()
-		if existing != nil && existing.secretFingerprint != fingerprint {
-			d.workersMu.Lock()
-			delete(d.workers, dep.ID)
-			cancel := d.workerCancels[dep.ID]
-			delete(d.workerCancels, dep.ID)
-			d.workersMu.Unlock()
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = existing.stop(stopCtx, "secret change")
-			stopCancel()
-			if cancel != nil {
-				cancel()
-			}
+		if existing != nil && (existing.secretFingerprint != fingerprint ||
+			existing.generation.Generation != dep.ActiveGeneration ||
+			existing.deployment.ArtifactID != dep.ArtifactID ||
+			existing.deployment.ConfigRevision != dep.ConfigRevision) {
+			d.stopWorker(dep.ID, "deployment snapshot changed")
 			existing = nil
 		}
 		if existing != nil || now.Before(next) {
@@ -47,23 +53,24 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 		}
 		if err = d.launch(ctx, dep, secretMap, fingerprint); err != nil {
 			d.workersMu.Lock()
-			d.workerFailures[dep.ID]++
-			attempt := min(d.workerFailures[dep.ID], 8)
-			d.workerNextStart[dep.ID] = now.Add(time.Second * time.Duration(1<<attempt))
+			slot := d.workers[dep.ID]
+			if slot == nil {
+				slot = &workerSlot{}
+				d.workers[dep.ID] = slot
+			}
+			slot.failures++
+			attempt := min(slot.failures, 8)
+			slot.nextStart = now.Add(time.Second * time.Duration(1<<attempt))
 			d.workersMu.Unlock()
 			d.logger.Error("worker launch failed", "deployment", dep.Name, "error", err)
+			reconcileErrs = append(reconcileErrs, fmt.Errorf("launch %s: %w", dep.Name, err))
 		}
 	}
 	d.workersMu.Lock()
-	type stoppingWorker struct {
-		worker *worker
-		cancel context.CancelFunc
-	}
-	var stopping []stoppingWorker
-	for id, cancel := range d.workerCancels {
+	var stopping []*workerSlot
+	for id, slot := range d.workers {
 		if !active[id] {
-			stopping = append(stopping, stoppingWorker{d.workers[id], cancel})
-			delete(d.workerCancels, id)
+			stopping = append(stopping, slot)
 			delete(d.workers, id)
 		}
 	}
@@ -78,7 +85,25 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 			item.cancel()
 		}
 	}
-	return nil
+	return errors.Join(reconcileErrs...)
+}
+
+func (d *Daemon) stopWorker(id, reason string) {
+	d.workersMu.Lock()
+	slot := d.workers[id]
+	delete(d.workers, id)
+	d.workersMu.Unlock()
+	if slot == nil {
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if slot.worker != nil {
+		_ = slot.worker.stop(stopCtx, reason)
+	}
+	cancel()
+	if slot.cancel != nil {
+		slot.cancel()
+	}
 }
 
 func (d *Daemon) resolveDeploymentSecrets(dep storage.RuntimeDeployment) (map[string]map[string]string, string, error) {

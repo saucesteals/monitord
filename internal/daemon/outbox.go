@@ -35,14 +35,11 @@ func (s daemonDeliverySender) Send(ctx context.Context, delivery storage.Claimed
 	if err := json.Unmarshal(delivery.DestinationConfig, &binding); err != nil {
 		return permanentDeliveryError{fmt.Errorf("decode destination binding: %w", err)}
 	}
-	var rendered struct {
-		Deployment string         `json:"deployment"`
-		Event      monitord.Event `json:"event"`
+	var event monitord.Event
+	if err := json.Unmarshal(delivery.EventPayload, &event); err != nil {
+		return permanentDeliveryError{fmt.Errorf("decode event: %w", err)}
 	}
-	if err := json.Unmarshal(delivery.RenderedPayload, &rendered); err != nil {
-		return permanentDeliveryError{fmt.Errorf("decode rendered event: %w", err)}
-	}
-	return s.daemon.deliverRoute(ctx, binding, eventMessage(rendered.Deployment, rendered.Event))
+	return s.daemon.deliverRoute(ctx, binding, eventMessage(delivery.DeploymentName, event))
 }
 
 type permanentDeliveryError struct{ error }
@@ -51,15 +48,11 @@ func (permanentDeliveryError) Permanent() bool           { return true }
 func (permanentDeliveryError) RetryAfter() time.Duration { return 0 }
 
 func eventMessage(deployment string, event monitord.Event) routes.Message {
-	footer := event.Footer
-	if footer == "" {
-		footer = deployment
+	return routes.Message{
+		Title: event.Title, Message: event.Body, URL: event.URL,
+		Level: eventLevel(event.Severity), Fields: dataFields(event.Data),
+		Footer: deployment, Time: event.Time,
 	}
-	return routes.Message{Title: event.Title, Message: event.Message, Summary: event.Summary,
-		Details: event.Details, URL: event.URL, Image: event.Image, Thumbnail: event.Thumbnail,
-		Author: routes.Author{Name: event.Author.Name, URL: event.Author.URL, IconURL: event.Author.IconURL},
-		Level:  eventLevel(event.Severity), Color: event.Color, Fields: toFields(event.Fields),
-		Footer: footer, FooterIcon: event.FooterIcon, Mentions: event.Mentions, Time: event.Time}
 }
 
 type deliveryError interface {

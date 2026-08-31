@@ -33,8 +33,8 @@ func (c *CLI) newTestCmd() *cobra.Command {
 		Use:   "test NAME",
 		Short: "Build and run one monitor callback locally",
 		Args:  exactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return c.test(args[0], useStored, duration)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return c.test(cmd.Context(), args[0], useStored, duration)
 		},
 	}
 	cmd.Flags().BoolVar(&useStored, "stored-state", false, "start from the deployed monitor's stored state")
@@ -43,7 +43,7 @@ func (c *CLI) newTestCmd() *cobra.Command {
 	return cmd
 }
 
-func (c *CLI) test(target string, useStored bool, duration time.Duration) error {
+func (c *CLI) test(parent context.Context, target string, useStored bool, duration time.Duration) error {
 	if duration <= 0 {
 		return fmt.Errorf("--duration must be positive")
 	}
@@ -60,7 +60,7 @@ func (c *CLI) test(target string, useStored bool, duration time.Duration) error 
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	ctx, cancel := context.WithTimeout(parent, duration)
 	defer cancel()
 
 	// Build to a temp dir so a test never disturbs deployed artifacts.
@@ -204,7 +204,7 @@ func runLocal(
 
 		switch msg.Type {
 		case "monitor":
-			if err := send(monitord.DaemonFrame{Type: "start", Start: &monitord.Start{Plan: plan}}); err != nil {
+			if err := send(monitord.DaemonFrame{Type: "start", Start: &monitord.Start{Plan: plan, Once: plan.Kind == "every"}}); err != nil {
 				return nil, "", err
 			}
 			started = true
@@ -215,7 +215,7 @@ func runLocal(
 				return nil, "", fmt.Errorf("worker transaction hash mismatch")
 			}
 			for _, event := range msg.Transaction.Events {
-				fmt.Printf("[event/%s] %s: %s\n          id=%s\n          would deliver to %d destination(s)\n", event.Severity, event.Title, event.Summary, event.ID, len(config.Deliveries))
+				fmt.Printf("[event/%s] %s: %s\n          id=%s\n          would deliver to %d destination(s)\n", event.Severity, event.Title, event.Body, event.ID, len(config.Deliveries))
 			}
 			current = append(current[:0], msg.Transaction.NextState...)
 			revision++
@@ -226,19 +226,11 @@ func runLocal(
 				_ = send(monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: "local test complete"}})
 				started = false
 			}
-		case "run":
-			if msg.Run.Phase == "finished" {
-				if msg.Run.Error != "" {
-					status = "failure"
-					fmt.Printf("[run] failed: %s\n", msg.Run.Error)
-				} else {
-					fmt.Println("[run] success")
-				}
-				_ = send(monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: "local test complete"}})
-			}
-		case "health":
-			fmt.Printf("[health/%s] %s %s\n", msg.Health.Child, msg.Health.Status, msg.Health.Message)
 		case "stopped":
+			if msg.Stopped.Error != "" {
+				status = "failure"
+				fmt.Printf("[callback] failed: %s\n", msg.Stopped.Error)
+			}
 			_ = stdin.Close()
 			_ = cmd.Wait()
 			return current, status, nil

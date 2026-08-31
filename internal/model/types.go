@@ -14,16 +14,6 @@ type RouteKind string
 // RouteName identifies a daemon-owned notification route.
 type RouteName string
 
-// MonitorStatus is the scheduler lifecycle state for a monitor.
-type MonitorStatus string
-
-const (
-	// MonitorStatusActive means a monitor is eligible to run.
-	MonitorStatusActive MonitorStatus = "active"
-	// MonitorStatusExpired means a monitor has been manually or automatically expired.
-	MonitorStatusExpired MonitorStatus = "expired"
-)
-
 // ParseMonitorName validates a monitor name.
 func ParseMonitorName(value string) (MonitorName, error) {
 	if !validName(value) {
@@ -65,16 +55,6 @@ func ParseRouteName(value string) (RouteName, error) {
 	return route, nil
 }
 
-// ParseMonitorStatus validates a monitor lifecycle status.
-func ParseMonitorStatus(value string) (MonitorStatus, error) {
-	status := MonitorStatus(value)
-	if err := status.Validate(); err != nil {
-		return "", err
-	}
-
-	return status, nil
-}
-
 // String returns the raw monitor name.
 func (n MonitorName) String() string {
 	return string(n)
@@ -94,11 +74,6 @@ func (k RouteKind) String() string { return string(k) }
 
 // String returns the raw route name.
 func (n RouteName) String() string { return string(n) }
-
-// String returns the raw monitor status.
-func (s MonitorStatus) String() string {
-	return string(s)
-}
 
 // Validate checks whether a route kind is safe for storage and route names.
 func (k RouteKind) Validate() error {
@@ -123,16 +98,6 @@ func (n RouteName) Validate() error {
 	}
 
 	return nil
-}
-
-// Validate checks whether a monitor status is supported.
-func (s MonitorStatus) Validate() error {
-	switch s {
-	case MonitorStatusActive, MonitorStatusExpired:
-		return nil
-	default:
-		return fmt.Errorf("unsupported monitor status %q", s)
-	}
 }
 
 func validName(name string) bool {

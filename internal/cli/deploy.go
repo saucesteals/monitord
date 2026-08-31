@@ -21,19 +21,19 @@ func (c *CLI) newDeployCmd() *cobra.Command {
 		Use:   "deploy [PATH]",
 		Short: "Build and deploy a monitor",
 		Args:  cobra.MaximumNArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			target := "."
 			if len(args) == 1 {
 				target = args[0]
 			}
-			return c.deploy(target, name)
+			return c.deploy(cmd.Context(), target, name)
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "deployment name (defaults to source directory)")
 	return cmd
 }
 
-func (c *CLI) deploy(target, overrideName string) error {
+func (c *CLI) deploy(ctx context.Context, target, overrideName string) error {
 	store, paths, err := c.store()
 	if err != nil {
 		return err
@@ -55,7 +55,6 @@ func (c *CLI) deploy(target, overrideName string) error {
 		return err
 	}
 
-	ctx := context.Background()
 	existing, existingErr := store.GetDeployment(ctx, monitorName.String())
 	req := monitor.Request{
 		Dir:    dir,
@@ -97,24 +96,29 @@ func (c *CLI) deploy(target, overrideName string) error {
 		v := time.Now().UTC().Add(monitorConfig.TTL)
 		expires = &v
 	}
-	var deployed storage.Deployment
+	var expectedStateRevision *int64
 	if existingErr == nil {
-		deployed, err = store.Redeploy(ctx, existing.ID, built.Description.Info.Name, dir, artifact.ID, configHash, expires)
-	} else if errors.Is(existingErr, storage.ErrNotFound) {
-		deployed, err = store.CreateDeployment(ctx, storage.CreateDeployment{Name: monitorName.String(), InfoName: built.Description.Info.Name, SourceDir: dir, ArtifactID: artifact.ID, ConfigHash: configHash, State: built.State, StateVersion: built.Description.StateVersion, ExpiresAt: expires})
-	} else {
+		expectedStateRevision = &existing.StateRevision
+	}
+	if existingErr != nil && !errors.Is(existingErr, storage.ErrNotFound) {
 		return existingErr
 	}
-	if err != nil {
-		return err
-	}
+	destinations := make([]json.RawMessage, 0, len(monitorConfig.Deliveries))
 	for i, delivery := range monitorConfig.Deliveries {
-		raw, _ := json.Marshal(delivery)
-		if _, err = store.PutDestinationBinding(ctx, deployed.ID, fmt.Sprintf("destination-%d", i+1), raw); err != nil {
-			return err
+		raw, marshalErr := json.Marshal(delivery)
+		if marshalErr != nil {
+			return fmt.Errorf("encode destination %d: %w", i+1, marshalErr)
 		}
+		destinations = append(destinations, raw)
 	}
-	if err = store.RetireDestinationBindingsExcept(ctx, deployed.ID, len(monitorConfig.Deliveries)); err != nil {
+	deployed, err := store.Deploy(ctx, storage.DeployInput{
+		Name: monitorName.String(), InfoName: built.Description.Info.Name,
+		SourceDir: dir, ArtifactID: artifact.ID, ConfigHash: configHash,
+		State: built.State, StateVersion: built.Description.StateVersion,
+		ExpiresAt: expires, Destinations: destinations,
+		ExpectedStateRevision: expectedStateRevision,
+	})
+	if err != nil {
 		return err
 	}
 	fmt.Printf("deployed %s (%s)\n", deployed.Name, deployed.ID)

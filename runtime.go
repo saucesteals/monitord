@@ -10,19 +10,6 @@ import (
 	"os"
 )
 
-// Permanent marks a continuous-source error as terminal.
-func Permanent(err error) error {
-	if err == nil {
-		return nil
-	}
-	return permanentError{err}
-}
-
-type permanentError struct{ error }
-
-func (permanentError) Permanent() {}
-func isPermanent(err error) bool  { var p interface{ Permanent() }; return errors.As(err, &p) }
-
 func dispatchMonitor[S any](m Monitor[S]) error {
 	d, err := validateMonitor(m)
 	if err != nil {
@@ -78,7 +65,7 @@ func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io
 	if !bytes.Equal(want, got) {
 		return errors.New("start plan differs from described plan")
 	}
-	coord := &workerCoordinator{wire: w, hello: hello, revision: hello.StateRevision, acks: make(chan TransactionAck, 1), stop: make(chan Stop, 1), fatal: make(chan error, 1), progress: make(chan struct{}, 1)}
+	coord := &workerCoordinator{wire: w, hello: hello, revision: hello.StateRevision, acks: make(chan TransactionAck, 1), stop: make(chan Stop, 1), fatal: make(chan error, 1)}
 	if err := validateHandshakeSecrets(desc, hello.Secrets); err != nil {
 		return err
 	}
@@ -101,41 +88,23 @@ func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io
 	go readControl(w, coord)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := make(chan childResult[S], 8)
-	children := runtimeChildren(m.Plan())
-	for _, child := range children {
-		if child.check != nil {
-			_ = sendHealth(w, child.name, "ready", "schedule activated")
+	done := make(chan error, 1)
+	go func() { done <- runPlan(ctx, session, m.Plan(), start.Start.Once) }()
+	select {
+	case err := <-done:
+		stopped := &StoppedFrame{Generation: hello.Generation, Clean: err == nil}
+		if err != nil {
+			stopped.Error = err.Error()
 		}
-		go runChild(ctx, w, session, hello.Generation, child, done)
+		return w.send(WorkerFrame{Type: "stopped", Stopped: stopped})
+	case <-coord.stop:
+		cancel()
+		<-done
+		return w.send(WorkerFrame{Type: "stopped", Stopped: &StoppedFrame{Generation: hello.Generation, Clean: true}})
+	case err := <-coord.fatal:
+		cancel()
+		return err
 	}
-	remaining := len(children)
-	clean := true
-	for remaining > 0 {
-		select {
-		case result := <-done:
-			remaining--
-			if result.err != nil {
-				clean = false
-				_ = sendHealth(w, result.child.name, "terminal", result.err.Error())
-				if !result.child.optional {
-					cancel()
-				}
-			}
-		case <-coord.stop:
-			cancel()
-		case err := <-coord.fatal:
-			cancel()
-			return err
-		case <-coord.progress:
-			for _, child := range children {
-				if child.continuous != nil {
-					_ = sendHealth(w, child.name, "ready", "progress committed")
-				}
-			}
-		}
-	}
-	return w.send(WorkerFrame{Type: "stopped", Stopped: &StoppedFrame{Generation: hello.Generation, Clean: clean}})
 }
 
 func validateHandshakeSecrets(desc PlanDescription, supplied map[string]map[string]string) error {

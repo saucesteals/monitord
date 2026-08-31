@@ -36,8 +36,8 @@ func (c *CLI) newRouteCreateCmd() *cobra.Command {
 		Use:   "create openclaw NAME",
 		Short: "Create or update an OpenClaw agent route",
 		Args:  exactArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return c.createOpenClawRoute(args[0], args[1], options)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return c.createOpenClawRoute(cmd.Context(), args[0], args[1], options)
 		},
 	}
 	cmd.Flags().StringArrayVar(&options, "option", nil, "route setting as key=value (repeatable)")
@@ -45,7 +45,7 @@ func (c *CLI) newRouteCreateCmd() *cobra.Command {
 	return cmd
 }
 
-func (c *CLI) createOpenClawRoute(rawKind string, rawName string, values []string) error {
+func (c *CLI) createOpenClawRoute(ctx context.Context, rawKind string, rawName string, values []string) error {
 	if rawKind != "openclaw" {
 		return fmt.Errorf("only openclaw agent routes are supported")
 	}
@@ -73,7 +73,7 @@ func (c *CLI) createOpenClawRoute(rawKind string, rawName string, values []strin
 	}
 	defer func() { _ = store.Close() }()
 
-	if err := store.UpsertRoute(context.Background(), storage.Route{
+	if err := store.UpsertRoute(ctx, storage.Route{
 		Name:    name,
 		Kind:    kind,
 		Options: options,
@@ -91,14 +91,14 @@ func (c *CLI) newRouteListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List agent routes",
 		Args:  noArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			store, _, err := c.store()
 			if err != nil {
 				return err
 			}
 			defer func() { _ = store.Close() }()
 
-			items, err := store.ListRoutes(context.Background())
+			items, err := store.ListRoutes(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -120,7 +120,7 @@ func (c *CLI) newRouteTestCmd() *cobra.Command {
 		Use:   "test ROUTE",
 		Short: "Send an agent route test",
 		Args:  exactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			name, err := model.ParseRouteName(args[0])
 			if err != nil {
 				return err
@@ -131,11 +131,11 @@ func (c *CLI) newRouteTestCmd() *cobra.Command {
 			}
 			defer func() { _ = store.Close() }()
 
-			route, err := store.GetRoute(context.Background(), name)
+			route, err := store.GetRoute(cmd.Context(), name)
 			if err != nil {
 				return err
 			}
-			if err := routes.Test(context.Background(), route.Kind, route.Options, routes.Message{
+			if err := routes.Test(cmd.Context(), route.Kind, route.Options, routes.Message{
 				Title:   "monitord route test",
 				Summary: "test notification from monitord",
 			}); err != nil {

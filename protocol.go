@@ -33,10 +33,10 @@ type Hello struct {
 	State          json.RawMessage              `json:"state"`
 	Checkpoints    map[string]json.RawMessage   `json:"checkpoints,omitempty"`
 	Secrets        map[string]map[string]string `json:"secrets,omitempty"`
-	Capabilities   []string                     `json:"capabilities,omitempty"`
 }
 type Start struct {
 	Plan PlanDescription `json:"plan"`
+	Once bool            `json:"once,omitempty"`
 }
 type Stop struct {
 	Reason   string `json:"reason,omitempty"`
@@ -66,7 +66,6 @@ type TransactionFrame struct {
 	NextState         json.RawMessage            `json:"next_state"`
 	Checkpoints       map[string]json.RawMessage `json:"checkpoints,omitempty"`
 	Events            []Event                    `json:"events,omitempty"`
-	Progress          bool                       `json:"progress,omitempty"`
 	PayloadHash       string                     `json:"payload_hash"`
 }
 type MonitorFrame struct {
@@ -75,31 +74,23 @@ type MonitorFrame struct {
 	StateVersion int             `json:"state_version"`
 	State        json.RawMessage `json:"state"`
 }
+type DescribeInput struct {
+	State   json.RawMessage `json:"state,omitempty"`
+	Version int             `json:"version,omitempty"`
+}
 type ReadyFrame struct {
 	Generation uint64 `json:"generation"`
-}
-type RunFrame struct {
-	AttemptID string `json:"attempt_id"`
-	Child     string `json:"child"`
-	Phase     string `json:"phase"`
-	Error     string `json:"error,omitempty"`
-}
-type HealthFrame struct {
-	Child   string `json:"child"`
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
 }
 type StoppedFrame struct {
 	Generation uint64 `json:"generation"`
 	Clean      bool   `json:"clean"`
+	Error      string `json:"error,omitempty"`
 }
 type WorkerFrame struct {
 	Type        string            `json:"type"`
 	Monitor     *MonitorFrame     `json:"monitor,omitempty"`
 	Ready       *ReadyFrame       `json:"ready,omitempty"`
 	Transaction *TransactionFrame `json:"transaction,omitempty"`
-	Run         *RunFrame         `json:"run,omitempty"`
-	Health      *HealthFrame      `json:"health,omitempty"`
 	Stopped     *StoppedFrame     `json:"stopped,omitempty"`
 }
 
@@ -174,32 +165,6 @@ func (i DaemonFrame) Validate() error {
 				return fmt.Errorf("invalid hello checkpoint %q", source)
 			}
 		}
-		if len(i.Hello.Capabilities) > 64 {
-			return errors.New("too many protocol capabilities")
-		}
-		supported := map[string]bool{"transactions": true, "outbox": true, "health": true}
-		seenCaps := map[string]bool{}
-		for _, capability := range i.Hello.Capabilities {
-			if !supported[capability] {
-				return fmt.Errorf("unsupported capability %q", capability)
-			}
-			if seenCaps[capability] {
-				return fmt.Errorf("duplicate capability %q", capability)
-			}
-			seenCaps[capability] = true
-		}
-		for _, required := range []string{"transactions", "outbox", "health"} {
-			found := false
-			for _, capability := range i.Hello.Capabilities {
-				if capability == required {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return fmt.Errorf("required capability %q was not negotiated", required)
-			}
-		}
 	case "start":
 		if i.Start == nil {
 			return errors.New("start payload missing")
@@ -230,7 +195,7 @@ func (i DaemonFrame) Validate() error {
 }
 func (o WorkerFrame) Validate() error {
 	n := 0
-	for _, p := range []any{o.Monitor, o.Ready, o.Transaction, o.Run, o.Health, o.Stopped} {
+	for _, p := range []any{o.Monitor, o.Ready, o.Transaction, o.Stopped} {
 		if !isNil(p) {
 			n++
 		}
@@ -289,20 +254,6 @@ func (o WorkerFrame) Validate() error {
 				return fmt.Errorf("event %d: %w", index, err)
 			}
 		}
-	case "run":
-		if o.Run == nil {
-			return errors.New("run payload missing")
-		}
-		if o.Run.AttemptID == "" || o.Run.Child == "" || (o.Run.Phase != "started" && o.Run.Phase != "finished" && o.Run.Phase != "success" && o.Run.Phase != "failure" && o.Run.Phase != "canceled") {
-			return errors.New("invalid run frame")
-		}
-	case "health":
-		if o.Health == nil {
-			return errors.New("health payload missing")
-		}
-		if o.Health.Child == "" || (o.Health.Status != "ready" && o.Health.Status != "healthy" && o.Health.Status != "degraded" && o.Health.Status != "failed" && o.Health.Status != "terminal" && o.Health.Status != "restarting" && o.Health.Status != "stopped") {
-			return errors.New("invalid health frame")
-		}
 	case "stopped":
 		if o.Stopped == nil {
 			return errors.New("stopped payload missing")
@@ -335,39 +286,12 @@ func (p PlanDescription) Validate() error {
 	}
 	switch p.Kind {
 	case "continuous":
-		if p.Name != "" || p.Interval != 0 || len(p.Children) != 0 {
+		if p.Interval != 0 {
 			return errors.New("invalid continuous plan shape")
 		}
 	case "every":
-		if p.Name != "" || p.Interval <= 0 || len(p.Children) != 0 {
+		if p.Interval <= 0 {
 			return errors.New("invalid polling plan shape")
-		}
-	case "named":
-		if len(p.Name) > 63 || !infoNamePattern.MatchString(p.Name) || len(p.Children) != 1 || p.Interval != 0 || p.Timeout != 0 || len(p.Secrets) != 0 {
-			return errors.New("invalid named plan shape")
-		}
-		if err := p.Children[0].Validate(); err != nil {
-			return err
-		}
-		if p.Children[0].Kind == "named" || p.Children[0].Kind == "combined" {
-			return errors.New("invalid named child")
-		}
-	case "combined":
-		if p.Name != "" || p.Interval != 0 || p.Timeout != 0 || len(p.Secrets) != 0 || len(p.Children) == 0 {
-			return errors.New("invalid combined plan shape")
-		}
-		seen := map[string]bool{}
-		for _, child := range p.Children {
-			if child.Kind != "named" {
-				return errors.New("combined child is not named")
-			}
-			if seen[child.Name] {
-				return fmt.Errorf("duplicate child name %q", child.Name)
-			}
-			seen[child.Name] = true
-			if err := child.Validate(); err != nil {
-				return err
-			}
 		}
 	default:
 		return fmt.Errorf("unsupported plan kind %q", p.Kind)
@@ -389,10 +313,6 @@ func isNil(v any) bool {
 	case *ReadyFrame:
 		return x == nil
 	case *TransactionFrame:
-		return x == nil
-	case *RunFrame:
-		return x == nil
-	case *HealthFrame:
 		return x == nil
 	case *StoppedFrame:
 		return x == nil

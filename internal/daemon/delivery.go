@@ -2,18 +2,24 @@ package daemon
 
 import (
 	"context"
+	"sort"
 
 	monitord "github.com/saucesteals/monitord"
 	"github.com/saucesteals/monitord/internal/routes"
 )
 
-func toFields(fields []monitord.Field) []routes.Field {
-	if len(fields) == 0 {
+func dataFields(data map[string]string) []routes.Field {
+	if len(data) == 0 {
 		return nil
 	}
-	out := make([]routes.Field, 0, len(fields))
-	for _, field := range fields {
-		out = append(out, routes.Field{Name: field.Name, Value: field.Value, Inline: field.Inline})
+	keys := make([]string, 0, len(data))
+	for key := range data {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]routes.Field, 0, len(data))
+	for _, key := range keys {
+		out = append(out, routes.Field{Name: key, Value: data[key]})
 	}
 	return out
 }

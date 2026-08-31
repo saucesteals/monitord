@@ -10,111 +10,115 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func (c *CLI) newRemoveCmd() *cobra.Command {
-	var purge bool
-	var force bool
-
-	cmd := &cobra.Command{
-		Use:     "rm NAME",
-		Aliases: []string{"remove"},
-		Short:   "Delete a monitor",
-		Args:    exactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return c.rm(args[0], purge, force)
-		},
-	}
-	cmd.Flags().BoolVar(&purge, "purge", false, "permanently delete archived deployment data")
-	cmd.Flags().BoolVar(&force, "force", false, "allow purge when queued deliveries remain")
-
-	return cmd
+func (c *CLI) newArchiveCmd() *cobra.Command {
+	return &cobra.Command{Use: "archive NAME_OR_ID", Short: "Archive an inactive deployment", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		return c.archive(cmd.Context(), args[0])
+	}}
 }
 
-func (c *CLI) rm(selector string, purge, force bool) error {
+func (c *CLI) archive(ctx context.Context, selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
-
-	d, err := store.GetDeployment(context.Background(), selector)
+	deployment, err := store.GetDeployment(ctx, selector)
 	if err != nil {
 		return err
 	}
-	if !purge {
-		if d.Status != "archived" {
-			err = store.ArchiveDeployment(context.Background(), d.ID)
-		}
-		if err == nil {
-			fmt.Printf("archived %s (%s)\n", d.Name, d.ID)
-		}
+	if deployment.Status == "active" {
+		return errors.New("pause the deployment before archiving it")
+	}
+	if err := store.ArchiveDeployment(ctx, deployment.ID); err != nil {
 		return err
 	}
-	if d.Status != "archived" {
-		return errors.New("archive deployment before purging")
+	fmt.Printf("archived %s (%s)\n", deployment.Name, deployment.ID)
+	return nil
+}
+
+func (c *CLI) newPurgeCmd() *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{Use: "purge NAME_OR_ID", Short: "Permanently delete an archived deployment", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		return c.purge(cmd.Context(), args[0], force)
+	}}
+	cmd.Flags().BoolVar(&force, "force", false, "discard queued deliveries")
+	return cmd
+}
+
+func (c *CLI) purge(ctx context.Context, selector string, force bool) error {
+	store, _, err := c.store()
+	if err != nil {
+		return err
 	}
-	if err = store.PurgeDeploymentSafe(context.Background(), d.ID, force); err != nil {
+	defer func() { _ = store.Close() }()
+	deployment, err := store.GetDeployment(ctx, selector)
+	if err != nil {
+		return err
+	}
+	if deployment.Status != "archived" {
+		return errors.New("archive the deployment before purging it")
+	}
+	if err = store.PurgeDeploymentSafe(ctx, deployment.ID, force); err != nil {
 		if strings.Contains(err.Error(), "queued deliveries") {
 			return errors.New("queued deliveries remain; retry later or use --force")
 		}
 		return err
 	}
-	fmt.Printf("purged %s (%s)\n", d.Name, d.ID)
+	fmt.Printf("purged %s (%s)\n", deployment.Name, deployment.ID)
 	return nil
 }
 
-func (c *CLI) newExpireCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "expire NAME",
-		Short: "Stop scheduling a monitor",
-		Args:  exactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return c.expire(args[0])
-		},
-	}
-}
-
-func (c *CLI) newResumeCmd() *cobra.Command {
-	var ttl time.Duration
-	cmd := &cobra.Command{Use: "resume NAME_OR_ID", Short: "Resume an expired deployment", Args: exactArgs(1), RunE: func(_ *cobra.Command, args []string) error {
-		if ttl <= 0 {
-			return errors.New("--ttl must be positive")
-		}
-		store, _, err := c.store()
-		if err != nil {
-			return err
-		}
-		defer store.Close()
-		d, err := store.GetDeployment(context.Background(), args[0])
-		if err != nil {
-			return err
-		}
-		expires := time.Now().UTC().Add(ttl)
-		if err = store.ResumeDeployment(context.Background(), d.ID, &expires); err != nil {
-			return err
-		}
-		fmt.Printf("resumed %s (%s) until %s\n", d.Name, d.ID, expires.Format(time.RFC3339))
-		return nil
+func (c *CLI) newPauseCmd() *cobra.Command {
+	return &cobra.Command{Use: "pause NAME_OR_ID", Short: "Pause a deployment", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		return c.pause(cmd.Context(), args[0])
 	}}
-	cmd.Flags().DurationVar(&ttl, "ttl", 0, "fresh deployment lifetime")
-	_ = cmd.MarkFlagRequired("ttl")
-	return cmd
 }
 
-func (c *CLI) expire(rawName string) error {
+func (c *CLI) pause(ctx context.Context, selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
-
-	d, err := store.GetDeployment(context.Background(), rawName)
+	deployment, err := store.GetDeployment(ctx, selector)
 	if err != nil {
 		return err
 	}
-	if err := store.ExpireDeployment(context.Background(), d.ID); err != nil {
+	if err := store.PauseDeployment(ctx, deployment.ID); err != nil {
 		return err
 	}
-	fmt.Printf("expired %s (%s)\n", d.Name, d.ID)
-
+	fmt.Printf("paused %s (%s)\n", deployment.Name, deployment.ID)
 	return nil
+}
+
+func (c *CLI) newResumeCmd() *cobra.Command {
+	var ttl time.Duration
+	var persistent bool
+	cmd := &cobra.Command{Use: "resume NAME_OR_ID", Short: "Resume an inactive deployment", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if persistent == (ttl > 0) {
+			return errors.New("set exactly one of --ttl or --persistent")
+		}
+		store, _, err := c.store()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = store.Close() }()
+		deployment, err := store.GetDeployment(cmd.Context(), args[0])
+		if err != nil {
+			return err
+		}
+		var expires *time.Time
+		if ttl > 0 {
+			value := time.Now().UTC().Add(ttl)
+			expires = &value
+		}
+		if err = store.ResumeDeployment(cmd.Context(), deployment.ID, expires); err != nil {
+			return err
+		}
+		fmt.Printf("resumed %s (%s)\n", deployment.Name, deployment.ID)
+		return nil
+	}}
+	cmd.Flags().DurationVar(&ttl, "ttl", 0, "fresh deployment lifetime")
+	cmd.Flags().BoolVar(&persistent, "persistent", false, "resume without an expiration")
+	return cmd
 }

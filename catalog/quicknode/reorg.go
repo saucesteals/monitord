@@ -40,5 +40,9 @@ func reconcileJournal(ctx context.Context, c *Client, j walletJournal, next uint
 }
 func (w Wallet) correctionEvent(t Transfer) monitord.Event {
 	original := w.mapEvent(t)
-	return monitord.Event{ID: "correction:" + t.ID(), Title: "Chain reorganization correction", Message: "A previously reported wallet transfer is no longer canonical", Summary: original.Title + ": " + original.Message, Details: "original_event_id=" + t.ID()}
+	return monitord.Event{
+		ID: "correction:" + t.ID(), Title: "Chain reorganization correction",
+		Body: "A previously reported wallet transfer is no longer canonical",
+		Data: map[string]string{"original_event_id": t.ID(), "original_title": original.Title},
+	}
 }

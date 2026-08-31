@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -27,8 +26,8 @@ func (c *CLI) newAccountListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List Keychain delivery accounts",
 		Args:  noArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			accounts, err := routes.ListAccounts(context.Background())
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			accounts, err := routes.ListAccounts(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -46,8 +45,8 @@ func (c *CLI) newAccountRemoveCmd() *cobra.Command {
 		Use:   "remove KIND NAME",
 		Short: "Remove a Keychain delivery account",
 		Args:  exactArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
-			if err := routes.RemoveAccount(context.Background(), args[0], args[1]); err != nil {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := routes.RemoveAccount(cmd.Context(), args[0], args[1]); err != nil {
 				return err
 			}
 
@@ -65,11 +64,11 @@ func (c *CLI) newAccountSetCmd() *cobra.Command {
 		Use:   "set KIND NAME",
 		Short: "Store a delivery account token in Keychain",
 		Args:  exactArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			if token == "" {
 				return fmt.Errorf("--token is required")
 			}
-			if err := routes.StoreAccountToken(context.Background(), args[0], args[1], strings.TrimSpace(token)); err != nil {
+			if err := routes.StoreAccountToken(cmd.Context(), args[0], args[1], strings.TrimSpace(token)); err != nil {
 				return err
 			}
 

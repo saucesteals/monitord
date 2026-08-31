@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,15 +27,12 @@ type CheckpointMutation struct {
 type OutboxDelivery struct {
 	DestinationID       string
 	DestinationRevision int64
-	RenderedPayload     json.RawMessage
 }
 
 type OutboxEvent struct {
 	OutboxID   string
 	EventID    string
 	Payload    json.RawMessage
-	DedupeKey  string
-	DedupeFor  time.Duration
 	Deliveries []OutboxDelivery
 }
 
@@ -51,7 +47,6 @@ type TransactionFrame struct {
 	NextState         json.RawMessage
 	Checkpoints       []CheckpointMutation
 	Events            []OutboxEvent
-	Progress          bool
 	PayloadHash       [sha256.Size]byte
 }
 
@@ -149,13 +144,6 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 	}
 
 	for _, event := range frame.Events {
-		accepted, err := claimDedupe(ctx, tx, frame.DeploymentID, event, now)
-		if err != nil {
-			return TransactionACK{}, err
-		}
-		if !accepted {
-			continue
-		}
 		if err := insertOutboxEvent(ctx, tx, frame, event, now); err != nil {
 			return TransactionACK{}, err
 		}
@@ -247,29 +235,6 @@ func lookupTransaction(ctx context.Context, tx *sql.Tx, frame TransactionFrame) 
 	return ack, true, nil
 }
 
-func claimDedupe(ctx context.Context, tx *sql.Tx, deploymentID string, event OutboxEvent, now time.Time) (bool, error) {
-	if event.DedupeKey == "" || event.DedupeFor <= 0 {
-		return true, nil
-	}
-	result, err := tx.ExecContext(ctx, `
-		INSERT INTO dedupe_claims (deployment_id, dedupe_key, claimed_at, expires_at, event_id)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(deployment_id, dedupe_key) DO UPDATE SET
-			claimed_at = excluded.claimed_at,
-			expires_at = excluded.expires_at,
-			event_id = excluded.event_id
-		WHERE dedupe_claims.expires_at <= excluded.claimed_at`, deploymentID,
-		event.DedupeKey, toMs(now), toMs(now.Add(event.DedupeFor)), event.EventID)
-	if err != nil {
-		return false, fmt.Errorf("claim dedupe key %q: %w", event.DedupeKey, err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("inspect dedupe claim %q: %w", event.DedupeKey, err)
-	}
-	return rows == 1, nil
-}
-
 func insertOutboxEvent(ctx context.Context, tx *sql.Tx, frame TransactionFrame, event OutboxEvent, now time.Time) error {
 	payloadHash := sha256.Sum256(event.Payload)
 	if _, err := tx.ExecContext(ctx, `
@@ -292,13 +257,11 @@ func insertOutboxEvent(ctx context.Context, tx *sql.Tx, frame TransactionFrame, 
 		return fmt.Errorf("insert outbox event %q: %w", event.EventID, err)
 	}
 	for _, delivery := range event.Deliveries {
-		renderedHash := sha256.Sum256(delivery.RenderedPayload)
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO outbox_deliveries (
-				outbox_id, destination_id, destination_revision, destination_deployment_id,
-				rendered_payload, payload_hash, next_attempt_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?)`, event.OutboxID, delivery.DestinationID,
-			delivery.DestinationRevision, frame.DeploymentID, delivery.RenderedPayload, renderedHash[:], toMs(now)); err != nil {
+				outbox_id, destination_id, destination_revision, next_attempt_at
+			) VALUES (?, ?, ?, ?)`, event.OutboxID, delivery.DestinationID,
+			delivery.DestinationRevision, toMs(now)); err != nil {
 			return fmt.Errorf("insert delivery %q: %w", delivery.DestinationID, err)
 		}
 	}
@@ -340,7 +303,7 @@ func validateFrame(frame TransactionFrame) error {
 		eventIDs[event.EventID], outboxIDs[event.OutboxID] = struct{}{}, struct{}{}
 		destinations := make(map[string]struct{}, len(event.Deliveries))
 		for _, delivery := range event.Deliveries {
-			if delivery.DestinationID == "" || delivery.DestinationRevision < 1 || !json.Valid(delivery.RenderedPayload) {
+			if delivery.DestinationID == "" || delivery.DestinationRevision < 1 {
 				return errors.New("transaction frame contains an invalid delivery")
 			}
 			if _, exists := destinations[delivery.DestinationID]; exists {
@@ -353,59 +316,4 @@ func validateFrame(frame TransactionFrame) error {
 		return errors.New("transaction frame payload hash is missing")
 	}
 	return nil
-}
-
-// HashTransactionFrame hashes an unambiguous length-delimited representation of
-// every semantic frame field except PayloadHash itself. Slice order is meaningful.
-func HashTransactionFrame(frame TransactionFrame) [sha256.Size]byte {
-	h := sha256.New()
-	writeHashBytes(h, []byte(frame.DeploymentID))
-	writeHashInt64(h, frame.Generation)
-	writeHashBytes(h, frame.WorkerToken)
-	writeHashInt64(h, frame.Sequence)
-	writeHashInt64(h, frame.BaseStateRevision)
-	writeHashBytes(h, frame.NextState)
-	writeHashInt64(h, int64(len(frame.Checkpoints)))
-	for _, checkpoint := range frame.Checkpoints {
-		writeHashBytes(h, []byte(checkpoint.Source))
-		writeHashBytes(h, checkpoint.Value)
-	}
-	writeHashInt64(h, int64(len(frame.Events)))
-	for _, event := range frame.Events {
-		writeHashBytes(h, []byte(event.OutboxID))
-		writeHashBytes(h, []byte(event.EventID))
-		writeHashBytes(h, event.Payload)
-		writeHashBytes(h, []byte(event.DedupeKey))
-		writeHashInt64(h, int64(event.DedupeFor))
-		writeHashInt64(h, int64(len(event.Deliveries)))
-		for _, delivery := range event.Deliveries {
-			writeHashBytes(h, []byte(delivery.DestinationID))
-			writeHashInt64(h, delivery.DestinationRevision)
-			writeHashBytes(h, delivery.RenderedPayload)
-		}
-	}
-	if frame.Progress {
-		writeHashInt64(h, 1)
-	} else {
-		writeHashInt64(h, 0)
-	}
-
-	var sum [sha256.Size]byte
-	copy(sum[:], h.Sum(nil))
-	return sum
-}
-
-type hashWriter interface {
-	Write([]byte) (int, error)
-}
-
-func writeHashBytes(w hashWriter, value []byte) {
-	writeHashInt64(w, int64(len(value)))
-	_, _ = w.Write(value)
-}
-
-func writeHashInt64(w hashWriter, value int64) {
-	var encoded [8]byte
-	binary.BigEndian.PutUint64(encoded[:], uint64(value))
-	_, _ = w.Write(encoded[:])
 }

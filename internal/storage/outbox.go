@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 )
 
@@ -42,12 +41,12 @@ func (s *Store) ListOutboxHistory(ctx context.Context, id string, limit int, fai
 }
 
 type ClaimedDelivery struct {
-	OutboxID, DeploymentID, DestinationID string
-	DestinationRevision                   int64
-	RenderedPayload, DestinationConfig    json.RawMessage
-	AttemptCount                          int
-	LeaseOwner                            string
-	LeaseExpiresAt                        time.Time
+	OutboxID, DeploymentID, DeploymentName, DestinationID string
+	DestinationRevision                                   int64
+	EventPayload, DestinationConfig                       json.RawMessage
+	AttemptCount                                          int
+	LeaseOwner                                            string
+	LeaseExpiresAt                                        time.Time
 }
 
 // ClaimOutbox atomically leases due rows. Completion is intentionally generation-independent.
@@ -61,7 +60,7 @@ func (s *Store) ClaimOutbox(ctx context.Context, owner string, now time.Time, le
 	}
 	defer tx.Rollback()
 	expires := now.Add(lease)
-	rows, err := tx.QueryContext(ctx, `UPDATE outbox_deliveries SET status='sending',lease_owner=?,lease_expires_at=? WHERE rowid IN (SELECT d.rowid FROM outbox_deliveries d WHERE (d.status='pending' AND d.next_attempt_at<=?) OR (d.status='sending' AND d.lease_expires_at<=?) ORDER BY d.next_attempt_at LIMIT ?) RETURNING outbox_id,destination_id,destination_revision,rendered_payload,attempt_count`, owner, toMs(expires), toMs(now), toMs(now), limit)
+	rows, err := tx.QueryContext(ctx, `UPDATE outbox_deliveries SET status='sending',lease_owner=?,lease_expires_at=? WHERE rowid IN (SELECT d.rowid FROM outbox_deliveries d WHERE (d.status='pending' AND d.next_attempt_at<=?) OR (d.status='sending' AND d.lease_expires_at<=?) ORDER BY d.next_attempt_at LIMIT ?) RETURNING outbox_id,destination_id,destination_revision,attempt_count`, owner, toMs(expires), toMs(now), toMs(now), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -69,12 +68,12 @@ func (s *Store) ClaimOutbox(ctx context.Context, owner string, now time.Time, le
 	var out []ClaimedDelivery
 	for rows.Next() {
 		var d ClaimedDelivery
-		if err = rows.Scan(&d.OutboxID, &d.DestinationID, &d.DestinationRevision, &d.RenderedPayload, &d.AttemptCount); err != nil {
+		if err = rows.Scan(&d.OutboxID, &d.DestinationID, &d.DestinationRevision, &d.AttemptCount); err != nil {
 			return nil, err
 		}
 		d.LeaseOwner = owner
 		d.LeaseExpiresAt = expires
-		err = tx.QueryRowContext(ctx, `SELECT e.deployment_id,b.config FROM outbox_events e JOIN destination_bindings b ON b.deployment_id=e.deployment_id AND b.id=? AND b.revision=? WHERE e.outbox_id=?`, d.DestinationID, d.DestinationRevision, d.OutboxID).Scan(&d.DeploymentID, &d.DestinationConfig)
+		err = tx.QueryRowContext(ctx, `SELECT e.deployment_id,p.name,e.payload,b.config FROM outbox_events e JOIN deployments p ON p.id=e.deployment_id JOIN destination_bindings b ON b.deployment_id=e.deployment_id AND b.id=? AND b.revision=? WHERE e.outbox_id=?`, d.DestinationID, d.DestinationRevision, d.OutboxID).Scan(&d.DeploymentID, &d.DeploymentName, &d.EventPayload, &d.DestinationConfig)
 		if err != nil {
 			return nil, err
 		}
@@ -99,7 +98,7 @@ func (s *Store) MarkDeliveryFailed(ctx context.Context, outboxID, destinationID,
 	var attempts int
 	err := s.db.QueryRowContext(ctx, `SELECT attempt_count FROM outbox_deliveries WHERE outbox_id=? AND destination_id=? AND status='sending' AND lease_owner=?`, outboxID, destinationID, owner).Scan(&attempts)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ErrRunFenced
+		return ErrLeaseLost
 	}
 	if err != nil {
 		return err
@@ -117,7 +116,7 @@ func (s *Store) finishDelivery(ctx context.Context, outboxID, destinationID, own
 	}
 	rows, _ := res.RowsAffected()
 	if rows != 1 {
-		return fmt.Errorf("delivery lease lost: %w", ErrRunFenced)
+		return ErrLeaseLost
 	}
 	return nil
 }
@@ -131,16 +130,4 @@ func (s *Store) RetryDeadDelivery(ctx context.Context, outboxID, destinationID s
 		return ErrNotFound
 	}
 	return nil
-}
-
-// PruneOutbox only removes events whose every destination is terminal. It never prunes transaction ledger rows.
-func (s *Store) PruneOutbox(ctx context.Context, before time.Time, limit int) (int64, error) {
-	if limit <= 0 {
-		return 0, nil
-	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM outbox_events WHERE outbox_id IN (SELECT e.outbox_id FROM outbox_events e WHERE e.created_at<? AND NOT EXISTS(SELECT 1 FROM outbox_deliveries d WHERE d.outbox_id=e.outbox_id AND d.status NOT IN ('delivered','dead')) ORDER BY e.created_at LIMIT ?)`, toMs(before), limit)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
 }

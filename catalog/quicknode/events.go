@@ -80,9 +80,6 @@ func (e Events[S]) run(ctx context.Context, s *monitord.Session[S]) error {
 	if err != nil {
 		return err
 	}
-	if err := s.Progress(ctx); err != nil {
-		return err
-	}
 	// Checkpoints are daemon-owned but not exposed as a Session read API. Start
 	// inclusively from genesis; durable event IDs make restarts safe. The daemon
 	// can optimize this once checkpoint snapshots are exposed to catalog plans.
@@ -154,7 +151,6 @@ func (e Events[S]) processBlock(ctx context.Context, s *monitord.Session[S], c *
 			if err := tx.Checkpoint(checkpointSource, Checkpoint{ChainID: c.ChainID(), NextBlock: n, CanonicalParent: block.Hash}); err != nil {
 				return err
 			}
-			tx.Progress()
 			return nil
 		}); err != nil {
 			return err
@@ -164,7 +160,6 @@ func (e Events[S]) processBlock(ctx context.Context, s *monitord.Session[S], c *
 		if err := tx.Checkpoint(checkpointSource, Checkpoint{ChainID: c.ChainID(), NextBlock: n + 1, CanonicalParent: block.Hash}); err != nil {
 			return err
 		}
-		tx.Progress()
 		return nil
 	})
 }

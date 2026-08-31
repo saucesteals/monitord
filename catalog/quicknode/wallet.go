@@ -106,9 +106,6 @@ func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error
 	if err != nil {
 		return err
 	}
-	if err = s.Progress(ctx); err != nil {
-		return err
-	}
 	next := s.State().Checkpoint.NextBlock
 	var journal walletJournal
 	_, err = s.Checkpoint(walletJournalSource, &journal)
@@ -181,7 +178,6 @@ func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error
 					if err := tx.Checkpoint(walletJournalSource, nextJournal); err != nil {
 						return err
 					}
-					tx.Progress()
 					return nil
 				}); err != nil {
 					return err

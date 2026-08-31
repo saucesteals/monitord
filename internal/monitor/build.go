@@ -5,6 +5,8 @@ package monitor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,18 +60,19 @@ func Build(ctx context.Context, paths config.Paths, req Request) (BuildResult, e
 	if err != nil {
 		return BuildResult{}, err
 	}
-	fingerprint, err := fingerprintDir(dir)
-	if err != nil {
-		return BuildResult{}, err
-	}
-	artifactDir := filepath.Join(paths.ArtifactDir(req.Name), fingerprint)
-	if err = os.MkdirAll(artifactDir, 0o700); err != nil {
-		return BuildResult{}, fmt.Errorf("create artifact dir: %w", err)
-	}
 	if err = config.Tidy(ctx, paths); err != nil {
 		return BuildResult{}, err
 	}
-	binaryPath := filepath.Join(artifactDir, "monitor")
+	artifactRoot := paths.ArtifactDir(req.Name)
+	if err = os.MkdirAll(artifactRoot, 0o700); err != nil {
+		return BuildResult{}, fmt.Errorf("create artifact root: %w", err)
+	}
+	buildDir, err := os.MkdirTemp(artifactRoot, ".build-")
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("create build directory: %w", err)
+	}
+	defer os.RemoveAll(buildDir)
+	binaryPath := filepath.Join(buildDir, "monitor")
 	if err = build(ctx, dir, binaryPath); err != nil {
 		return BuildResult{}, err
 	}
@@ -83,7 +86,20 @@ func Build(ctx context.Context, paths config.Paths, req Request) (BuildResult, e
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("encode description: %w", err)
 	}
-	return BuildResult{Artifact: storage.Artifact{ID: fingerprint, ContentHash: fingerprint, Path: binaryPath, Describe: describeJSON}, Description: description, State: state}, nil
+	contents, err := os.ReadFile(binaryPath)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("read built monitor: %w", err)
+	}
+	sum := sha256.Sum256(contents)
+	contentHash := hex.EncodeToString(sum[:])
+	artifactDir := filepath.Join(artifactRoot, contentHash)
+	finalPath := filepath.Join(artifactDir, "monitor")
+	if err = os.Rename(buildDir, artifactDir); err != nil {
+		if _, statErr := os.Stat(finalPath); statErr != nil {
+			return BuildResult{}, fmt.Errorf("publish artifact: %w", err)
+		}
+	}
+	return BuildResult{Artifact: storage.Artifact{ID: contentHash, ContentHash: contentHash, Path: finalPath, Describe: describeJSON}, Description: description, State: state}, nil
 }
 
 func validateDir(req Request) (string, error) {

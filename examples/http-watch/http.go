@@ -102,7 +102,7 @@ func commitObservation(tx *monitord.Tx[State], result observation) error {
 	case result.err != nil:
 		event.Severity = monitord.SeverityCritical
 		event.Title = result.target.Name + " is unreachable"
-		event.Summary = result.err.Error()
+		event.Body = result.err.Error()
 	case result.status < http.StatusBadRequest:
 		event.Severity = monitord.SeverityInfo
 		event.Title = result.target.Name + " recovered"

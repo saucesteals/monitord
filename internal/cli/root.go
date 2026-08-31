@@ -43,13 +43,13 @@ func New() *cobra.Command {
 		c.newNewMonitorCmd(),
 		c.newTestCmd(),
 		c.newDeployCmd(),
-		c.newRunsCmd(),
 		c.newEventsCmd(),
-		c.newRemoveCmd(),
+		c.newArchiveCmd(),
+		c.newPurgeCmd(),
 		c.newListCmd(),
 		c.newInspectCmd(),
 		c.newStateCmd(),
-		c.newExpireCmd(),
+		c.newPauseCmd(),
 		c.newResumeCmd(),
 		c.newSkillCmd(),
 		c.newVersionCmd(),
@@ -95,6 +95,13 @@ func noArgs(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func truncate(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit-1] + "…"
 }
 
 func formatTime(t *time.Time) string {

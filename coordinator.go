@@ -22,7 +22,6 @@ type workerCoordinator struct {
 	acks        chan TransactionAck
 	stop        chan Stop
 	fatal       chan error
-	progress    chan struct{}
 	outstanding atomic.Bool
 }
 
@@ -32,7 +31,7 @@ func (c *workerCoordinator) Commit(ctx context.Context, tx transactionCommit) (j
 	c.outstanding.Store(true)
 	defer c.outstanding.Store(false)
 	nextSequence := c.seq + 1
-	frame := TransactionFrame{DeploymentID: c.hello.DeploymentID, Generation: c.hello.Generation, WorkerToken: c.hello.WorkerToken, Sequence: nextSequence, BaseStateRevision: c.revision, NextState: tx.NextState, Checkpoints: tx.Checkpoints, Events: tx.Events, Progress: tx.Progress}
+	frame := TransactionFrame{DeploymentID: c.hello.DeploymentID, Generation: c.hello.Generation, WorkerToken: c.hello.WorkerToken, Sequence: nextSequence, BaseStateRevision: c.revision, NextState: tx.NextState, Checkpoints: tx.Checkpoints, Events: tx.Events}
 	sum := HashTransactionFrame(frame)
 	frame.PayloadHash = hex.EncodeToString(sum[:])
 	out := WorkerFrame{Type: "transaction", Transaction: &frame}
@@ -55,6 +54,8 @@ func (c *workerCoordinator) Commit(ctx context.Context, tx transactionCommit) (j
 	defer retry.Stop()
 	for {
 		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case ack := <-c.acks:
 			if ack.DeploymentID != frame.DeploymentID || ack.Generation != frame.Generation || ack.Sequence != frame.Sequence || ack.PayloadHash != frame.PayloadHash {
 				return nil, errors.New("transaction ACK identity mismatch")
@@ -63,12 +64,6 @@ func (c *workerCoordinator) Commit(ctx context.Context, tx transactionCommit) (j
 				return nil, fmt.Errorf("transaction rejected with status %q", ack.Status)
 			}
 			c.revision = ack.ResultRevision
-			if tx.Progress {
-				select {
-				case c.progress <- struct{}{}:
-				default:
-				}
-			}
 			return append(json.RawMessage(nil), tx.NextState...), nil
 		case <-retry.C:
 			if err = c.wire.sendBytes(raw); err != nil {
@@ -83,7 +78,7 @@ func (c *workerCoordinator) Commit(ctx context.Context, tx transactionCommit) (j
 // HashTransactionFrame returns the canonical semantic payload hash.
 func HashTransactionFrame(frame TransactionFrame) [32]byte {
 	h := sha256.New()
-	fields := []any{frame.DeploymentID, frame.Generation, frame.WorkerToken, frame.Sequence, frame.BaseStateRevision, frame.NextState, frame.Checkpoints, frame.Events, frame.Progress}
+	fields := []any{frame.DeploymentID, frame.Generation, frame.WorkerToken, frame.Sequence, frame.BaseStateRevision, frame.NextState, frame.Checkpoints, frame.Events}
 	var size [8]byte
 	for _, field := range fields {
 		raw, _ := json.Marshal(field)

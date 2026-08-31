@@ -26,7 +26,6 @@ import (
 type worker struct {
 	deployment        storage.RuntimeDeployment
 	generation        storage.ActiveGeneration
-	plan              monitord.PlanDescription
 	cmd               *exec.Cmd
 	in                io.WriteCloser
 	out               *bufio.Reader
@@ -75,7 +74,7 @@ func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDe
 	}()
 	go func() { w.done <- cmd.Wait() }()
 	go w.readLoop()
-	hello := monitord.Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: dep.ID, DeploymentName: dep.Name, Generation: uint64(generation.Generation), WorkerToken: hex.EncodeToString(generation.WorkerToken), ArtifactHash: dep.ArtifactHash, ConfigHash: dep.ConfigHash, StateRevision: dep.StateRevision, State: dep.State, Checkpoints: dep.Checkpoints, Secrets: secrets, Capabilities: []string{"transactions", "outbox", "health"}}
+	hello := monitord.Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: dep.ID, DeploymentName: dep.Name, Generation: uint64(generation.Generation), WorkerToken: hex.EncodeToString(generation.WorkerToken), ArtifactHash: dep.ArtifactHash, ConfigHash: dep.ConfigHash, StateRevision: dep.StateRevision, State: dep.State, Checkpoints: dep.Checkpoints, Secrets: secrets}
 	if err = w.send(monitord.DaemonFrame{Type: "hello", Hello: &hello}); err != nil {
 		w.kill()
 		return nil, err
@@ -112,8 +111,7 @@ func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDe
 		w.kill()
 		return nil, errors.New("worker monitor frame differs from persisted artifact description")
 	}
-	w.plan = persisted.Plan
-	if err = w.send(monitord.DaemonFrame{Type: "start", Start: &monitord.Start{Plan: w.plan}}); err != nil {
+	if err = w.send(monitord.DaemonFrame{Type: "start", Start: &monitord.Start{Plan: persisted.Plan}}); err != nil {
 		w.kill()
 		return nil, err
 	}
@@ -140,15 +138,13 @@ func (w *worker) serve(ctx context.Context, store *storage.Store) error {
 			if err = w.transaction(ctx, store, *msg.Transaction); err != nil {
 				return err
 			}
-		case "run":
-			if err = w.run(ctx, store, *msg.Run); err != nil {
-				return err
-			}
-		case "health":
-			if err = store.WriteHealth(ctx, w.deployment.ID, w.generation.Generation, w.generation.WorkerToken, msg.Health.Child, normalizeHealth(msg.Health.Status), msg.Health.Message); err != nil {
-				return err
-			}
 		case "stopped":
+			if msg.Stopped.Error != "" {
+				return errors.New(msg.Stopped.Error)
+			}
+			if !msg.Stopped.Clean {
+				return errors.New("worker stopped unsuccessfully")
+			}
 			return nil
 		default:
 			return fmt.Errorf("unexpected worker frame %q", msg.Type)
@@ -178,25 +174,24 @@ func (w *worker) transaction(ctx context.Context, store *storage.Store, wire mon
 	}
 	events := make([]storage.OutboxEvent, 0, len(wire.Events))
 	for i, event := range wire.Events {
+		if event.Time.IsZero() {
+			event.Time = time.Now().UTC()
+		}
 		payload, err := json.Marshal(event)
 		if err != nil {
 			return err
 		}
 		deliveries := make([]storage.OutboxDelivery, 0, len(bindings))
 		for _, b := range bindings {
-			rendered, err := renderEvent(w.deployment.Name, event, b.Config)
-			if err != nil {
-				return err
-			}
-			deliveries = append(deliveries, storage.OutboxDelivery{DestinationID: b.ID, DestinationRevision: b.Revision, RenderedPayload: rendered})
+			deliveries = append(deliveries, storage.OutboxDelivery{DestinationID: b.ID, DestinationRevision: b.Revision})
 		}
 		sum := sha256.Sum256([]byte(w.deployment.ID + "\x00" + strconv.FormatUint(wire.Generation, 10) + "\x00" + strconv.FormatUint(wire.Sequence, 10) + "\x00" + strconv.Itoa(i)))
-		events = append(events, storage.OutboxEvent{OutboxID: hex.EncodeToString(sum[:]), EventID: event.ID, Payload: payload, DedupeKey: event.DedupeKey, DedupeFor: event.DedupeFor, Deliveries: deliveries})
+		events = append(events, storage.OutboxEvent{OutboxID: hex.EncodeToString(sum[:]), EventID: event.ID, Payload: payload, Deliveries: deliveries})
 	}
 	hash, _ := hex.DecodeString(wire.PayloadHash)
 	var fixed [sha256.Size]byte
 	copy(fixed[:], hash)
-	frame := storage.TransactionFrame{DeploymentID: wire.DeploymentID, Generation: int64(wire.Generation), WorkerToken: w.generation.WorkerToken, Sequence: int64(wire.Sequence), BaseStateRevision: wire.BaseStateRevision, NextState: wire.NextState, Checkpoints: checkpoints, Events: events, Progress: wire.Progress, PayloadHash: fixed}
+	frame := storage.TransactionFrame{DeploymentID: wire.DeploymentID, Generation: int64(wire.Generation), WorkerToken: w.generation.WorkerToken, Sequence: int64(wire.Sequence), BaseStateRevision: wire.BaseStateRevision, NextState: wire.NextState, Checkpoints: checkpoints, Events: events, PayloadHash: fixed}
 	ack, err := store.ApplyTransaction(ctx, frame)
 	if err != nil {
 		return err
@@ -211,68 +206,6 @@ func verifyWireHash(frame monitord.TransactionFrame) error {
 		return fmt.Errorf("%w: got %s want %s", storage.ErrPayloadConflict, frame.PayloadHash, want)
 	}
 	return nil
-}
-func renderEvent(deploymentName string, event monitord.Event, config json.RawMessage) (json.RawMessage, error) {
-	return json.Marshal(struct {
-		Deployment  string          `json:"deployment"`
-		Event       monitord.Event  `json:"event"`
-		Destination json.RawMessage `json:"destination"`
-	}{deploymentName, event, config})
-}
-
-func (w *worker) run(ctx context.Context, store *storage.Store, r monitord.RunFrame) error {
-	switch r.Phase {
-	case "started":
-		return store.StartRun(ctx, storage.RunStart{ID: r.AttemptID, DeploymentID: w.deployment.ID, Generation: w.generation.Generation, WorkerToken: w.generation.WorkerToken, ChildName: r.Child, Kind: childKind(w.plan, r.Child)})
-	case "finished":
-		status := "success"
-		if r.Error != "" {
-			status = "failure"
-		}
-		return store.FinishRun(ctx, storage.RunFinish{ID: r.AttemptID, DeploymentID: w.deployment.ID, Generation: w.generation.Generation, WorkerToken: w.generation.WorkerToken, Status: status, Error: r.Error})
-	case "success", "failure", "canceled":
-		return store.FinishRun(ctx, storage.RunFinish{ID: r.AttemptID, DeploymentID: w.deployment.ID, Generation: w.generation.Generation, WorkerToken: w.generation.WorkerToken, Status: r.Phase, Error: r.Error})
-	default:
-		return fmt.Errorf("invalid run phase %q", r.Phase)
-	}
-}
-func childKind(plan monitord.PlanDescription, name string) string {
-	for _, c := range plan.Children {
-		if c.Name == name {
-			if planHasKind(c, "continuous") {
-				return "continuous"
-			}
-			return "poll"
-		}
-	}
-	if plan.Kind == "continuous" {
-		return "continuous"
-	}
-	return "poll"
-}
-
-func planHasKind(plan monitord.PlanDescription, kind string) bool {
-	if plan.Kind == kind {
-		return true
-	}
-	for _, c := range plan.Children {
-		if planHasKind(c, kind) {
-			return true
-		}
-	}
-	return false
-}
-func normalizeHealth(s string) string {
-	switch s {
-	case "healthy":
-		return "healthy"
-	case "degraded":
-		return "degraded"
-	case "terminal", "failed":
-		return "failed"
-	default:
-		return "stopped"
-	}
 }
 func (w *worker) send(v monitord.DaemonFrame) error {
 	if err := v.Validate(); err != nil {

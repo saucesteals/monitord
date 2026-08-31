@@ -26,7 +26,8 @@ func (s *Store) GetRuntimeDeployment(ctx context.Context, selector string) (Runt
 }
 
 func (s *Store) ListRuntimeDeployments(ctx context.Context) ([]RuntimeDeployment, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id,d.name,d.info_name,d.source_dir,d.status,COALESCE(d.artifact_id,''),d.config_revision,d.config_hash,d.active_generation,d.state,d.state_version,d.state_revision,d.created_at,d.updated_at,d.expires_at,d.archived_at,a.path,a.content_hash,a.describe_json FROM deployments d JOIN artifacts a ON a.id=d.artifact_id WHERE d.status='active' AND (d.expires_at IS NULL OR d.expires_at>?) ORDER BY d.name`, toMs(time.Now().UTC()))
+	now := toMs(time.Now().UTC())
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id,d.name,d.info_name,d.source_dir,d.status,COALESCE(d.artifact_id,''),d.config_revision,d.config_hash,d.active_generation,d.state,d.state_version,d.state_revision,d.created_at,d.updated_at,d.expires_at,d.archived_at,a.path,a.content_hash,a.describe_json FROM deployments d JOIN artifacts a ON a.id=d.artifact_id WHERE d.status='active' AND (d.expires_at IS NULL OR d.expires_at>?) ORDER BY d.name`, now)
 	if err != nil {
 		return nil, err
 	}
@@ -53,24 +54,25 @@ func (s *Store) ListRuntimeDeployments(ctx context.Context) ([]RuntimeDeployment
 	if err = rows.Close(); err != nil {
 		return nil, err
 	}
+	byID := make(map[string]*RuntimeDeployment, len(out))
 	for i := range out {
 		out[i].Checkpoints = map[string]json.RawMessage{}
-		checkpointRows, queryErr := s.db.QueryContext(ctx, `SELECT source,value FROM checkpoints WHERE deployment_id=? ORDER BY source`, out[i].ID)
-		if queryErr != nil {
-			return nil, queryErr
+		byID[out[i].ID] = &out[i]
+	}
+	checkpointRows, err := s.db.QueryContext(ctx, `SELECT c.deployment_id,c.source,c.value FROM checkpoints c JOIN deployments d ON d.id=c.deployment_id WHERE d.status='active' AND (d.expires_at IS NULL OR d.expires_at>?) ORDER BY c.deployment_id,c.source`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer checkpointRows.Close()
+	for checkpointRows.Next() {
+		var deploymentID, source string
+		var value []byte
+		if err = checkpointRows.Scan(&deploymentID, &source, &value); err != nil {
+			return nil, err
 		}
-		for checkpointRows.Next() {
-			var source string
-			var value []byte
-			if queryErr = checkpointRows.Scan(&source, &value); queryErr != nil {
-				checkpointRows.Close()
-				return nil, queryErr
-			}
-			out[i].Checkpoints[source] = append(json.RawMessage(nil), value...)
-		}
-		if queryErr = checkpointRows.Close(); queryErr != nil {
-			return nil, queryErr
+		if deployment := byID[deploymentID]; deployment != nil {
+			deployment.Checkpoints[source] = append(json.RawMessage(nil), value...)
 		}
 	}
-	return out, nil
+	return out, checkpointRows.Err()
 }

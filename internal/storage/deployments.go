@@ -16,7 +16,7 @@ import (
 var (
 	ErrNotFound      = errors.New("not found")
 	ErrInvalidStatus = errors.New("invalid deployment status")
-	ErrRunFenced     = errors.New("run generation is fenced")
+	ErrLeaseLost     = errors.New("delivery lease is no longer owned")
 )
 
 type Deployment struct {
@@ -28,113 +28,141 @@ type Deployment struct {
 	ExpiresAt, ArchivedAt                                         *time.Time
 }
 
-type CreateDeployment struct {
+// DeployInput is the complete durable snapshot produced by one deploy. The
+// deployment and its destinations become visible together or not at all.
+type DeployInput struct {
 	Name, InfoName, SourceDir, ArtifactID, ConfigHash string
 	State                                             json.RawMessage
 	StateVersion                                      int
 	ExpiresAt                                         *time.Time
+	Destinations                                      []json.RawMessage
+	// ExpectedStateRevision prevents a build from overwriting state committed
+	// while it was compiling. Nil means this is a new deployment.
+	ExpectedStateRevision *int64
 }
 
-func (s *Store) ListDeployments(ctx context.Context) ([]Deployment, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id FROM deployments ORDER BY name`)
-	if err != nil {
-		return nil, err
+func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) {
+	if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.InfoName) == "" || in.ArtifactID == "" || in.ConfigHash == "" || !json.Valid(in.State) || in.StateVersion < 1 || len(in.Destinations) == 0 {
+		return Deployment{}, errors.New("deploy requires name, info, artifact, config hash, and valid versioned state")
 	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err = rows.Scan(&id); err != nil {
-			return nil, err
+	for _, destination := range in.Destinations {
+		if !json.Valid(destination) {
+			return Deployment{}, errors.New("deploy requires valid destination JSON")
 		}
-		ids = append(ids, id)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-	out := make([]Deployment, 0, len(ids))
-	for _, id := range ids {
-		d, e := s.GetDeployment(ctx, id)
-		if e != nil {
-			return nil, e
-		}
-		out = append(out, d)
-	}
-	return out, nil
-}
-func (s *Store) HasQueuedDeliveries(ctx context.Context, id string) (bool, error) {
-	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM outbox_events e JOIN outbox_deliveries d ON d.outbox_id=e.outbox_id WHERE e.deployment_id=? AND d.status IN ('pending','sending')`, id).Scan(&n)
-	return n > 0, err
-}
-
-func (s *Store) ExpireDueDeployments(ctx context.Context, now time.Time) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE deployments SET status='expired',updated_at=? WHERE status='active' AND expires_at IS NOT NULL AND expires_at<=?`, toMs(now), toMs(now))
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-func (s *Store) CreateDeployment(ctx context.Context, in CreateDeployment) (Deployment, error) {
-	if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.InfoName) == "" || in.ArtifactID == "" || in.ConfigHash == "" || !json.Valid(in.State) || in.StateVersion < 1 {
-		return Deployment{}, errors.New("deployment requires name, info, artifact, config hash, and valid versioned state")
-	}
-	id, err := randomID()
-	if err != nil {
-		return Deployment{}, err
-	}
-	now := time.Now().UTC()
-	var expires any
-	if in.ExpiresAt != nil {
-		expires = toMs(*in.ExpiresAt)
-	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO deployments(id,name,info_name,source_dir,status,artifact_id,config_revision,config_hash,state,state_version,created_at,updated_at,expires_at)
-		VALUES(?,?,?,?, 'active', ?,1,?,?,?,?,?,?)`, id, in.Name, in.InfoName, in.SourceDir, in.ArtifactID, in.ConfigHash, in.State, in.StateVersion, toMs(now), toMs(now), expires)
-	if err != nil {
-		return Deployment{}, fmt.Errorf("create deployment: %w", err)
-	}
-	return s.GetDeployment(ctx, id)
-}
-
-// Redeploy updates implementation/config metadata while preserving immutable identity, state, and history.
-func (s *Store) Redeploy(ctx context.Context, id, infoName, sourceDir, artifactID, configHash string, expiresAt *time.Time) (Deployment, error) {
-	if id == "" || infoName == "" || artifactID == "" || configHash == "" {
-		return Deployment{}, errors.New("redeploy requires identity, info, artifact, and config hash")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Deployment{}, err
 	}
 	defer tx.Rollback()
-	var oldHash string
-	if err = tx.QueryRowContext(ctx, `SELECT config_hash FROM deployments WHERE id=? AND status!='archived'`, id).Scan(&oldHash); errors.Is(err, sql.ErrNoRows) {
-		return Deployment{}, ErrNotFound
-	}
-	if err != nil {
-		return Deployment{}, err
-	}
-	revisionBump := int64(0)
-	if oldHash != configHash {
-		revisionBump = 1
-	}
+
+	now := time.Now().UTC()
+	nowMS := toMs(now)
 	var expires any
-	if expiresAt != nil {
-		expires = toMs(*expiresAt)
+	if in.ExpiresAt != nil {
+		expires = toMs(*in.ExpiresAt)
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE deployments SET info_name=?,source_dir=?,artifact_id=?,config_hash=?,config_revision=config_revision+?,status='active',expires_at=?,archived_at=NULL,updated_at=? WHERE id=?`, infoName, sourceDir, artifactID, configHash, revisionBump, expires, toMs(time.Now().UTC()), id)
+	var id, oldHash, status string
+	var stateRevision int64
+	err = tx.QueryRowContext(ctx, `SELECT id,config_hash,status,state_revision FROM deployments WHERE name=?`, in.Name).Scan(&id, &oldHash, &status, &stateRevision)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if in.ExpectedStateRevision != nil {
+			return Deployment{}, ErrStateConflict
+		}
+		id, err = randomID()
+		if err != nil {
+			return Deployment{}, err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO deployments(id,name,info_name,source_dir,status,artifact_id,config_revision,config_hash,state,state_version,created_at,updated_at,expires_at)
+			VALUES(?,?,?,?, 'active', ?,1,?,?,?,?,?,?)`, id, in.Name, in.InfoName, in.SourceDir, in.ArtifactID, in.ConfigHash, in.State, in.StateVersion, nowMS, nowMS, expires)
+	case err != nil:
+		return Deployment{}, err
+	default:
+		if status == "archived" {
+			return Deployment{}, ErrInvalidStatus
+		}
+		if in.ExpectedStateRevision == nil || *in.ExpectedStateRevision != stateRevision {
+			return Deployment{}, ErrStateConflict
+		}
+		revisionBump := 0
+		if oldHash != in.ConfigHash {
+			revisionBump = 1
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE deployments SET info_name=?,source_dir=?,artifact_id=?,config_hash=?,config_revision=config_revision+?,active_generation=0,state=?,state_version=?,state_revision=state_revision+1,status='active',expires_at=?,archived_at=NULL,updated_at=? WHERE id=?`, in.InfoName, in.SourceDir, in.ArtifactID, in.ConfigHash, revisionBump, in.State, in.StateVersion, expires, nowMS, id)
+	}
 	if err != nil {
+		return Deployment{}, fmt.Errorf("deploy: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=? WHERE deployment_id=? AND status='active'`, nowMS, id); err != nil {
 		return Deployment{}, err
 	}
-	// Redeploy never revives an old worker capability, even when configuration
-	// bytes happen to be unchanged. The caller activates a fresh generation.
-	if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=? WHERE deployment_id=? AND status='active'`, toMs(time.Now().UTC()), id); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE destination_bindings SET retired_at=? WHERE deployment_id=? AND retired_at IS NULL`, nowMS, id); err != nil {
 		return Deployment{}, err
+	}
+	for i, destination := range in.Destinations {
+		destinationID := fmt.Sprintf("destination-%d", i+1)
+		var revision int64
+		if err = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(revision),0)+1 FROM destination_bindings WHERE deployment_id=? AND id=?`, id, destinationID).Scan(&revision); err != nil {
+			return Deployment{}, err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO destination_bindings(id,revision,deployment_id,config,config_hash,created_at) VALUES(?,?,?,?,?,?)`, destinationID, revision, id, destination, hashJSON(destination), nowMS); err != nil {
+			return Deployment{}, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return Deployment{}, err
 	}
 	return s.GetDeployment(ctx, id)
+}
+
+func (s *Store) ListDeployments(ctx context.Context) ([]Deployment, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,active_generation,state,state_version,state_revision,created_at,updated_at,expires_at,archived_at FROM deployments ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Deployment
+	for rows.Next() {
+		var d Deployment
+		var state []byte
+		var created, updated int64
+		var expires, archived sql.NullInt64
+		if err = rows.Scan(&d.ID, &d.Name, &d.InfoName, &d.SourceDir, &d.Status, &d.ArtifactID, &d.ConfigRevision, &d.ConfigHash, &d.ActiveGeneration, &state, &d.StateVersion, &d.StateRevision, &created, &updated, &expires, &archived); err != nil {
+			return nil, err
+		}
+		d.State = append(json.RawMessage(nil), state...)
+		d.CreatedAt = fromMs(created)
+		d.UpdatedAt = fromMs(updated)
+		d.ExpiresAt = nullTime(expires)
+		d.ArchivedAt = nullTime(archived)
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeactivateDueDeployments(ctx context.Context, now time.Time) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	nowMS := toMs(now)
+	if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=? WHERE status='active' AND deployment_id IN (SELECT id FROM deployments WHERE status='active' AND expires_at IS NOT NULL AND expires_at<=?)`, nowMS, nowMS); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE deployments SET status='inactive',active_generation=0,updated_at=? WHERE status='active' AND expires_at IS NOT NULL AND expires_at<=?`, nowMS, nowMS)
+	if err != nil {
+		return 0, err
+	}
+	count, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (s *Store) GetDeployment(ctx context.Context, selector string) (Deployment, error) {
@@ -167,7 +195,13 @@ func (s *Store) setDeploymentStatus(ctx context.Context, id, from, to string, ex
 	if to == "archived" {
 		archived = toMs(time.Now().UTC())
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE deployments SET status=?,expires_at=?,archived_at=?,updated_at=? WHERE id=? AND status=?`, to, expiry, archived, toMs(time.Now().UTC()), id, from)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := toMs(time.Now().UTC())
+	res, err := tx.ExecContext(ctx, `UPDATE deployments SET status=?,active_generation=0,expires_at=?,archived_at=?,updated_at=? WHERE id=? AND status=?`, to, expiry, archived, now, id, from)
 	if err != nil {
 		return err
 	}
@@ -175,14 +209,19 @@ func (s *Store) setDeploymentStatus(ctx context.Context, id, from, to string, ex
 	if rows != 1 {
 		return ErrInvalidStatus
 	}
-	return nil
+	if from == "active" {
+		if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=? WHERE deployment_id=? AND status='active'`, now, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
-func (s *Store) ExpireDeployment(ctx context.Context, id string) error {
-	return s.setDeploymentStatus(ctx, id, "active", "expired", nil)
+func (s *Store) PauseDeployment(ctx context.Context, id string) error {
+	return s.setDeploymentStatus(ctx, id, "active", "inactive", nil)
 }
 func (s *Store) ResumeDeployment(ctx context.Context, id string, expires *time.Time) error {
-	return s.setDeploymentStatus(ctx, id, "expired", "active", expires)
+	return s.setDeploymentStatus(ctx, id, "inactive", "active", expires)
 }
 func (s *Store) ArchiveDeployment(ctx context.Context, id string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -191,7 +230,7 @@ func (s *Store) ArchiveDeployment(ctx context.Context, id string) error {
 	}
 	defer tx.Rollback()
 	now := toMs(time.Now().UTC())
-	res, err := tx.ExecContext(ctx, `UPDATE deployments SET status='archived',expires_at=NULL,archived_at=?,updated_at=? WHERE id=? AND status!='archived'`, now, now, id)
+	res, err := tx.ExecContext(ctx, `UPDATE deployments SET status='archived',expires_at=NULL,archived_at=?,updated_at=? WHERE id=? AND status='inactive'`, now, now, id)
 	if err != nil {
 		return err
 	}
@@ -205,18 +244,6 @@ func (s *Store) ArchiveDeployment(ctx context.Context, id string) error {
 	}
 	return tx.Commit()
 }
-func (s *Store) PurgeDeployment(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM deployments WHERE id=? AND status='archived'`, id)
-	if err != nil {
-		return err
-	}
-	rows, _ := res.RowsAffected()
-	if rows != 1 {
-		return ErrInvalidStatus
-	}
-	return nil
-}
-
 func (s *Store) PurgeDeploymentSafe(ctx context.Context, id string, force bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -254,7 +281,7 @@ func (s *Store) ReplaceState(ctx context.Context, id string, base int64, state j
 	}
 	defer tx.Rollback()
 	now := toMs(time.Now().UTC())
-	res, err := tx.ExecContext(ctx, `UPDATE deployments SET state=?,state_version=?,state_revision=state_revision+1,updated_at=? WHERE id=? AND state_revision=?`, state, version, now, id, base)
+	res, err := tx.ExecContext(ctx, `UPDATE deployments SET state=?,state_version=?,state_revision=state_revision+1,active_generation=0,updated_at=? WHERE id=? AND state_revision=?`, state, version, now, id, base)
 	if err != nil {
 		return 0, err
 	}

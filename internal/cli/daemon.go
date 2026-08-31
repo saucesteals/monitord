@@ -19,8 +19,8 @@ func (c *CLI) newDaemonCmd() *cobra.Command {
 		Use:   "daemon",
 		Short: "Run the monitor scheduler",
 		Args:  noArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return c.daemon(interval)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return c.daemon(cmd.Context(), interval)
 		},
 	}
 	cmd.Flags().DurationVar(&interval, "interval", daemon.DefaultInterval, "maximum time to sleep while idle; scheduling itself is exact")
@@ -28,14 +28,14 @@ func (c *CLI) newDaemonCmd() *cobra.Command {
 	return cmd
 }
 
-func (c *CLI) daemon(interval time.Duration) error {
+func (c *CLI) daemon(parent context.Context, interval time.Duration) error {
 	store, paths, err := c.store()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// The daemon's operational log is stdout, unlike the CLI's, which uses

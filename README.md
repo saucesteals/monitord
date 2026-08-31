@@ -68,14 +68,13 @@ func check(ctx context.Context, session *monitord.Session[State]) error {
 }
 ```
 
-`Every` runs immediately and then without overlap. `Continuous` supervises a long-lived source. Use `Combined(Named(...), Named(...))` when polling and streaming children share state; `Optional()` makes a terminal child degrade health without cancelling required siblings.
+`Every` runs immediately and then without overlap. `Continuous` runs one long-lived source. A monitor has exactly one plan; deploy separate monitors for independent polling or streaming work.
 
 ## Durable sessions
 
 - `Session.State()` decodes a fresh state value. Maps, slices, pointers, and `big.Int` values never alias canonical state.
 - `Session.Commit` admits one bounded deterministic closure at a time. Fetch and decode externally before entering it, then recheck ordering against `tx.State`.
-- `Tx.Emit`, `Tx.Checkpoint`, and `Tx.Progress` become durable atomically with state.
-- `Session.Progress` records useful source progress without changing state.
+- `Tx.Emit` and `Tx.Checkpoint` become durable atomically with state.
 - `Session.Checkpoint(source, &value)` reads a fresh daemon-owned checkpoint snapshot.
 - A closure error, panic, encoding failure, or cancellation before admission publishes nothing.
 
@@ -83,7 +82,7 @@ The worker retains the exact unacknowledged transaction bytes. If an ACK is lost
 
 ## Events and delivery
 
-`Event.ID` is an immutable source occurrence ID. Replaying the same ID and payload coalesces; reusing it for different content conflicts. `DedupeKey`/`DedupeFor` optionally suppress repeated state edges without rolling back state or checkpoints.
+`Event.ID` is an immutable source occurrence ID. Replaying the same ID and payload coalesces; reusing it for different content conflicts. Monitors suppress repeated conditions in their durable state, keeping delivery semantics explicit.
 
 Events enter a durable per-destination outbox in the same SQLite commit. Delivery is at least once: a destination may receive a duplicate if it accepted a request immediately before the daemon lost the success marker. Retries, partial destination success, leases, and dead letters are independent of worker lifetime.
 
@@ -120,14 +119,13 @@ monitord deploy restock --name shop-restock
 monitord list
 monitord inspect shop-restock
 monitord state get shop-restock
-monitord runs shop-restock
-monitord events shop-restock
-monitord expire shop-restock
+monitord events list shop-restock
+monitord pause shop-restock
 monitord resume shop-restock
-monitord rm shop-restock            # archive
-monitord rm shop-restock --purge    # destructive, confirmation required
+monitord archive shop-restock
+monitord purge shop-restock         # permanently delete archived data
 ```
 
-Deploying an existing name preserves its immutable deployment ID, state, and history while activating a new artifact and worker generation. Manual state changes fence the old generation. Expired and archived deployments continue draining already committed outbox rows.
+Deploying an existing name preserves its immutable deployment ID and state while activating a new artifact and worker generation. Manual state changes fence the old generation. Inactive and archived deployments continue draining already committed outbox rows.
 
 State schema version and concurrency revision are separate. Implement `StateVersion() int` and `MigrateState(from int, raw json.RawMessage) error` when changing the stored shape; deploy validates and migrates before activation.

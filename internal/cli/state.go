@@ -34,20 +34,20 @@ func (c *CLI) newStateGetCmd() *cobra.Command {
 		Use:   "get NAME",
 		Short: "Print stored monitor state as JSON",
 		Args:  exactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return c.stateGet(args[0])
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return c.stateGet(cmd.Context(), args[0])
 		},
 	}
 }
 
-func (c *CLI) stateGet(selector string) error {
+func (c *CLI) stateGet(ctx context.Context, selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
 
-	m, err := store.GetDeployment(context.Background(), selector)
+	m, err := store.GetDeployment(ctx, selector)
 	if err != nil {
 		return err
 	}
@@ -66,13 +66,13 @@ func (c *CLI) newStateSetCmd() *cobra.Command {
 		Use:   "set NAME FILE",
 		Short: "Replace stored monitor state",
 		Args:  exactArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return c.stateSet(args[0], args[1])
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return c.stateSet(cmd.Context(), args[0], args[1])
 		},
 	}
 }
 
-func (c *CLI) stateSet(selector string, source string) error {
+func (c *CLI) stateSet(ctx context.Context, selector string, source string) error {
 	raw, err := readStateFile(source)
 	if err != nil {
 		return err
@@ -90,7 +90,6 @@ func (c *CLI) stateSet(selector string, source string) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	ctx := context.Background()
 	m, err := store.GetRuntimeDeployment(ctx, selector)
 	if err != nil {
 		return err
@@ -116,20 +115,19 @@ func (c *CLI) newStateClearCmd() *cobra.Command {
 		Use:   "clear NAME",
 		Short: "Reset stored monitor state",
 		Args:  exactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			return c.stateClear(args[0])
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return c.stateClear(cmd.Context(), args[0])
 		},
 	}
 }
 
-func (c *CLI) stateClear(selector string) error {
+func (c *CLI) stateClear(ctx context.Context, selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
 
-	ctx := context.Background()
 	m, err := store.GetRuntimeDeployment(ctx, selector)
 	if err != nil {
 		return err

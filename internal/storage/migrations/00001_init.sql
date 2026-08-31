@@ -25,7 +25,7 @@ CREATE TABLE deployments (
     name                TEXT NOT NULL UNIQUE,
     info_name           TEXT NOT NULL,
     source_dir          TEXT NOT NULL,
-    status              TEXT NOT NULL CHECK(status IN ('active', 'expired', 'archived')),
+    status              TEXT NOT NULL CHECK(status IN ('active', 'inactive', 'archived')),
     artifact_id         TEXT REFERENCES artifacts(id),
     config_revision     INTEGER NOT NULL DEFAULT 1 CHECK(config_revision > 0),
     config_hash         TEXT NOT NULL,
@@ -77,15 +77,6 @@ CREATE TABLE transactions (
         REFERENCES deployment_generations(deployment_id, generation) ON DELETE CASCADE
 ) STRICT;
 
-CREATE TABLE dedupe_claims (
-    deployment_id   TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
-    dedupe_key      TEXT NOT NULL,
-    claimed_at      INTEGER NOT NULL,
-    expires_at      INTEGER NOT NULL,
-    event_id        TEXT NOT NULL,
-    PRIMARY KEY (deployment_id, dedupe_key)
-) STRICT;
-
 CREATE TABLE destination_bindings (
     id              TEXT NOT NULL,
     revision        INTEGER NOT NULL CHECK(revision > 0),
@@ -115,9 +106,6 @@ CREATE TABLE outbox_deliveries (
     outbox_id              TEXT NOT NULL REFERENCES outbox_events(outbox_id) ON DELETE CASCADE,
     destination_id         TEXT NOT NULL,
     destination_revision   INTEGER NOT NULL,
-    destination_deployment_id TEXT NOT NULL,
-    rendered_payload       BLOB NOT NULL CHECK(json_valid(rendered_payload)),
-    payload_hash           BLOB NOT NULL,
     status                 TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sending', 'delivered', 'dead')),
     attempt_count          INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
     next_attempt_at        INTEGER NOT NULL,
@@ -126,38 +114,7 @@ CREATE TABLE outbox_deliveries (
     delivered_at           INTEGER,
     last_error             TEXT NOT NULL DEFAULT '',
     dead_at                INTEGER,
-    PRIMARY KEY (outbox_id, destination_id),
-    FOREIGN KEY (destination_deployment_id, destination_id, destination_revision)
-        REFERENCES destination_bindings(deployment_id, id, revision),
-    CHECK(destination_deployment_id <> '')
-) STRICT;
-
-CREATE TABLE deployment_runs (
-    id                  TEXT PRIMARY KEY,
-    deployment_id       TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
-    generation          INTEGER NOT NULL,
-    child_name          TEXT NOT NULL,
-    kind                TEXT NOT NULL CHECK(kind IN ('poll', 'continuous')),
-    status              TEXT NOT NULL CHECK(status IN ('running', 'success', 'failure', 'canceled')),
-    started_at          INTEGER NOT NULL,
-    finished_at         INTEGER,
-    summary             TEXT NOT NULL DEFAULT '',
-    error               TEXT NOT NULL DEFAULT '',
-    FOREIGN KEY (deployment_id, generation)
-        REFERENCES deployment_generations(deployment_id, generation) ON DELETE CASCADE
-) STRICT;
-
-CREATE TABLE deployment_health (
-    deployment_id       TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
-    child_name          TEXT NOT NULL,
-    generation          INTEGER NOT NULL,
-    status              TEXT NOT NULL CHECK(status IN ('healthy', 'degraded', 'failed', 'stopped')),
-    summary             TEXT NOT NULL DEFAULT '',
-    consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_failures >= 0),
-    updated_at          INTEGER NOT NULL,
-    PRIMARY KEY (deployment_id, child_name),
-    FOREIGN KEY (deployment_id, generation)
-        REFERENCES deployment_generations(deployment_id, generation) ON DELETE CASCADE
+    PRIMARY KEY (outbox_id, destination_id)
 ) STRICT;
 
 CREATE INDEX outbox_deliveries_ready
@@ -165,10 +122,6 @@ CREATE INDEX outbox_deliveries_ready
     WHERE status = 'pending';
 CREATE INDEX transactions_committed
     ON transactions(deployment_id, generation, committed_at);
-CREATE INDEX dedupe_claims_expiry
-    ON dedupe_claims(expires_at);
-CREATE INDEX deployment_runs_history
-    ON deployment_runs(deployment_id, started_at DESC);
 CREATE INDEX outbox_deliveries_lease
     ON outbox_deliveries(status, lease_expires_at)
     WHERE status = 'sending';
@@ -179,10 +132,7 @@ CREATE INDEX outbox_deliveries_lease
 -- +goose StatementBegin
 DROP TABLE outbox_deliveries;
 DROP TABLE outbox_events;
-DROP TABLE deployment_health;
-DROP TABLE deployment_runs;
 DROP TABLE destination_bindings;
-DROP TABLE dedupe_claims;
 DROP TABLE transactions;
 DROP TABLE checkpoints;
 DROP TABLE deployment_generations;

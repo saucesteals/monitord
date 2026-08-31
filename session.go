@@ -83,7 +83,6 @@ type Tx[S any] struct {
 	State       *S
 	events      []Event
 	checkpoints map[string]json.RawMessage
-	progress    bool
 }
 
 func (tx *Tx[S]) Emit(e Event) error {
@@ -115,14 +114,12 @@ func (tx *Tx[S]) Checkpoint(source string, value any) error {
 	tx.checkpoints[source] = append(json.RawMessage(nil), raw...)
 	return nil
 }
-func (tx *Tx[S]) Progress() { tx.progress = true }
 
 type transactionCommit struct {
 	BaseState   json.RawMessage
 	NextState   json.RawMessage
 	Events      []Event
 	Checkpoints map[string]json.RawMessage
-	Progress    bool
 }
 type sessionCommitter interface {
 	Commit(context.Context, transactionCommit) (json.RawMessage, error)
@@ -202,9 +199,6 @@ func (s *Session[S]) State() S {
 	return *v
 }
 func (s *Session[S]) Secrets() SecretSet { return s.secrets }
-func (s *Session[S]) Progress(ctx context.Context) error {
-	return s.Commit(ctx, func(tx *Tx[S]) error { tx.Progress(); return nil })
-}
 func (s *Session[S]) Commit(ctx context.Context, fn func(*Tx[S]) error) error {
 	if fn == nil {
 		return errors.New("commit closure is nil")
@@ -238,7 +232,7 @@ func (s *Session[S]) Commit(ctx context.Context, fn func(*Tx[S]) error) error {
 	if err != nil {
 		return err
 	}
-	acked, err := s.committer.Commit(ctx, transactionCommit{BaseState: base, NextState: next, Events: tx.events, Checkpoints: tx.checkpoints, Progress: tx.progress})
+	acked, err := s.committer.Commit(ctx, transactionCommit{BaseState: base, NextState: next, Events: tx.events, Checkpoints: tx.checkpoints})
 	if err != nil {
 		return err
 	}

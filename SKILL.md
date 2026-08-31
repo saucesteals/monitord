@@ -37,7 +37,6 @@ func watch(ctx context.Context, session *monitord.Session[State]) error {
 	if err != nil { return err }
 	stream, err := connect(ctx, endpoint)
 	if err != nil { return err }
-	if err := session.Progress(ctx); err != nil { return err }
 	for stream.Next(ctx) {
 		record := stream.Record()
 		if err := session.Commit(ctx, func(tx *monitord.Tx[State]) error {
@@ -50,20 +49,20 @@ func watch(ctx context.Context, session *monitord.Session[State]) error {
 }
 ```
 
-Choose `Every(interval, fn)` for polling and `Continuous(fn)` for streams. A `Combined` plan requires unique `Named` children sharing one state coordinator. Mark non-critical children with `Optional()`. Return `monitord.Permanent(err)` only for a terminal configuration/source error.
+Choose `Every(interval, fn)` for polling and `Continuous(fn)` for streams. A monitor has one plan; use separate deployments for independent work. Callback errors are returned to the daemon, which owns restart and backoff.
 
 ## Transaction rules
 
 - Perform network I/O, sleeping, and expensive parsing before `Commit`.
-- Recheck cursors, ordering, and dedupe predicates against `tx.State`.
+- Recheck cursors, ordering, and repeated-condition predicates against `tx.State`.
 - Keep the closure bounded and deterministic; do not launch goroutines or retain `tx.State` references.
 - Use `Tx.Checkpoint` for source resume boundaries and `Session.Checkpoint` to read them.
-- Handler state, checkpoints, progress, events, dedupe decisions, and outbox rows commit together.
+- Handler state, checkpoints, events, and outbox rows commit together.
 - Do not implement retries by rerunning a closure. The SDK retains and resends the exact frame until its durable ACK is known.
 
 ## Event identity
 
-Use an immutable occurrence identifier for `Event.ID`, such as a chain/log identity or source record ID. A recurring condition needs a new occurrence ID. Use `DedupeKey` plus `DedupeFor` for temporary state-edge suppression. Delivery is durable and at least once per destination; do not promise external exactly-once behavior.
+Use an immutable occurrence identifier for `Event.ID`, such as a chain/log identity or source record ID. A recurring condition needs a new occurrence ID. Suppress repeated conditions using durable monitor state. Delivery is durable and at least once per destination; do not promise external exactly-once behavior.
 
 ## Secrets
 
@@ -75,11 +74,11 @@ Declare exact refs with `WithSecrets`; never read arbitrary environment variable
 monitord list
 monitord inspect <name-or-full-id>
 monitord state get|set|clear <name-or-full-id>
-monitord runs <name-or-full-id>
-monitord events <name-or-full-id>
-monitord expire <name-or-full-id>
+monitord events list <name-or-full-id>
+monitord pause <name-or-full-id>
 monitord resume <name-or-full-id>
-monitord rm <name-or-full-id>
+monitord archive <name-or-full-id>
+monitord purge <name-or-full-id>
 ```
 
-State changes and resume/redeploy create a new fenced worker generation. Archive/expiry do not discard queued deliveries. Purge is destructive and must report pending deliveries before confirmation.
+State changes and resume/redeploy create a new fenced worker generation. Pausing and archiving do not discard queued deliveries. Purge is destructive and must report pending deliveries.

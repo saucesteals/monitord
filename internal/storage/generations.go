@@ -14,6 +14,7 @@ type GenerationActivation struct {
 	DeploymentID      string
 	ArtifactID        string
 	ConfigRevision    int64
+	StateRevision     int64
 	SecretFingerprint []byte
 }
 
@@ -56,12 +57,13 @@ func (s *Store) ActivateGeneration(ctx context.Context, activation GenerationAct
 	}
 	defer tx.Rollback()
 
-	var activeGeneration, configRevision int64
+	var artifactID string
+	var activeGeneration, configRevision, stateRevision int64
 	err = tx.QueryRowContext(ctx, `
-		SELECT active_generation, config_revision
+		SELECT artifact_id, active_generation, config_revision, state_revision
 		FROM deployments
 		WHERE id = ? AND status = 'active'`, activation.DeploymentID).
-		Scan(&activeGeneration, &configRevision)
+		Scan(&artifactID, &activeGeneration, &configRevision, &stateRevision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ActiveGeneration{}, fmt.Errorf("active deployment %q not found", activation.DeploymentID)
 	}
@@ -70,6 +72,9 @@ func (s *Store) ActivateGeneration(ctx context.Context, activation GenerationAct
 	}
 	if configRevision != activation.ConfigRevision {
 		return ActiveGeneration{}, fmt.Errorf("config revision changed: got %d, current %d", activation.ConfigRevision, configRevision)
+	}
+	if artifactID != activation.ArtifactID || stateRevision != activation.StateRevision {
+		return ActiveGeneration{}, errors.New("deployment snapshot changed during generation activation")
 	}
 
 	now := time.Now().UTC()
@@ -102,10 +107,10 @@ func (s *Store) ActivateGeneration(ctx context.Context, activation GenerationAct
 	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE deployments
-		SET active_generation = ?, artifact_id = ?, updated_at = ?
-		WHERE id = ? AND active_generation = ? AND config_revision = ?`,
-		nextGeneration, activation.ArtifactID, toMs(now), activation.DeploymentID,
-		activeGeneration, activation.ConfigRevision)
+		SET active_generation = ?, updated_at = ?
+		WHERE id = ? AND artifact_id = ? AND active_generation = ? AND config_revision = ? AND state_revision = ?`,
+		nextGeneration, toMs(now), activation.DeploymentID, activation.ArtifactID,
+		activeGeneration, activation.ConfigRevision, activation.StateRevision)
 	if err != nil {
 		return ActiveGeneration{}, fmt.Errorf("advance deployment generation: %w", err)
 	}

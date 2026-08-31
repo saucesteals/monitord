@@ -19,18 +19,15 @@ const (
 )
 
 type Daemon struct {
-	store           *storage.Store
-	paths           config.Paths
-	logger          *slog.Logger
-	interval        time.Duration
-	wg              sync.WaitGroup
-	workersMu       sync.Mutex
-	workers         map[string]*worker
-	workerCancels   map[string]context.CancelFunc
-	workerFailures  map[string]int
-	workerNextStart map[string]time.Time
-	deliverySender  DeliverySender
-	secretKey       []byte
+	store          *storage.Store
+	paths          config.Paths
+	logger         *slog.Logger
+	interval       time.Duration
+	wg             sync.WaitGroup
+	workersMu      sync.Mutex
+	workers        map[string]*workerSlot
+	deliverySender DeliverySender
+	secretKey      []byte
 }
 
 func New(store *storage.Store, paths config.Paths, logger *slog.Logger, interval time.Duration) *Daemon {
@@ -42,7 +39,7 @@ func New(store *storage.Store, paths config.Paths, logger *slog.Logger, interval
 	}
 	key := make([]byte, 32)
 	_, _ = rand.Read(key)
-	d := &Daemon{store: store, paths: paths, logger: logger, interval: interval, workers: map[string]*worker{}, workerCancels: map[string]context.CancelFunc{}, workerFailures: map[string]int{}, workerNextStart: map[string]time.Time{}, secretKey: key}
+	d := &Daemon{store: store, paths: paths, logger: logger, interval: interval, workers: map[string]*workerSlot{}, secretKey: key}
 	d.deliverySender = daemonDeliverySender{daemon: d}
 	return d
 }
