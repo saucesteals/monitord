@@ -75,7 +75,7 @@ import (
 	http "github.com/saucesteals/fhttp"
 )
 
-// State persists across ticks and daemon restarts.
+// State persists across checks and daemon restarts.
 type State struct {
 	LastStatus int ` + "`json:\"last_status\"`" + `
 }
@@ -107,12 +107,7 @@ func check(ctx context.Context, session *monitord.Session[State]) error {
 }
 `
 
-const scaffoldConfig = `description: HTTP status monitor
-clients: 1
-every: 5m
-ttl: 24h
-timeout: 30s
-failure_threshold: 3 # alert after three consecutive failed ticks
+const scaffoldConfig = `ttl: 24h
 deliveries:
   - discord:
       account: jarvis

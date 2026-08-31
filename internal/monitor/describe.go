@@ -24,7 +24,7 @@ const (
 //
 // It runs the same introspection Build uses, so an externally edited state is
 // held to the monitor's own struct instead of being accepted as bare JSON and
-// failing on every later tick. Passing empty state returns the monitor's
+// failing on every later callback. Passing empty state returns the monitor's
 // defaults.
 func ValidateState(ctx context.Context, binaryPath string, dir string, state json.RawMessage, version int) (json.RawMessage, error) {
 	described, err := describe(ctx, binaryPath, dir, monitord.DescribeInput{

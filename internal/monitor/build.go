@@ -41,56 +41,53 @@ type Request struct {
 	CurrentVersion int
 }
 
-// V5Build is an immutable artifact plus deployment-local canonical state.
+// BuildResult is an immutable artifact plus deployment-local canonical state.
 // State is deliberately excluded from Artifact.Describe so redeploying the
 // same code never changes content-addressed artifact metadata.
-type V5Build struct {
+type BuildResult struct {
 	Artifact    storage.Artifact
 	Description monitord.MonitorFrame
 	State       json.RawMessage
 }
 
-// BuildV5 compiles and describes an immutable V5 artifact without creating or
+// Build compiles and describes an immutable artifact without creating or
 // mutating a deployment. Callers persist Artifact first, then atomically create
 // or redeploy using State and Description.StateVersion.
-func BuildV5(ctx context.Context, paths config.Paths, req Request) (V5Build, error) {
+func Build(ctx context.Context, paths config.Paths, req Request) (BuildResult, error) {
 	dir, err := validateDir(req)
 	if err != nil {
-		return V5Build{}, err
+		return BuildResult{}, err
 	}
 	fingerprint, err := fingerprintDir(dir)
 	if err != nil {
-		return V5Build{}, err
+		return BuildResult{}, err
 	}
 	artifactDir := filepath.Join(paths.ArtifactDir(req.Name), fingerprint)
 	if err = os.MkdirAll(artifactDir, 0o700); err != nil {
-		return V5Build{}, fmt.Errorf("create artifact dir: %w", err)
+		return BuildResult{}, fmt.Errorf("create artifact dir: %w", err)
 	}
 	if err = config.Tidy(ctx, paths); err != nil {
-		return V5Build{}, err
+		return BuildResult{}, err
 	}
 	binaryPath := filepath.Join(artifactDir, "monitor")
 	if err = build(ctx, dir, binaryPath); err != nil {
-		return V5Build{}, err
+		return BuildResult{}, err
 	}
 	description, err := describe(ctx, binaryPath, dir, monitord.DescribeInput{State: req.Current, Version: req.CurrentVersion})
 	if err != nil {
-		return V5Build{}, err
+		return BuildResult{}, err
 	}
 	state := append(json.RawMessage(nil), description.State...)
 	description.State = nil
 	describeJSON, err := json.Marshal(description)
 	if err != nil {
-		return V5Build{}, fmt.Errorf("encode V5 description: %w", err)
+		return BuildResult{}, fmt.Errorf("encode description: %w", err)
 	}
-	return V5Build{Artifact: storage.Artifact{ID: fingerprint, ContentHash: fingerprint, Path: binaryPath, Describe: describeJSON}, Description: description, State: state}, nil
+	return BuildResult{Artifact: storage.Artifact{ID: fingerprint, ContentHash: fingerprint, Path: binaryPath, Describe: describeJSON}, Description: description, State: state}, nil
 }
 
 func validateDir(req Request) (string, error) {
 	if err := req.Name.Validate(); err != nil {
-		return "", err
-	}
-	if err := req.Config.ProxyPool.Validate(); err != nil {
 		return "", err
 	}
 	if len(req.Config.Deliveries) == 0 {

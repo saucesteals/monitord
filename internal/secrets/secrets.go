@@ -1,4 +1,4 @@
-// Package secrets resolves the exact secret keys declared by a V5 monitor.
+// Package secrets resolves the exact secret keys declared by a monitor.
 package secrets
 
 import (

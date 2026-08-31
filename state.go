@@ -8,7 +8,7 @@ import (
 	"io"
 )
 
-// NoState is the state type for monitors that keep no cross-tick data.
+// NoState is the state type for monitors that keep no durable data.
 type NoState = struct{}
 
 // Versioned is implemented by state types that track a schema version.

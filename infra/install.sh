@@ -237,7 +237,7 @@ case "$(detect_service)" in
   systemd) install_systemd ;;
   none)
     say "service skipped"
-    say "run: $ROOT/bin/monitord --root $ROOT daemon --interval 5s --concurrency 8"
+    say "run: $ROOT/bin/monitord --root $ROOT daemon --interval 5s"
     ;;
 esac
 

@@ -1,122 +1,192 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- Timestamps are INTEGER unix-milliseconds throughout. Booleans are INTEGER 0/1.
--- JSON payloads are TEXT.
-
--- routes: a named notification backend (discord webhook, openclaw hook, ...).
--- Keyed by name; the id autoincrement is gone.
+-- Operator-owned delivery routes live independently of deployment runtime
+-- state.
 CREATE TABLE routes (
     name        TEXT PRIMARY KEY,
     kind        TEXT NOT NULL,
-    config      TEXT NOT NULL DEFAULT '{}',   -- driver options (json)
+    config      TEXT NOT NULL DEFAULT '{}',
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL
 ) STRICT;
 
--- proxy_pools: a named set of proxies plus its round-robin cursor
--- (proxy_offsets folded in as `offset`).
-CREATE TABLE proxy_pools (
-    name        TEXT PRIMARY KEY,
-    strategy    TEXT NOT NULL,
-    proxies     TEXT NOT NULL,                -- newline-joined proxy urls
-    offset      INTEGER NOT NULL DEFAULT 0,   -- round-robin cursor
-    created_at  INTEGER NOT NULL,
-    updated_at  INTEGER NOT NULL
+CREATE TABLE artifacts (
+    id              TEXT PRIMARY KEY,
+    content_hash    TEXT NOT NULL UNIQUE,
+    path            TEXT NOT NULL,
+    describe_json   BLOB NOT NULL CHECK(json_valid(describe_json)),
+    created_at      INTEGER NOT NULL
 ) STRICT;
 
--- monitors: one row per deployed monitor. Grouped by concern, one entity.
-CREATE TABLE monitors (
-    name            TEXT PRIMARY KEY,
+-- Deployment identity is deliberately independent of the implementation name.
+CREATE TABLE deployments (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL UNIQUE,
+    info_name           TEXT NOT NULL,
+    source_dir          TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK(status IN ('active', 'expired', 'archived')),
+    artifact_id         TEXT REFERENCES artifacts(id),
+    config_revision     INTEGER NOT NULL DEFAULT 1 CHECK(config_revision > 0),
+    config_hash         TEXT NOT NULL,
+    active_generation   INTEGER NOT NULL DEFAULT 0 CHECK(active_generation >= 0),
+    state               BLOB NOT NULL CHECK(json_valid(state)),
+    state_version       INTEGER NOT NULL DEFAULT 1 CHECK(state_version > 0),
+    state_revision      INTEGER NOT NULL DEFAULT 0 CHECK(state_revision >= 0),
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    expires_at          INTEGER,
+    archived_at         INTEGER
+) STRICT;
 
-    -- artifact
-    source_dir      TEXT NOT NULL,
-    artifact_dir    TEXT NOT NULL,
-    binary_path     TEXT NOT NULL,
-    definition      TEXT NOT NULL,            -- monitor Definition (json)
-    status          TEXT NOT NULL,            -- active | expired
+CREATE TABLE deployment_generations (
+    deployment_id       TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    generation          INTEGER NOT NULL CHECK(generation > 0),
+    worker_token_hash   BLOB NOT NULL,
+    artifact_id         TEXT NOT NULL REFERENCES artifacts(id),
+    config_revision     INTEGER NOT NULL CHECK(config_revision > 0),
+    secret_fingerprint  BLOB NOT NULL,
+    status              TEXT NOT NULL CHECK(status IN ('active', 'retired')),
+    last_transaction_seq INTEGER NOT NULL DEFAULT 0 CHECK(last_transaction_seq >= 0),
+    started_at          INTEGER NOT NULL,
+    retired_at          INTEGER,
+    PRIMARY KEY (deployment_id, generation)
+) STRICT;
 
-    -- config (from monitor.yaml)
-    interval_ms     INTEGER NOT NULL,
-    ttl_ms          INTEGER NOT NULL,
-    timeout_ms      INTEGER NOT NULL,
-    max_events      INTEGER NOT NULL DEFAULT 0,
-    deliveries      TEXT NOT NULL DEFAULT '[]', -- route bindings (json)
-    proxy_pool      TEXT REFERENCES proxy_pools(name) ON DELETE SET NULL, -- null = no pool
+CREATE TABLE checkpoints (
+    deployment_id       TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    source              TEXT NOT NULL,
+    value               BLOB NOT NULL,
+    value_hash          BLOB NOT NULL,
+    updated_generation  INTEGER NOT NULL,
+    updated_seq         INTEGER NOT NULL,
+    PRIMARY KEY (deployment_id, source)
+) STRICT;
 
-    -- durable state
-    state           TEXT NOT NULL DEFAULT '{}',
-    state_version   INTEGER NOT NULL DEFAULT 1,
-    state_revision  INTEGER NOT NULL DEFAULT 0,
+CREATE TABLE transactions (
+    deployment_id   TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    generation      INTEGER NOT NULL,
+    seq             INTEGER NOT NULL,
+    payload_hash    BLOB NOT NULL,
+    base_revision   INTEGER NOT NULL,
+    result_revision INTEGER NOT NULL,
+    ack_payload     BLOB NOT NULL,
+    committed_at    INTEGER NOT NULL,
+    PRIMARY KEY (deployment_id, generation, seq),
+    FOREIGN KEY (deployment_id, generation)
+        REFERENCES deployment_generations(deployment_id, generation) ON DELETE CASCADE
+) STRICT;
 
-    -- schedule + lease
+CREATE TABLE dedupe_claims (
+    deployment_id   TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    dedupe_key      TEXT NOT NULL,
+    claimed_at      INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL,
+    event_id        TEXT NOT NULL,
+    PRIMARY KEY (deployment_id, dedupe_key)
+) STRICT;
+
+CREATE TABLE destination_bindings (
+    id              TEXT NOT NULL,
+    revision        INTEGER NOT NULL CHECK(revision > 0),
+    deployment_id   TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    config          BLOB NOT NULL CHECK(json_valid(config)),
+    config_hash     BLOB NOT NULL,
     created_at      INTEGER NOT NULL,
-    updated_at      INTEGER NOT NULL,
-    expires_at      INTEGER,
-    next_due_at     INTEGER,
-    last_run_at     INTEGER,
-    expired_at      INTEGER,
-    running_run_id  TEXT NOT NULL DEFAULT '',
-    running_started_at INTEGER,
-    running_expires_at INTEGER,
-
-    -- health
-    last_status          TEXT NOT NULL DEFAULT '',
-    notified_status      TEXT NOT NULL DEFAULT '',
-    consecutive_failures INTEGER NOT NULL DEFAULT 0,
-    total_runs           INTEGER NOT NULL DEFAULT 0,
-    total_failures       INTEGER NOT NULL DEFAULT 0
+    retired_at      INTEGER,
+    PRIMARY KEY (deployment_id, id, revision)
 ) STRICT;
 
-CREATE INDEX monitors_due ON monitors(next_due_at) WHERE status = 'active';
-
--- runs: one row per tick, newest-first history.
-CREATE TABLE runs (
-    id            TEXT PRIMARY KEY,
-    monitor_name  TEXT NOT NULL REFERENCES monitors(name) ON DELETE CASCADE,
-    started_at    INTEGER NOT NULL,
-    finished_at   INTEGER NOT NULL,
-    status        TEXT NOT NULL,
-    exit_code     INTEGER NOT NULL,
-    stdout        TEXT NOT NULL DEFAULT '',
-    stderr        TEXT NOT NULL DEFAULT '',
-    error         TEXT NOT NULL DEFAULT '',
-    notified      INTEGER NOT NULL DEFAULT 0,  -- bool
-    notify_error  TEXT NOT NULL DEFAULT ''
+CREATE TABLE outbox_events (
+    outbox_id       TEXT PRIMARY KEY,
+    deployment_id   TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    generation      INTEGER NOT NULL,
+    transaction_seq INTEGER NOT NULL,
+    event_id        TEXT NOT NULL,
+    payload         BLOB NOT NULL CHECK(json_valid(payload)),
+    payload_hash    BLOB NOT NULL,
+    created_at      INTEGER NOT NULL,
+    UNIQUE (deployment_id, event_id),
+    FOREIGN KEY (deployment_id, generation, transaction_seq)
+        REFERENCES transactions(deployment_id, generation, seq) DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
-CREATE INDEX runs_monitor_started ON runs(monitor_name, started_at DESC);
-
--- events: the alert history AND the dedupe source. One row per identified event
--- (monitor_name, event_id), upserted on every send — so it's the set of distinct
--- events a monitor has emitted, each carrying its latest send. Dedupe is a
--- windowed check on that row; history is kept until a periodic prune reclaims it.
--- Only monitor-emitted events with an id land here (health pages have none).
-CREATE TABLE events (
-    monitor_name  TEXT NOT NULL REFERENCES monitors(name) ON DELETE CASCADE,
-    event_id      TEXT NOT NULL,
-    title         TEXT NOT NULL,
-    summary       TEXT NOT NULL DEFAULT '',
-    url           TEXT NOT NULL DEFAULT '',
-    severity      TEXT NOT NULL DEFAULT 'info',
-    sent_at       INTEGER NOT NULL,
-    delivered     INTEGER NOT NULL DEFAULT 0,  -- bool
-    error         TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (monitor_name, event_id)
+CREATE TABLE outbox_deliveries (
+    outbox_id              TEXT NOT NULL REFERENCES outbox_events(outbox_id) ON DELETE CASCADE,
+    destination_id         TEXT NOT NULL,
+    destination_revision   INTEGER NOT NULL,
+    destination_deployment_id TEXT NOT NULL,
+    rendered_payload       BLOB NOT NULL CHECK(json_valid(rendered_payload)),
+    payload_hash           BLOB NOT NULL,
+    status                 TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sending', 'delivered', 'dead')),
+    attempt_count          INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    next_attempt_at        INTEGER NOT NULL,
+    lease_owner            TEXT,
+    lease_expires_at       INTEGER,
+    delivered_at           INTEGER,
+    last_error             TEXT NOT NULL DEFAULT '',
+    dead_at                INTEGER,
+    PRIMARY KEY (outbox_id, destination_id),
+    FOREIGN KEY (destination_deployment_id, destination_id, destination_revision)
+        REFERENCES destination_bindings(deployment_id, id, revision),
+    CHECK(destination_deployment_id <> '')
 ) STRICT;
 
--- history/prune: by monitor over time, and global prune by age. The primary key
--- already serves dedupe lookups on (monitor_name, event_id).
-CREATE INDEX events_monitor_sent ON events(monitor_name, sent_at DESC);
-CREATE INDEX events_sent ON events(sent_at);
+CREATE TABLE deployment_runs (
+    id                  TEXT PRIMARY KEY,
+    deployment_id       TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    generation          INTEGER NOT NULL,
+    child_name          TEXT NOT NULL,
+    kind                TEXT NOT NULL CHECK(kind IN ('poll', 'continuous')),
+    status              TEXT NOT NULL CHECK(status IN ('running', 'success', 'failure', 'canceled')),
+    started_at          INTEGER NOT NULL,
+    finished_at         INTEGER,
+    summary             TEXT NOT NULL DEFAULT '',
+    error               TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (deployment_id, generation)
+        REFERENCES deployment_generations(deployment_id, generation) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE deployment_health (
+    deployment_id       TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    child_name          TEXT NOT NULL,
+    generation          INTEGER NOT NULL,
+    status              TEXT NOT NULL CHECK(status IN ('healthy', 'degraded', 'failed', 'stopped')),
+    summary             TEXT NOT NULL DEFAULT '',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_failures >= 0),
+    updated_at          INTEGER NOT NULL,
+    PRIMARY KEY (deployment_id, child_name),
+    FOREIGN KEY (deployment_id, generation)
+        REFERENCES deployment_generations(deployment_id, generation) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX outbox_deliveries_ready
+    ON outbox_deliveries(status, next_attempt_at)
+    WHERE status = 'pending';
+CREATE INDEX transactions_committed
+    ON transactions(deployment_id, generation, committed_at);
+CREATE INDEX dedupe_claims_expiry
+    ON dedupe_claims(expires_at);
+CREATE INDEX deployment_runs_history
+    ON deployment_runs(deployment_id, started_at DESC);
+CREATE INDEX outbox_deliveries_lease
+    ON outbox_deliveries(status, lease_expires_at)
+    WHERE status = 'sending';
 
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-DROP TABLE events;
-DROP TABLE runs;
-DROP TABLE monitors;
-DROP TABLE proxy_pools;
+DROP TABLE outbox_deliveries;
+DROP TABLE outbox_events;
+DROP TABLE deployment_health;
+DROP TABLE deployment_runs;
+DROP TABLE destination_bindings;
+DROP TABLE dedupe_claims;
+DROP TABLE transactions;
+DROP TABLE checkpoints;
+DROP TABLE deployment_generations;
+DROP TABLE deployments;
+DROP TABLE artifacts;
 DROP TABLE routes;
 -- +goose StatementEnd

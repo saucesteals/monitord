@@ -4,14 +4,8 @@ package db
 import "context"
 
 type Querier interface {
-	DeleteProxyPool(context.Context, string) error
-	GetProxyOffset(context.Context, string) (int64, error)
-	GetProxyPool(context.Context, string) (ProxyPool, error)
 	GetRoute(context.Context, string) (Route, error)
-	ListProxyPools(context.Context) ([]ProxyPool, error)
 	ListRoutes(context.Context) ([]Route, error)
-	SetProxyOffset(context.Context, SetProxyOffsetParams) error
-	UpsertProxyPool(context.Context, UpsertProxyPoolParams) error
 	UpsertRoute(context.Context, UpsertRouteParams) error
 }
 

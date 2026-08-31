@@ -1,10 +1,12 @@
-# monitord V5
+# monitord
 
 `monitord` runs small, stateful Go monitors while the daemon owns deployment identity, scheduling, durable state, worker fencing, checkpoints, event delivery, and recovery.
 
-V5 has two authoring layers: a monitor declares its identity and opaque plan; `monitord.Run` compiles that plan into a daemon-owned session. State belongs to an immutable deployment ID, not a Go implementation name or source directory.
+The authoring model has two layers: a monitor declares its identity and opaque plan; `monitord.Run` compiles that plan into a daemon-owned session. State belongs to an immutable deployment ID, not a Go implementation name or source directory.
 
-V5 is an intentional clean break. Its migration removes the V4 name-keyed monitor, run, and event tables; export or back up a V4 root before opening it with V5. Route, account, and proxy configuration remains reusable, but V4 deployments must be created again as V5 deployments.
+## Upgrading from V4
+
+V5 is an intentional clean break. Export or back up a V4 root before opening it with this release. Route and account configuration remains reusable, but deployments must be created again because runtime identity and storage are deployment-based. Proxy pools were removed because the current runtime does not consume them.
 
 ## A monitor
 

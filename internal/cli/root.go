@@ -40,7 +40,6 @@ func New() *cobra.Command {
 		c.newDaemonCmd(),
 		c.newRouteCmd(),
 		c.newAccountCmd(),
-		c.newProxyCmd(),
 		c.newNewMonitorCmd(),
 		c.newTestCmd(),
 		c.newDeployCmd(),

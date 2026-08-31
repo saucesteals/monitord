@@ -24,9 +24,6 @@ const (
 	MonitorStatusExpired MonitorStatus = "expired"
 )
 
-// PoolName identifies a stored proxy pool.
-type PoolName string
-
 // ParseMonitorName validates a monitor name.
 func ParseMonitorName(value string) (MonitorName, error) {
 	if !validName(value) {
@@ -78,18 +75,6 @@ func ParseMonitorStatus(value string) (MonitorStatus, error) {
 	return status, nil
 }
 
-// ParsePoolName validates an optional proxy pool name.
-func ParsePoolName(value string) (PoolName, error) {
-	if value == "" {
-		return "", nil
-	}
-	if !validName(value) {
-		return "", fmt.Errorf("invalid proxy pool name %q", value)
-	}
-
-	return PoolName(value), nil
-}
-
 // String returns the raw monitor name.
 func (n MonitorName) String() string {
 	return string(n)
@@ -113,23 +98,6 @@ func (n RouteName) String() string { return string(n) }
 // String returns the raw monitor status.
 func (s MonitorStatus) String() string {
 	return string(s)
-}
-
-// String returns the raw pool name.
-func (p PoolName) String() string {
-	return string(p)
-}
-
-// Validate checks whether a pool name is safe for lookup.
-func (p PoolName) Validate() error {
-	if p == "" {
-		return nil
-	}
-	if !validName(string(p)) {
-		return fmt.Errorf("invalid proxy pool name %q", p)
-	}
-
-	return nil
 }
 
 // Validate checks whether a route kind is safe for storage and route names.

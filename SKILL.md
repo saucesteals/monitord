@@ -1,9 +1,9 @@
 ---
 name: monitord
-description: Build, test, deploy, and operate durable V5 monitors with typed state, polling or continuous plans, exact scoped secrets, and at-least-once notification delivery.
+description: Build, test, deploy, and operate durable monitord monitors with typed state, polling or continuous plans, exact scoped secrets, and at-least-once notification delivery.
 ---
 
-# monitord V5
+# monitord
 
 Use monitord for a recurring or streaming watch that needs durable state and reliable event handoff.
 

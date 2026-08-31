@@ -20,32 +20,16 @@ const ConfigFileName = "monitor.yaml"
 
 // Config is the validated runtime configuration loaded from monitor.yaml.
 type Config struct {
-	Description      string
-	Clients          int
-	Every            time.Duration
-	TTL              time.Duration
-	Timeout          time.Duration
-	Persistent       bool
-	FailureThreshold int
-	// MaxEvents caps how many events one tick may deliver. Zero means the
-	// daemon default.
-	MaxEvents  int
-	ProxyPool  model.PoolName
+	TTL        time.Duration
+	Persistent bool
 	Deliveries []routes.Delivery
 }
 
 type fileConfig struct {
-	Description      string         `yaml:"description"`
-	Clients          int            `yaml:"clients"`
-	Every            string         `yaml:"every"`
-	TTL              string         `yaml:"ttl"`
-	Timeout          string         `yaml:"timeout"`
-	Persistent       bool           `yaml:"persistent"`
-	FailureThreshold int            `yaml:"failure_threshold"`
-	MaxEvents        int            `yaml:"max_events"`
-	Proxies          string         `yaml:"proxies"`
-	Deliveries       []fileDelivery `yaml:"deliveries"`
-	Routes           []fileRoute    `yaml:"routes"`
+	TTL        string         `yaml:"ttl"`
+	Persistent bool           `yaml:"persistent"`
+	Deliveries []fileDelivery `yaml:"deliveries"`
+	Routes     []fileRoute    `yaml:"routes"`
 }
 
 type fileDelivery struct {
@@ -98,44 +82,8 @@ func LoadConfig(dir string) (Config, error) {
 }
 
 func (raw fileConfig) validate() (Config, error) {
-	clients := raw.Clients
-	if clients == 0 {
-		clients = 1
-	}
-	if clients < 0 {
-		return Config{}, errors.New("clients must be positive")
-	}
-
-	if raw.MaxEvents < 0 {
-		return Config{}, errors.New("max_events cannot be negative")
-	}
-	failureThreshold := raw.FailureThreshold
-	if failureThreshold == 0 {
-		failureThreshold = 3
-	}
-	if failureThreshold < 0 {
-		return Config{}, errors.New("failure_threshold must be positive")
-	}
-
-	// Scheduling belongs to the V5 Go plan. Keep these decoded temporarily for
-	// the local test command, but deploy never persists or schedules from them.
-	var every time.Duration
-	var err error
-	if strings.TrimSpace(raw.Every) != "" {
-		every, err = requiredDuration("every", raw.Every)
-		if err != nil {
-			return Config{}, err
-		}
-	}
-	timeout := 30 * time.Second
-	if strings.TrimSpace(raw.Timeout) != "" {
-		timeout, err = requiredDuration("timeout", raw.Timeout)
-		if err != nil {
-			return Config{}, err
-		}
-	}
-
 	var ttl time.Duration
+	var err error
 	if raw.Persistent {
 		if strings.TrimSpace(raw.TTL) != "" {
 			return Config{}, errors.New("ttl cannot be combined with persistent: true")
@@ -147,10 +95,6 @@ func (raw fileConfig) validate() (Config, error) {
 		}
 	}
 
-	proxyPool, err := model.ParsePoolName(strings.TrimSpace(raw.Proxies))
-	if err != nil {
-		return Config{}, err
-	}
 	if len(raw.Deliveries) == 0 && len(raw.Routes) == 0 {
 		return Config{}, errors.New("at least one delivery is required")
 	}
@@ -186,16 +130,7 @@ func (raw fileConfig) validate() (Config, error) {
 	}
 
 	return Config{
-		Description:      strings.TrimSpace(raw.Description),
-		Clients:          clients,
-		Every:            every,
-		TTL:              ttl,
-		Timeout:          timeout,
-		Persistent:       raw.Persistent,
-		FailureThreshold: failureThreshold,
-		MaxEvents:        raw.MaxEvents,
-		ProxyPool:        proxyPool,
-		Deliveries:       deliveries,
+		TTL: ttl, Persistent: raw.Persistent, Deliveries: deliveries,
 	}, nil
 }
 

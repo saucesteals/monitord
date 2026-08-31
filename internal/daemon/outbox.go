@@ -42,7 +42,7 @@ func (s daemonDeliverySender) Send(ctx context.Context, delivery storage.Claimed
 	if err := json.Unmarshal(delivery.RenderedPayload, &rendered); err != nil {
 		return permanentDeliveryError{fmt.Errorf("decode rendered event: %w", err)}
 	}
-	return s.daemon.deliverRoute(ctx, binding, v5EventMessage(rendered.Deployment, rendered.Event))
+	return s.daemon.deliverRoute(ctx, binding, eventMessage(rendered.Deployment, rendered.Event))
 }
 
 type permanentDeliveryError struct{ error }
@@ -50,7 +50,7 @@ type permanentDeliveryError struct{ error }
 func (permanentDeliveryError) Permanent() bool           { return true }
 func (permanentDeliveryError) RetryAfter() time.Duration { return 0 }
 
-func v5EventMessage(deployment string, event monitord.Event) routes.Message {
+func eventMessage(deployment string, event monitord.Event) routes.Message {
 	footer := event.Footer
 	if footer == "" {
 		footer = deployment

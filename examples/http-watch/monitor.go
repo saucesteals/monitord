@@ -22,9 +22,9 @@ type Target struct {
 	URL  string `json:"url"`
 }
 
-// State persists across ticks and daemon restarts.
+// State persists across checks and daemon restarts.
 type State struct {
-	// LastStatus maps target name to the HTTP status last seen, so a tick can
+	// LastStatus maps target name to the HTTP status last seen, so a check can
 	// report transitions rather than absolute state.
 	LastStatus map[string]int `json:"last_status"`
 	LastOK     time.Time      `json:"last_ok"`

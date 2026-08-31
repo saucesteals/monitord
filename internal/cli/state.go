@@ -59,7 +59,7 @@ func (c *CLI) stateGet(selector string) error {
 
 // stateSet replaces stored state from a file, or from stdin when given "-".
 //
-// The write bumps the state revision, so a tick already in flight loses to this
+// The write bumps the state revision, so a callback already in flight loses to this
 // edit instead of overwriting it.
 func (c *CLI) newStateSetCmd() *cobra.Command {
 	return &cobra.Command{
@@ -97,7 +97,7 @@ func (c *CLI) stateSet(selector string, source string) error {
 	}
 
 	// Hold the edit to the monitor's own struct. Storing unvalidated JSON would
-	// fail every subsequent tick, with nothing able to overwrite it.
+	// fail every subsequent callback, with nothing able to overwrite it.
 	canonical, err := monitor.ValidateState(ctx, m.ArtifactPath, filepath.Dir(m.ArtifactPath), raw, m.StateVersion)
 	if err != nil {
 		return fmt.Errorf("state from %s rejected by %s: %w", source, m.Name, err)

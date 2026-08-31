@@ -1,9 +1,4 @@
-description: Checks a list of URLs and alerts on status changes
-clients: 4
-every: 5m
 ttl: 24h
-timeout: 30s
-failure_threshold: 3 # alert after three consecutive failed ticks
 deliveries:
   - discord:
       account: jarvis

@@ -21,27 +21,32 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// test builds a monitor and runs one tick locally without deploying it.
+// test builds a monitor and runs one callback locally without deploying it.
 //
 // Nothing is written to the schedule and no notification is sent; state changes
 // are shown as a diff instead of being saved. This is the authoring loop.
 func (c *CLI) newTestCmd() *cobra.Command {
 	var useStored bool
+	var duration time.Duration
 
 	cmd := &cobra.Command{
 		Use:   "test NAME",
-		Short: "Build and run one monitor tick locally",
+		Short: "Build and run one monitor callback locally",
 		Args:  exactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return c.test(args[0], useStored)
+			return c.test(args[0], useStored, duration)
 		},
 	}
 	cmd.Flags().BoolVar(&useStored, "stored-state", false, "start from the deployed monitor's stored state")
+	cmd.Flags().DurationVar(&duration, "duration", 30*time.Second, "maximum local run duration")
 
 	return cmd
 }
 
-func (c *CLI) test(target string, useStored bool) error {
+func (c *CLI) test(target string, useStored bool, duration time.Duration) error {
+	if duration <= 0 {
+		return fmt.Errorf("--duration must be positive")
+	}
 	paths, err := config.Init(c.root)
 	if err != nil {
 		return err
@@ -55,7 +60,7 @@ func (c *CLI) test(target string, useStored bool) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), monitorConfig.Timeout+30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
 	// Build to a temp dir so a test never disturbs deployed artifacts.
@@ -118,7 +123,7 @@ func (c *CLI) test(target string, useStored bool) error {
 	fmt.Printf("monitor  %s (%s, state v%d)\n", name, described.Info.Name, described.StateVersion)
 	fmt.Printf("state in %s\n\n", compactJSON(before))
 
-	after, status, err := runOneTick(ctx, binaryPath, dir, name, before, described.Plan, workerSecrets, monitorConfig)
+	after, status, err := runLocal(ctx, binaryPath, dir, name, before, described.Plan, workerSecrets, monitorConfig)
 	if err != nil {
 		return err
 	}
@@ -128,14 +133,14 @@ func (c *CLI) test(target string, useStored bool) error {
 		fmt.Println("state would be saved (differs from input)")
 	}
 	if status == "failure" {
-		return fmt.Errorf("monitor tick failed")
+		return fmt.Errorf("monitor callback failed")
 	}
 
 	return nil
 }
 
-// runOneTick drives a worker through a single tick and streams its output.
-func runOneTick(
+// runLocal drives a worker through one local callback and streams its output.
+func runLocal(
 	ctx context.Context,
 	binaryPath string,
 	dir string,
@@ -163,7 +168,7 @@ func runOneTick(
 	}
 	defer func() { _ = cmd.Process.Kill() }()
 
-	send := func(msg monitord.V5Inbound) error {
+	send := func(msg monitord.DaemonFrame) error {
 		payload, err := json.Marshal(msg)
 		if err != nil {
 			return err
@@ -173,9 +178,9 @@ func runOneTick(
 		return err
 	}
 
-	if err := send(monitord.V5Inbound{
+	if err := send(monitord.DaemonFrame{
 		Type:  "hello",
-		Hello: &monitord.V5Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: "local-test", DeploymentName: name.String(), Generation: 1, WorkerToken: "local-test-token", ArtifactHash: "local", ConfigHash: "local", State: state, Secrets: secrets},
+		Hello: &monitord.Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: "local-test", DeploymentName: name.String(), Generation: 1, WorkerToken: "local-test-token", ArtifactHash: "local", ConfigHash: "local", State: state, Secrets: secrets},
 	}); err != nil {
 		return nil, "", err
 	}
@@ -190,7 +195,7 @@ func runOneTick(
 			continue
 		}
 
-		var msg monitord.V5Outbound
+		var msg monitord.WorkerFrame
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			fmt.Println(line)
 
@@ -199,7 +204,7 @@ func runOneTick(
 
 		switch msg.Type {
 		case "monitor":
-			if err := send(monitord.V5Inbound{Type: "start", Start: &monitord.V5Start{Plan: plan}}); err != nil {
+			if err := send(monitord.DaemonFrame{Type: "start", Start: &monitord.Start{Plan: plan}}); err != nil {
 				return nil, "", err
 			}
 			started = true
@@ -214,11 +219,11 @@ func runOneTick(
 			}
 			current = append(current[:0], msg.Transaction.NextState...)
 			revision++
-			if err := send(monitord.V5Inbound{Type: "ack", Ack: &monitord.TransactionAck{DeploymentID: msg.Transaction.DeploymentID, Generation: msg.Transaction.Generation, Sequence: msg.Transaction.Sequence, PayloadHash: msg.Transaction.PayloadHash, ResultRevision: revision, Status: "accepted"}}); err != nil {
+			if err := send(monitord.DaemonFrame{Type: "ack", Ack: &monitord.TransactionAck{DeploymentID: msg.Transaction.DeploymentID, Generation: msg.Transaction.Generation, Sequence: msg.Transaction.Sequence, PayloadHash: msg.Transaction.PayloadHash, ResultRevision: revision, Status: "accepted"}}); err != nil {
 				return nil, "", err
 			}
 			if plan.Kind == "continuous" && started {
-				_ = send(monitord.V5Inbound{Type: "stop", Stop: &monitord.V5Stop{Reason: "local test complete"}})
+				_ = send(monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: "local test complete"}})
 				started = false
 			}
 		case "run":
@@ -229,7 +234,7 @@ func runOneTick(
 				} else {
 					fmt.Println("[run] success")
 				}
-				_ = send(monitord.V5Inbound{Type: "stop", Stop: &monitord.V5Stop{Reason: "local test complete"}})
+				_ = send(monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: "local test complete"}})
 			}
 		case "health":
 			fmt.Printf("[health/%s] %s %s\n", msg.Health.Child, msg.Health.Status, msg.Health.Message)

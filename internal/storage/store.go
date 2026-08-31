@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/saucesteals/monitord/internal/model"
-	"github.com/saucesteals/monitord/internal/network"
 	"github.com/saucesteals/monitord/internal/routes"
 	"github.com/saucesteals/monitord/internal/storage/db"
 	_ "modernc.org/sqlite"
@@ -28,12 +27,6 @@ type Route struct {
 	Name                 model.RouteName
 	Kind                 model.RouteKind
 	Options              routes.Options
-	CreatedAt, UpdatedAt time.Time
-}
-type ProxyPool struct {
-	Name                 model.PoolName
-	Strategy             network.Strategy
-	Proxies              []string
 	CreatedAt, UpdatedAt time.Time
 }
 
@@ -102,72 +95,6 @@ func (s *Store) GetRoute(ctx context.Context, name model.RouteName) (Route, erro
 	}
 	return toRoute(row)
 }
-func (s *Store) UpsertProxyPool(ctx context.Context, pool ProxyPool) error {
-	if err := pool.Name.Validate(); err != nil {
-		return err
-	}
-	if err := pool.Strategy.Validate(); err != nil {
-		return err
-	}
-	if len(pool.Proxies) == 0 {
-		return fmt.Errorf("pool %s has no proxies", pool.Name)
-	}
-	now := toMs(time.Now().UTC())
-	return s.q.UpsertProxyPool(ctx, db.UpsertProxyPoolParams{Name: pool.Name.String(), Strategy: pool.Strategy.String(), Proxies: strings.Join(pool.Proxies, "\n"), CreatedAt: now, UpdatedAt: now})
-}
-func (s *Store) GetProxyPool(ctx context.Context, name model.PoolName) (ProxyPool, error) {
-	if err := name.Validate(); err != nil {
-		return ProxyPool{}, err
-	}
-	row, err := s.q.GetProxyPool(ctx, name.String())
-	if errors.Is(err, sql.ErrNoRows) {
-		return ProxyPool{}, fmt.Errorf("proxy pool %s not found", name)
-	}
-	if err != nil {
-		return ProxyPool{}, err
-	}
-	return toProxyPool(row)
-}
-func (s *Store) ListProxyPools(ctx context.Context) ([]ProxyPool, error) {
-	rows, err := s.q.ListProxyPools(ctx)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]ProxyPool, 0, len(rows))
-	for _, row := range rows {
-		p, e := toProxyPool(row)
-		if e != nil {
-			return nil, e
-		}
-		out = append(out, p)
-	}
-	return out, nil
-}
-func (s *Store) DeleteProxyPool(ctx context.Context, name model.PoolName) error {
-	if err := name.Validate(); err != nil {
-		return err
-	}
-	return s.q.DeleteProxyPool(ctx, name.String())
-}
-func (s *Store) TakeProxyOffset(ctx context.Context, pool model.PoolName, advance func(int64) int64) (int64, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-	q := s.q.WithTx(tx)
-	current, err := q.GetProxyOffset(ctx, pool.String())
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, err
-	}
-	if err = q.SetProxyOffset(ctx, db.SetProxyOffsetParams{Offset: advance(current), UpdatedAt: toMs(time.Now().UTC()), Name: pool.String()}); err != nil {
-		return 0, err
-	}
-	if err = tx.Commit(); err != nil {
-		return 0, err
-	}
-	return current, nil
-}
 func toRoute(r db.Route) (Route, error) {
 	name, err := model.ParseRouteName(r.Name)
 	if err != nil {
@@ -187,13 +114,6 @@ func toRoute(r db.Route) (Route, error) {
 	}
 	return Route{Name: name, Kind: kind, Options: opts, CreatedAt: fromMs(r.CreatedAt), UpdatedAt: fromMs(r.UpdatedAt)}, nil
 }
-func toProxyPool(p db.ProxyPool) (ProxyPool, error) {
-	name, err := model.ParsePoolName(p.Name)
-	if err != nil {
-		return ProxyPool{}, err
-	}
-	return ProxyPool{Name: name, Strategy: network.Strategy(p.Strategy), Proxies: strings.Split(p.Proxies, "\n"), CreatedAt: fromMs(p.CreatedAt), UpdatedAt: fromMs(p.UpdatedAt)}, nil
-}
 func toMs(t time.Time) int64    { return t.UTC().UnixMilli() }
 func fromMs(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
 func nullMs(t *time.Time) sql.NullInt64 {
@@ -208,12 +128,6 @@ func msPtr(n sql.NullInt64) *time.Time {
 	}
 	t := fromMs(n.Int64)
 	return &t
-}
-func nullPool(p model.PoolName) sql.NullString {
-	if p == "" {
-		return sql.NullString{}
-	}
-	return sql.NullString{String: p.String(), Valid: true}
 }
 func encodeOptions(o routes.Options) (string, error) {
 	if o == nil {
