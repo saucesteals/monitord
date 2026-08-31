@@ -11,14 +11,13 @@ Use monitord for a recurring or streaming watch that needs durable state and rel
 
 ```bash
 monitord new <name>
-$EDITOR ~/.monitord/monitors/<name>/monitor.go
-monitord describe ~/.monitord/monitors/<name>
+$EDITOR ~/.monitord/monitors/<name>/
 monitord test <name>
 monitord deploy <name> [--name <deployment>]
 monitord inspect <deployment>
 ```
 
-Always describe and test before deploy. Deployment names select instances; `Info.Name` identifies Go behavior and is not a persistence key.
+Run the local test command before deploy. Deployment names select instances; `Info.Name` identifies Go behavior and is not a persistence key. Organize non-trivial monitors as Go packages with separate entrypoint, state, and source/domain files.
 
 ## Authoring contract
 

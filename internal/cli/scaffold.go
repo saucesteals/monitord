@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 
 	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/model"
@@ -43,7 +42,7 @@ func (c *CLI) newMonitor(rawName string) error {
 	}
 
 	fmt.Printf("created %s\n", dir)
-	fmt.Printf("edit %s and %s, then:\n", filepath.Join(dir, "monitor.go"), filepath.Join(dir, monitor.ConfigFileName))
+	fmt.Printf("edit the Go package and %s in %s, then:\n", monitor.ConfigFileName, dir)
 	fmt.Printf("  monitord test %s\n", name)
 	fmt.Printf("  monitord deploy %s\n", name)
 

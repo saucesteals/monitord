@@ -53,9 +53,11 @@ func Scaffold(paths config.Paths, name model.MonitorName) (string, error) {
 		return "", fmt.Errorf("create monitor dir: %w", err)
 	}
 
-	source := strings.ReplaceAll(scaffoldTemplate, "MONITOR_NAME", name.String())
-	if err := os.WriteFile(filepath.Join(dir, "monitor.go"), []byte(source), 0o600); err != nil {
-		return "", fmt.Errorf("write monitor source: %w", err)
+	for _, file := range scaffoldFiles {
+		source := strings.ReplaceAll(file.template, "MONITOR_NAME", name.String())
+		if err := os.WriteFile(filepath.Join(dir, file.name), []byte(source), 0o600); err != nil {
+			return "", fmt.Errorf("write %s: %w", file.name, err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(dir, ConfigFileName), []byte(scaffoldConfig), 0o600); err != nil {
 		return "", fmt.Errorf("write monitor config: %w", err)
@@ -64,21 +66,17 @@ func Scaffold(paths config.Paths, name model.MonitorName) (string, error) {
 	return dir, nil
 }
 
-const scaffoldTemplate = `package main
+var scaffoldFiles = []struct {
+	name     string
+	template string
+}{
+	{"main.go", `package main
 
 import (
-	"context"
-	"fmt"
 	"time"
 
 	"github.com/saucesteals/monitord"
-	http "github.com/saucesteals/fhttp"
 )
-
-// State persists across checks and daemon restarts.
-type State struct {
-	LastStatus int ` + "`json:\"last_status\"`" + `
-}
 
 func main() {
 	monitord.Run(monitord.Define(
@@ -86,6 +84,27 @@ func main() {
 		monitord.Every(5*time.Minute, check),
 	))
 }
+`},
+	{"state.go", `package main
+
+// State persists across checks and daemon restarts.
+type State struct {
+	LastStatus int ` + "`json:\"last_status\"`" + `
+	Initialized bool ` + "`json:\"initialized\"`" + `
+}
+
+func (State) StateVersion() int { return 1 }
+`},
+	{"check.go", `package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	http "github.com/saucesteals/fhttp"
+	"github.com/saucesteals/monitord"
+)
 
 func check(ctx context.Context, session *monitord.Session[State]) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/", nil)
@@ -98,14 +117,26 @@ func check(ctx context.Context, session *monitord.Session[State]) error {
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	observedAt := time.Now().UTC()
 
 	return session.Commit(ctx, func(tx *monitord.Tx[State]) error {
+		previous := tx.State.LastStatus
 		tx.State.LastStatus = resp.StatusCode
-		if resp.StatusCode >= 400 { return tx.Emit(monitord.Event{ID: fmt.Sprintf("http:%d", resp.StatusCode), Title: fmt.Sprintf("HTTP %d", resp.StatusCode)}) }
+		if tx.State.Initialized && previous == resp.StatusCode {
+			return nil
+		}
+		tx.State.Initialized = true
+		if resp.StatusCode >= 400 {
+			return tx.Emit(monitord.Event{
+				ID:    fmt.Sprintf("http:%d:%d", resp.StatusCode, observedAt.UnixNano()),
+				Title: fmt.Sprintf("HTTP %d", resp.StatusCode),
+			})
+		}
 		return nil
 	})
 }
-`
+`},
+}
 
 const scaffoldConfig = `ttl: 24h
 deliveries:

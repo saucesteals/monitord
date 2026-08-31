@@ -10,17 +10,27 @@ V5 is an intentional clean break. Export or back up a V4 root before opening it 
 
 ## A monitor
 
+Treat each monitor as a small Go package. Keep the entrypoint declarative and
+move durable state and source-specific behavior into focused files:
+
+```text
+restock/
+├── main.go
+├── state.go
+├── check.go
+└── monitor.yaml
+```
+
+`main.go` wires the monitor:
+
 ```go
 package main
 
 import (
-	"context"
 	"time"
 
 	"github.com/saucesteals/monitord"
 )
-
-type State struct { InStock bool `json:"in_stock"` }
 
 func main() {
 	monitord.Run(monitord.Define(
@@ -28,6 +38,28 @@ func main() {
 		monitord.Every(5*time.Minute, check),
 	))
 }
+```
+
+`state.go` owns the durable schema:
+
+```go
+package main
+
+type State struct { InStock bool `json:"in_stock"` }
+
+func (State) StateVersion() int { return 1 }
+```
+
+`check.go` owns the polling behavior:
+
+```go
+package main
+
+import (
+	"context"
+
+	"github.com/saucesteals/monitord"
+)
 
 func check(ctx context.Context, session *monitord.Session[State]) error {
 	inStock, err := fetchProduct(ctx) // network I/O stays outside Commit
@@ -90,7 +122,6 @@ The catalog also exposes managed confirmed `quicknode.Events[S]` and a raw JSON-
 
 ```bash
 monitord new restock
-monitord describe ~/.monitord/monitors/restock
 monitord test restock
 monitord deploy restock --name shop-restock
 monitord list
