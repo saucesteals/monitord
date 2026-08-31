@@ -10,18 +10,17 @@ V5 is an intentional clean break. Export or back up a V4 root before opening it 
 
 ## A monitor
 
-Treat each monitor as a small Go package. Keep the entrypoint declarative and
-move durable state and source-specific behavior into focused files:
+Treat each monitor as a small Go package. Keep its contract together and split
+out only the implementation that has a useful domain boundary:
 
 ```text
 restock/
-├── main.go
-├── state.go
+├── monitor.go
 ├── check.go
 └── monitor.yaml
 ```
 
-`main.go` wires the monitor:
+`monitor.go` contains the entrypoint, metadata, plan, and durable schema:
 
 ```go
 package main
@@ -32,22 +31,16 @@ import (
 	"github.com/saucesteals/monitord"
 )
 
+type State struct { InStock bool `json:"in_stock"` }
+
+func (State) StateVersion() int { return 1 }
+
 func main() {
 	monitord.Run(monitord.Define(
 		monitord.Info{Name: "restock", Description: "Watches one product"},
 		monitord.Every(5*time.Minute, check),
 	))
 }
-```
-
-`state.go` owns the durable schema:
-
-```go
-package main
-
-type State struct { InStock bool `json:"in_stock"` }
-
-func (State) StateVersion() int { return 1 }
 ```
 
 `check.go` owns the polling behavior:

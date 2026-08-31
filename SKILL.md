@@ -17,7 +17,7 @@ monitord deploy <name> [--name <deployment>]
 monitord inspect <deployment>
 ```
 
-Run the local test command before deploy. Deployment names select instances; `Info.Name` identifies Go behavior and is not a persistence key. Organize non-trivial monitors as Go packages with separate entrypoint, state, and source/domain files.
+Run the local test command before deploy. Deployment names select instances; `Info.Name` identifies Go behavior and is not a persistence key. Keep the entrypoint, metadata, plan, and state contract in `monitor.go`; split source or domain logic into additional files only when the boundary is useful.
 
 ## Authoring contract
 

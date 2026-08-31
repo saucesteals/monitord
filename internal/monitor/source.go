@@ -70,7 +70,7 @@ var scaffoldFiles = []struct {
 	name     string
 	template string
 }{
-	{"main.go", `package main
+	{"monitor.go", `package main
 
 import (
 	"time"
@@ -78,22 +78,20 @@ import (
 	"github.com/saucesteals/monitord"
 )
 
+// State is the monitor's durable schema.
+type State struct {
+	LastStatus  int  ` + "`json:\"last_status\"`" + `
+	Initialized bool ` + "`json:\"initialized\"`" + `
+}
+
+func (State) StateVersion() int { return 1 }
+
 func main() {
 	monitord.Run(monitord.Define(
 		monitord.Info{Name: "MONITOR_NAME", Description: "HTTP status monitor"},
 		monitord.Every(5*time.Minute, check),
 	))
 }
-`},
-	{"state.go", `package main
-
-// State persists across checks and daemon restarts.
-type State struct {
-	LastStatus int ` + "`json:\"last_status\"`" + `
-	Initialized bool ` + "`json:\"initialized\"`" + `
-}
-
-func (State) StateVersion() int { return 1 }
 `},
 	{"check.go", `package main
 

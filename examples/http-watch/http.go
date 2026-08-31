@@ -2,12 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	http "github.com/saucesteals/fhttp"
 	"github.com/saucesteals/monitord"
 )
+
+type Target struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
 
 type observation struct {
 	target Target
@@ -30,8 +37,23 @@ func checkTargets(ctx context.Context, session *monitord.Session[State]) error {
 			return err
 		}
 	}
-
 	return nil
+}
+
+func loadTargets(path string) ([]Target, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var targets []Target
+	if err := json.Unmarshal(contents, &targets); err != nil {
+		return nil, err
+	}
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("%s lists no targets", path)
+	}
+	return targets, nil
 }
 
 func observe(ctx context.Context, target Target) observation {
@@ -64,6 +86,7 @@ func commitObservation(tx *monitord.Tx[State], result observation) error {
 	if next.Reachable && next.Status < http.StatusBadRequest {
 		tx.State.LastOK = result.time
 	}
+
 	unchanged := seen && previous == next
 	initiallyHealthy := !seen && next.Reachable && next.Status < http.StatusBadRequest
 	if unchanged || initiallyHealthy {
@@ -84,6 +107,5 @@ func commitObservation(tx *monitord.Tx[State], result observation) error {
 		event.Severity = monitord.SeverityInfo
 		event.Title = result.target.Name + " recovered"
 	}
-
 	return tx.Emit(event)
 }
