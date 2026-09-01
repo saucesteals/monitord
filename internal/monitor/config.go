@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	monitord "github.com/saucesteals/monitord"
 	"github.com/saucesteals/monitord/internal/model"
 	"github.com/saucesteals/monitord/internal/routes"
 	"go.yaml.in/yaml/v3"
@@ -23,6 +24,7 @@ type Config struct {
 	TTL        time.Duration
 	Persistent bool
 	Deliveries []routes.Delivery
+	Policy     monitord.DeploymentPolicy
 }
 
 type fileConfig struct {
@@ -30,6 +32,17 @@ type fileConfig struct {
 	Persistent bool           `yaml:"persistent"`
 	Deliveries []fileDelivery `yaml:"deliveries"`
 	Routes     []fileRoute    `yaml:"routes"`
+	Health     fileHealth     `yaml:"health"`
+	Events     fileEvents     `yaml:"events"`
+}
+
+type fileHealth struct {
+	FailureThreshold *int `yaml:"failure_threshold"`
+}
+
+type fileEvents struct {
+	MaxPerTransaction *int   `yaml:"max_per_transaction"`
+	Retention         string `yaml:"retention"`
 }
 
 type fileDelivery struct {
@@ -82,6 +95,30 @@ func LoadConfig(dir string) (Config, error) {
 }
 
 func (raw fileConfig) validate() (Config, error) {
+	policy := monitord.DeploymentPolicy{
+		Health: monitord.HealthPolicy{FailureThreshold: 3},
+		Events: monitord.EventPolicy{
+			MaxPerTransaction: monitord.MaxEventsPerTransaction,
+			Retention:         30 * 24 * time.Hour,
+		},
+	}
+	if raw.Health.FailureThreshold != nil {
+		policy.Health.FailureThreshold = *raw.Health.FailureThreshold
+	}
+	if raw.Events.MaxPerTransaction != nil {
+		policy.Events.MaxPerTransaction = *raw.Events.MaxPerTransaction
+	}
+	if value := strings.TrimSpace(raw.Events.Retention); value != "" {
+		retention, err := parseDuration(value)
+		if err != nil {
+			return Config{}, fmt.Errorf("events.retention: %w", err)
+		}
+		policy.Events.Retention = retention
+	}
+	if err := policy.Validate(); err != nil {
+		return Config{}, err
+	}
+
 	var ttl time.Duration
 	var err error
 	if raw.Persistent {
@@ -126,8 +163,26 @@ func (raw fileConfig) validate() (Config, error) {
 	}
 
 	return Config{
-		TTL: ttl, Persistent: raw.Persistent, Deliveries: deliveries,
+		TTL: ttl, Persistent: raw.Persistent, Deliveries: deliveries, Policy: policy,
 	}, nil
+}
+
+func parseDuration(value string) (time.Duration, error) {
+	if strings.HasSuffix(value, "d") {
+		days, err := strconv.ParseInt(strings.TrimSuffix(value, "d"), 10, 32)
+		if err != nil || days <= 0 {
+			return 0, fmt.Errorf("%q is not a positive duration", value)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	if duration <= 0 {
+		return 0, errors.New("must be positive")
+	}
+	return duration, nil
 }
 
 func scalarOptions(raw map[string]any) (routes.Options, error) {

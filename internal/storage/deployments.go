@@ -23,6 +23,8 @@ type Deployment struct {
 	ID, Name, InfoName, SourceDir, Status, ArtifactID, ConfigHash string
 	ConfigRevision, ActiveGeneration, StateRevision               int64
 	StateVersion                                                  int
+	FailureThreshold, MaxEventsPerTransaction                     int
+	EventRetention                                                time.Duration
 	State                                                         json.RawMessage
 	CreatedAt, UpdatedAt                                          time.Time
 	ExpiresAt, ArchivedAt                                         *time.Time
@@ -31,19 +33,21 @@ type Deployment struct {
 // DeployInput is the complete durable snapshot produced by one deploy. The
 // deployment and its destinations become visible together or not at all.
 type DeployInput struct {
-	Name, InfoName, SourceDir, ConfigHash string
-	Artifact                              Artifact
-	State                                 json.RawMessage
-	StateVersion                          int
-	ExpiresAt                             *time.Time
-	Destinations                          []json.RawMessage
+	Name, InfoName, SourceDir, ConfigHash     string
+	Artifact                                  Artifact
+	State                                     json.RawMessage
+	StateVersion                              int
+	FailureThreshold, MaxEventsPerTransaction int
+	EventRetention                            time.Duration
+	ExpiresAt                                 *time.Time
+	Destinations                              []json.RawMessage
 	// ExpectedStateRevision prevents a build from overwriting state committed
 	// while it was compiling. Nil means this is a new deployment.
 	ExpectedStateRevision *int64
 }
 
 func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) {
-	if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.InfoName) == "" || in.ConfigHash == "" || !json.Valid(in.State) || in.StateVersion < 1 || len(in.Destinations) == 0 {
+	if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.InfoName) == "" || in.ConfigHash == "" || !json.Valid(in.State) || in.StateVersion < 1 || len(in.Destinations) == 0 || in.FailureThreshold < 1 || in.MaxEventsPerTransaction < 1 || in.MaxEventsPerTransaction > 256 || in.EventRetention <= 0 {
 		return Deployment{}, errors.New("deploy requires name, info, artifact, config hash, and valid versioned state")
 	}
 	for _, destination := range in.Destinations {
@@ -79,8 +83,8 @@ func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) 
 		if err != nil {
 			return Deployment{}, err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO deployments(id,name,info_name,source_dir,status,artifact_id,config_revision,config_hash,state,state_version,created_at,updated_at,expires_at)
-			VALUES(?,?,?,?, 'active', ?,1,?,?,?,?,?,?)`, id, in.Name, in.InfoName, in.SourceDir, artifact.ID, in.ConfigHash, in.State, in.StateVersion, nowMS, nowMS, expires)
+		_, err = tx.ExecContext(ctx, `INSERT INTO deployments(id,name,info_name,source_dir,status,artifact_id,config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,state,state_version,created_at,updated_at,expires_at)
+			VALUES(?,?,?,?, 'active', ?,1,?,?,?,?,?,?,?,?,?)`, id, in.Name, in.InfoName, in.SourceDir, artifact.ID, in.ConfigHash, in.FailureThreshold, in.MaxEventsPerTransaction, in.EventRetention.Milliseconds(), in.State, in.StateVersion, nowMS, nowMS, expires)
 	case err != nil:
 		return Deployment{}, err
 	default:
@@ -94,7 +98,7 @@ func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) 
 		if oldHash != in.ConfigHash {
 			revisionBump = 1
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE deployments SET info_name=?,source_dir=?,artifact_id=?,config_hash=?,config_revision=config_revision+?,active_generation=0,state=?,state_version=?,state_revision=state_revision+1,status='active',expires_at=?,archived_at=NULL,updated_at=? WHERE id=?`, in.InfoName, in.SourceDir, artifact.ID, in.ConfigHash, revisionBump, in.State, in.StateVersion, expires, nowMS, id)
+		_, err = tx.ExecContext(ctx, `UPDATE deployments SET info_name=?,source_dir=?,artifact_id=?,config_hash=?,config_revision=config_revision+?,failure_threshold=?,max_events_per_transaction=?,event_retention_ms=?,active_generation=0,state=?,state_version=?,state_revision=state_revision+1,status='active',expires_at=?,archived_at=NULL,updated_at=? WHERE id=?`, in.InfoName, in.SourceDir, artifact.ID, in.ConfigHash, revisionBump, in.FailureThreshold, in.MaxEventsPerTransaction, in.EventRetention.Milliseconds(), in.State, in.StateVersion, expires, nowMS, id)
 	}
 	if err != nil {
 		return Deployment{}, fmt.Errorf("deploy: %w", err)
@@ -122,7 +126,7 @@ func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) 
 }
 
 func (s *Store) ListDeployments(ctx context.Context) ([]Deployment, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,active_generation,state,state_version,state_revision,created_at,updated_at,expires_at,archived_at FROM deployments ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,active_generation,state,state_version,state_revision,created_at,updated_at,expires_at,archived_at FROM deployments ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -132,11 +136,13 @@ func (s *Store) ListDeployments(ctx context.Context) ([]Deployment, error) {
 		var d Deployment
 		var state []byte
 		var created, updated int64
+		var retentionMS int64
 		var expires, archived sql.NullInt64
-		if err = rows.Scan(&d.ID, &d.Name, &d.InfoName, &d.SourceDir, &d.Status, &d.ArtifactID, &d.ConfigRevision, &d.ConfigHash, &d.ActiveGeneration, &state, &d.StateVersion, &d.StateRevision, &created, &updated, &expires, &archived); err != nil {
+		if err = rows.Scan(&d.ID, &d.Name, &d.InfoName, &d.SourceDir, &d.Status, &d.ArtifactID, &d.ConfigRevision, &d.ConfigHash, &d.FailureThreshold, &d.MaxEventsPerTransaction, &retentionMS, &d.ActiveGeneration, &state, &d.StateVersion, &d.StateRevision, &created, &updated, &expires, &archived); err != nil {
 			return nil, err
 		}
 		d.State = append(json.RawMessage(nil), state...)
+		d.EventRetention = time.Duration(retentionMS) * time.Millisecond
 		d.CreatedAt = fromMs(created)
 		d.UpdatedAt = fromMs(updated)
 		d.ExpiresAt = nullTime(expires)
@@ -174,9 +180,10 @@ func (s *Store) GetDeployment(ctx context.Context, selector string) (Deployment,
 	var d Deployment
 	var state []byte
 	var created, updated int64
+	var retentionMS int64
 	var expires, archived sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,active_generation,state,state_version,state_revision,created_at,updated_at,expires_at,archived_at
-		FROM deployments WHERE id=? OR name=? ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END LIMIT 1`, selector, selector, selector).Scan(&d.ID, &d.Name, &d.InfoName, &d.SourceDir, &d.Status, &d.ArtifactID, &d.ConfigRevision, &d.ConfigHash, &d.ActiveGeneration, &state, &d.StateVersion, &d.StateRevision, &created, &updated, &expires, &archived)
+	err := s.db.QueryRowContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,active_generation,state,state_version,state_revision,created_at,updated_at,expires_at,archived_at
+		FROM deployments WHERE id=? OR name=? ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END LIMIT 1`, selector, selector, selector).Scan(&d.ID, &d.Name, &d.InfoName, &d.SourceDir, &d.Status, &d.ArtifactID, &d.ConfigRevision, &d.ConfigHash, &d.FailureThreshold, &d.MaxEventsPerTransaction, &retentionMS, &d.ActiveGeneration, &state, &d.StateVersion, &d.StateRevision, &created, &updated, &expires, &archived)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, fmt.Errorf("deployment %q: %w", selector, ErrNotFound)
 	}
@@ -184,6 +191,7 @@ func (s *Store) GetDeployment(ctx context.Context, selector string) (Deployment,
 		return Deployment{}, err
 	}
 	d.State = append(json.RawMessage(nil), state...)
+	d.EventRetention = time.Duration(retentionMS) * time.Millisecond
 	d.CreatedAt = fromMs(created)
 	d.UpdatedAt = fromMs(updated)
 	d.ExpiresAt = nullTime(expires)

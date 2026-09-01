@@ -76,7 +76,7 @@ func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io
 			secrets[g+"\x00"+k] = v
 		}
 	}
-	session, err := newSession[S](hello.State, secrets, coord)
+	session, err := newSession[S](hello.State, secrets, hello.Policy.Events.MaxPerTransaction, coord)
 	if err != nil {
 		return err
 	}

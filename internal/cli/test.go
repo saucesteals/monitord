@@ -182,7 +182,7 @@ func runLocal(
 
 	if err := send(monitord.DaemonFrame{
 		Type:  "hello",
-		Hello: &monitord.Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: "local-test", DeploymentName: name.String(), Generation: 1, WorkerToken: "local-test-token", ArtifactHash: "local", ConfigHash: "local", State: state, Secrets: secrets},
+		Hello: &monitord.Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: "local-test", DeploymentName: name.String(), Generation: 1, WorkerToken: "local-test-token", ArtifactHash: "local", ConfigHash: "local", State: state, Secrets: secrets, Policy: config.Policy},
 	}); err != nil {
 		return nil, "", err
 	}

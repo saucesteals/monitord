@@ -27,7 +27,7 @@ func (s *Store) GetRuntimeDeployment(ctx context.Context, selector string) (Runt
 
 func (s *Store) ListRuntimeDeployments(ctx context.Context) ([]RuntimeDeployment, error) {
 	now := toMs(time.Now().UTC())
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id,d.name,d.info_name,d.source_dir,d.status,COALESCE(d.artifact_id,''),d.config_revision,d.config_hash,d.active_generation,d.state,d.state_version,d.state_revision,d.created_at,d.updated_at,d.expires_at,d.archived_at,a.path,a.content_hash,a.describe_json FROM deployments d JOIN artifacts a ON a.id=d.artifact_id WHERE d.status='active' AND (d.expires_at IS NULL OR d.expires_at>?) ORDER BY d.name`, now)
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id,d.name,d.info_name,d.source_dir,d.status,COALESCE(d.artifact_id,''),d.config_revision,d.config_hash,d.failure_threshold,d.max_events_per_transaction,d.event_retention_ms,d.active_generation,d.state,d.state_version,d.state_revision,d.created_at,d.updated_at,d.expires_at,d.archived_at,a.path,a.content_hash,a.describe_json FROM deployments d JOIN artifacts a ON a.id=d.artifact_id WHERE d.status='active' AND (d.expires_at IS NULL OR d.expires_at>?) ORDER BY d.name`, now)
 	if err != nil {
 		return nil, err
 	}
@@ -37,11 +37,13 @@ func (s *Store) ListRuntimeDeployments(ctx context.Context) ([]RuntimeDeployment
 		var r RuntimeDeployment
 		var state []byte
 		var created, updated int64
+		var retentionMS int64
 		var expires, archived sql.NullInt64
-		if err = rows.Scan(&r.ID, &r.Name, &r.InfoName, &r.SourceDir, &r.Status, &r.ArtifactID, &r.ConfigRevision, &r.ConfigHash, &r.ActiveGeneration, &state, &r.StateVersion, &r.StateRevision, &created, &updated, &expires, &archived, &r.ArtifactPath, &r.ArtifactHash, &r.Describe); err != nil {
+		if err = rows.Scan(&r.ID, &r.Name, &r.InfoName, &r.SourceDir, &r.Status, &r.ArtifactID, &r.ConfigRevision, &r.ConfigHash, &r.FailureThreshold, &r.MaxEventsPerTransaction, &retentionMS, &r.ActiveGeneration, &state, &r.StateVersion, &r.StateRevision, &created, &updated, &expires, &archived, &r.ArtifactPath, &r.ArtifactHash, &r.Describe); err != nil {
 			return nil, err
 		}
 		r.State = append(json.RawMessage(nil), state...)
+		r.EventRetention = time.Duration(retentionMS) * time.Millisecond
 		r.CreatedAt = fromMs(created)
 		r.UpdatedAt = fromMs(updated)
 		r.ExpiresAt = nullTime(expires)

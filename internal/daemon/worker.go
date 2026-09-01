@@ -74,7 +74,7 @@ func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDe
 	}()
 	go func() { w.done <- cmd.Wait() }()
 	go w.readLoop()
-	hello := monitord.Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: dep.ID, DeploymentName: dep.Name, Generation: uint64(generation.Generation), WorkerToken: hex.EncodeToString(generation.WorkerToken), ArtifactHash: dep.ArtifactHash, ConfigHash: dep.ConfigHash, StateRevision: dep.StateRevision, State: dep.State, Checkpoints: dep.Checkpoints, Secrets: secrets}
+	hello := monitord.Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: dep.ID, DeploymentName: dep.Name, Generation: uint64(generation.Generation), WorkerToken: hex.EncodeToString(generation.WorkerToken), ArtifactHash: dep.ArtifactHash, ConfigHash: dep.ConfigHash, StateRevision: dep.StateRevision, State: dep.State, Checkpoints: dep.Checkpoints, Secrets: secrets, Policy: monitord.DeploymentPolicy{Health: monitord.HealthPolicy{FailureThreshold: dep.FailureThreshold}, Events: monitord.EventPolicy{MaxPerTransaction: dep.MaxEventsPerTransaction, Retention: dep.EventRetention}}}
 	if err = w.send(ctx, monitord.DaemonFrame{Type: "hello", Hello: &hello}); err != nil {
 		w.kill()
 		return nil, err
@@ -158,6 +158,9 @@ func (w *worker) transaction(ctx context.Context, store *storage.Store, wire mon
 	}
 	if err := verifyWireHash(wire); err != nil {
 		return err
+	}
+	if len(wire.Events) > w.deployment.MaxEventsPerTransaction {
+		return fmt.Errorf("transaction has %d events; deployment limit is %d", len(wire.Events), w.deployment.MaxEventsPerTransaction)
 	}
 	bindings, err := store.ListActiveBindings(ctx, w.deployment.ID)
 	if err != nil {

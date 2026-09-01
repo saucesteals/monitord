@@ -81,9 +81,13 @@ type Tx[S any] struct {
 	State       *S
 	events      []Event
 	checkpoints map[string]json.RawMessage
+	maxEvents   int
 }
 
 func (tx *Tx[S]) Emit(e Event) error {
+	if len(tx.events) >= tx.maxEvents {
+		return fmt.Errorf("transaction cannot emit more than %d events", tx.maxEvents)
+	}
 	if err := e.Validate(); err != nil {
 		return err
 	}
@@ -143,9 +147,13 @@ type Session[S any] struct {
 	checkpoints map[string]json.RawMessage
 	secrets     secretSet
 	committer   sessionCommitter
+	maxEvents   int
 }
 
-func newSession[S any](state json.RawMessage, secrets map[string]string, committer sessionCommitter) (*Session[S], error) {
+func newSession[S any](state json.RawMessage, secrets map[string]string, maxEvents int, committer sessionCommitter) (*Session[S], error) {
+	if maxEvents < 1 || maxEvents > MaxEventsPerTransaction {
+		return nil, fmt.Errorf("max events per transaction must be between 1 and %d", MaxEventsPerTransaction)
+	}
 	v, err := decodeState[S](state, 0)
 	if err != nil {
 		return nil, err
@@ -161,7 +169,7 @@ func newSession[S any](state json.RawMessage, secrets map[string]string, committ
 	if committer == nil {
 		committer = &localCommitter{state: raw}
 	}
-	return &Session[S]{state: raw, checkpoints: map[string]json.RawMessage{}, secrets: ss, committer: committer}, nil
+	return &Session[S]{state: raw, checkpoints: map[string]json.RawMessage{}, secrets: ss, committer: committer, maxEvents: maxEvents}, nil
 }
 
 // Checkpoint decodes a fresh copy of a durable source checkpoint into out.
@@ -211,7 +219,7 @@ func (s *Session[S]) Commit(ctx context.Context, fn func(*Tx[S]) error) error {
 	if err != nil {
 		return err
 	}
-	tx := &Tx[S]{State: state}
+	tx := &Tx[S]{State: state, maxEvents: s.maxEvents}
 	func() {
 		defer func() {
 			if r := recover(); r != nil {

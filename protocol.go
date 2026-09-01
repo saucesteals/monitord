@@ -21,6 +21,31 @@ type ProtocolVersion struct {
 	Major int `json:"major"`
 	Minor int `json:"minor"`
 }
+type DeploymentPolicy struct {
+	Health HealthPolicy `json:"health"`
+	Events EventPolicy  `json:"events"`
+}
+type HealthPolicy struct {
+	FailureThreshold int `json:"failure_threshold"`
+}
+type EventPolicy struct {
+	MaxPerTransaction int           `json:"max_per_transaction"`
+	Retention         time.Duration `json:"retention"`
+}
+
+func (p DeploymentPolicy) Validate() error {
+	if p.Health.FailureThreshold < 1 {
+		return errors.New("health failure threshold must be positive")
+	}
+	if p.Events.MaxPerTransaction < 1 || p.Events.MaxPerTransaction > MaxEventsPerTransaction {
+		return fmt.Errorf("events max per transaction must be between 1 and %d", MaxEventsPerTransaction)
+	}
+	if p.Events.Retention <= 0 {
+		return errors.New("events retention must be positive")
+	}
+	return nil
+}
+
 type Hello struct {
 	Version        ProtocolVersion              `json:"version"`
 	DeploymentID   string                       `json:"deployment_id"`
@@ -33,6 +58,7 @@ type Hello struct {
 	State          json.RawMessage              `json:"state"`
 	Checkpoints    map[string]json.RawMessage   `json:"checkpoints,omitempty"`
 	Secrets        map[string]map[string]string `json:"secrets,omitempty"`
+	Policy         DeploymentPolicy             `json:"policy"`
 }
 type Start struct {
 	Plan PlanDescription `json:"plan"`
@@ -164,6 +190,9 @@ func (i DaemonFrame) Validate() error {
 			if source == "" || len(source) > 128 || len(raw) > MaxCheckpointBytes || !json.Valid(raw) {
 				return fmt.Errorf("invalid hello checkpoint %q", source)
 			}
+		}
+		if err := i.Hello.Policy.Validate(); err != nil {
+			return fmt.Errorf("invalid deployment policy: %w", err)
 		}
 	case "start":
 		if i.Start == nil {

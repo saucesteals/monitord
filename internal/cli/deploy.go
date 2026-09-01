@@ -115,7 +115,10 @@ func (c *CLI) deploy(ctx context.Context, out io.Writer, target, overrideName st
 		Name: monitorName.String(), InfoName: built.Description.Info.Name,
 		SourceDir: dir, Artifact: built.Artifact, ConfigHash: configHash,
 		State: built.State, StateVersion: built.Description.StateVersion,
-		ExpiresAt: expires, Destinations: destinations,
+		FailureThreshold:        monitorConfig.Policy.Health.FailureThreshold,
+		MaxEventsPerTransaction: monitorConfig.Policy.Events.MaxPerTransaction,
+		EventRetention:          monitorConfig.Policy.Events.Retention,
+		ExpiresAt:               expires, Destinations: destinations,
 		ExpectedStateRevision: expectedStateRevision,
 	})
 	if err != nil {
