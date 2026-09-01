@@ -52,6 +52,9 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 			continue
 		}
 		if err = d.launch(ctx, dep, secretMap, fingerprint); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			d.workersMu.Lock()
 			slot := d.workers[dep.ID]
 			if slot == nil {

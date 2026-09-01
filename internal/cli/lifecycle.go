@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -12,11 +13,11 @@ import (
 
 func (c *CLI) newArchiveCmd() *cobra.Command {
 	return &cobra.Command{Use: "archive NAME_OR_ID", Short: "Archive an inactive deployment", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return c.archive(cmd.Context(), args[0])
+		return c.archive(cmd.Context(), cmd.OutOrStdout(), args[0])
 	}}
 }
 
-func (c *CLI) archive(ctx context.Context, selector string) error {
+func (c *CLI) archive(ctx context.Context, out io.Writer, selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
@@ -32,20 +33,20 @@ func (c *CLI) archive(ctx context.Context, selector string) error {
 	if err := store.ArchiveDeployment(ctx, deployment.ID); err != nil {
 		return err
 	}
-	fmt.Printf("archived %s (%s)\n", deployment.Name, deployment.ID)
+	fmt.Fprintf(out, "archived %s (%s)\n", deployment.Name, deployment.ID)
 	return nil
 }
 
 func (c *CLI) newPurgeCmd() *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{Use: "purge NAME_OR_ID", Short: "Permanently delete an archived deployment", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return c.purge(cmd.Context(), args[0], force)
+		return c.purge(cmd.Context(), cmd.OutOrStdout(), args[0], force)
 	}}
 	cmd.Flags().BoolVar(&force, "force", false, "discard queued deliveries")
 	return cmd
 }
 
-func (c *CLI) purge(ctx context.Context, selector string, force bool) error {
+func (c *CLI) purge(ctx context.Context, out io.Writer, selector string, force bool) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
@@ -64,17 +65,17 @@ func (c *CLI) purge(ctx context.Context, selector string, force bool) error {
 		}
 		return err
 	}
-	fmt.Printf("purged %s (%s)\n", deployment.Name, deployment.ID)
+	fmt.Fprintf(out, "purged %s (%s)\n", deployment.Name, deployment.ID)
 	return nil
 }
 
 func (c *CLI) newPauseCmd() *cobra.Command {
 	return &cobra.Command{Use: "pause NAME_OR_ID", Short: "Pause a deployment", Args: exactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return c.pause(cmd.Context(), args[0])
+		return c.pause(cmd.Context(), cmd.OutOrStdout(), args[0])
 	}}
 }
 
-func (c *CLI) pause(ctx context.Context, selector string) error {
+func (c *CLI) pause(ctx context.Context, out io.Writer, selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
@@ -87,7 +88,7 @@ func (c *CLI) pause(ctx context.Context, selector string) error {
 	if err := store.PauseDeployment(ctx, deployment.ID); err != nil {
 		return err
 	}
-	fmt.Printf("paused %s (%s)\n", deployment.Name, deployment.ID)
+	fmt.Fprintf(out, "paused %s (%s)\n", deployment.Name, deployment.ID)
 	return nil
 }
 
@@ -115,7 +116,7 @@ func (c *CLI) newResumeCmd() *cobra.Command {
 		if err = store.ResumeDeployment(cmd.Context(), deployment.ID, expires); err != nil {
 			return err
 		}
-		fmt.Printf("resumed %s (%s)\n", deployment.Name, deployment.ID)
+		fmt.Fprintf(cmd.OutOrStdout(), "resumed %s (%s)\n", deployment.Name, deployment.ID)
 		return nil
 	}}
 	cmd.Flags().DurationVar(&ttl, "ttl", 0, "fresh deployment lifetime")

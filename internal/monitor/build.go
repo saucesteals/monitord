@@ -53,8 +53,8 @@ type BuildResult struct {
 }
 
 // Build compiles and describes an immutable artifact without creating or
-// mutating a deployment. Callers persist Artifact first, then atomically create
-// or redeploy using State and Description.StateVersion.
+// mutating a deployment. The published binary becomes a reusable cache entry;
+// its database row is created only by a successful atomic deployment.
 func Build(ctx context.Context, paths config.Paths, req Request) (BuildResult, error) {
 	dir, err := validateDir(req)
 	if err != nil {
@@ -63,7 +63,9 @@ func Build(ctx context.Context, paths config.Paths, req Request) (BuildResult, e
 	if err = config.Tidy(ctx, paths); err != nil {
 		return BuildResult{}, err
 	}
-	artifactRoot := paths.ArtifactDir(req.Name)
+	// Artifacts are identified globally by their binary hash, so their path is
+	// global as well. The source monitor name must never affect content identity.
+	artifactRoot := paths.ArtifactsDir
 	if err = os.MkdirAll(artifactRoot, 0o700); err != nil {
 		return BuildResult{}, fmt.Errorf("create artifact root: %w", err)
 	}

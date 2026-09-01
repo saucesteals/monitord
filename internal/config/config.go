@@ -20,7 +20,8 @@ type Paths struct {
 	// MonitorsDir holds authored monitor sources, one directory per monitor.
 	// It is a single Go module so monitors can share dependency versions.
 	MonitorsDir string `json:"monitors_dir"`
-	// ArtifactsDir holds built, immutable monitor binaries.
+	// ArtifactsDir is a global content-addressed build cache. Database artifact
+	// rows are created only when a deployment commits successfully.
 	ArtifactsDir string `json:"artifacts_dir"`
 	// LibDir is the monitord checkout monitors link against. Keeping a clone
 	// inside the root makes an install self-contained: monitors build against
@@ -38,11 +39,6 @@ type Paths struct {
 // MonitorDir returns the authored source directory for a monitor.
 func (p Paths) MonitorDir(name model.MonitorName) string {
 	return filepath.Join(p.MonitorsDir, name.String())
-}
-
-// ArtifactDir returns the artifact root for a monitor.
-func (p Paths) ArtifactDir(name model.MonitorName) string {
-	return filepath.Join(p.ArtifactsDir, name.String())
 }
 
 // ModulePath is the go.mod shared by every monitor.

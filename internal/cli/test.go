@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,7 +35,7 @@ func (c *CLI) newTestCmd() *cobra.Command {
 		Short: "Build and run one monitor callback locally",
 		Args:  exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return c.test(cmd.Context(), args[0], useStored, duration)
+			return c.test(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), args[0], useStored, duration)
 		},
 	}
 	cmd.Flags().BoolVar(&useStored, "stored-state", false, "start from the deployed monitor's stored state")
@@ -43,7 +44,7 @@ func (c *CLI) newTestCmd() *cobra.Command {
 	return cmd
 }
 
-func (c *CLI) test(parent context.Context, target string, useStored bool, duration time.Duration) error {
+func (c *CLI) test(parent context.Context, out, errOut io.Writer, target string, useStored bool, duration time.Duration) error {
 	if duration <= 0 {
 		return fmt.Errorf("--duration must be positive")
 	}
@@ -75,11 +76,11 @@ func (c *CLI) test(parent context.Context, target string, useStored bool, durati
 	}
 
 	binaryPath := filepath.Join(buildDir, "monitor")
-	fmt.Printf("building %s\n", dir)
+	fmt.Fprintf(out, "building %s\n", dir)
 	build := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, ".")
 	build.Dir = dir
 	build.Env = append(os.Environ(), "GOWORK=off")
-	build.Stderr = os.Stderr
+	build.Stderr = errOut
 	if err := build.Run(); err != nil {
 		return fmt.Errorf("build failed: %w", err)
 	}
@@ -120,17 +121,17 @@ func (c *CLI) test(parent context.Context, target string, useStored bool, durati
 		}
 	}
 
-	fmt.Printf("monitor  %s (%s, state v%d)\n", name, described.Info.Name, described.StateVersion)
-	fmt.Printf("state in %s\n\n", compactJSON(before))
+	fmt.Fprintf(out, "monitor  %s (%s, state v%d)\n", name, described.Info.Name, described.StateVersion)
+	fmt.Fprintf(out, "state in %s\n\n", compactJSON(before))
 
-	after, status, err := runLocal(ctx, binaryPath, dir, name, before, described.Plan, workerSecrets, monitorConfig)
+	after, status, err := runLocal(ctx, out, errOut, binaryPath, dir, name, before, described.Plan, workerSecrets, monitorConfig)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("\nstate out %s\n", compactJSON(after))
+	fmt.Fprintf(out, "\nstate out %s\n", compactJSON(after))
 	if string(before) != string(after) && len(after) > 0 {
-		fmt.Println("state would be saved (differs from input)")
+		fmt.Fprintln(out, "state would be saved (differs from input)")
 	}
 	if status == "failure" {
 		return fmt.Errorf("monitor callback failed")
@@ -142,6 +143,7 @@ func (c *CLI) test(parent context.Context, target string, useStored bool, durati
 // runLocal drives a worker through one local callback and streams its output.
 func runLocal(
 	ctx context.Context,
+	out, errOut io.Writer,
 	binaryPath string,
 	dir string,
 	name model.MonitorName,
@@ -153,7 +155,7 @@ func runLocal(
 	cmd := exec.CommandContext(ctx, binaryPath, monitord.FlagWorker)
 	cmd.Dir = dir
 	cmd.Env = monitor.Env()
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = errOut
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -197,7 +199,7 @@ func runLocal(
 
 		var msg monitord.WorkerFrame
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
-			fmt.Println(line)
+			fmt.Fprintln(out, line)
 
 			continue
 		}
@@ -209,13 +211,13 @@ func runLocal(
 			}
 			started = true
 		case "ready":
-			fmt.Println("ready")
+			fmt.Fprintln(out, "ready")
 		case "transaction":
 			if monitord.HashTransactionFrame(*msg.Transaction) != mustHash(msg.Transaction.PayloadHash) {
 				return nil, "", fmt.Errorf("worker transaction hash mismatch")
 			}
 			for _, event := range msg.Transaction.Events {
-				fmt.Printf("[event/%s] %s: %s\n          id=%s\n          would deliver to %d destination(s)\n", event.Severity, event.Title, event.Body, event.ID, len(config.Deliveries))
+				fmt.Fprintf(out, "[event/%s] %s: %s\n          id=%s\n          would deliver to %d destination(s)\n", event.Severity, event.Title, event.Body, event.ID, len(config.Deliveries))
 			}
 			current = append(current[:0], msg.Transaction.NextState...)
 			revision++
@@ -229,7 +231,7 @@ func runLocal(
 		case "stopped":
 			if msg.Stopped.Error != "" {
 				status = "failure"
-				fmt.Printf("[callback] failed: %s\n", msg.Stopped.Error)
+				fmt.Fprintf(out, "[callback] failed: %s\n", msg.Stopped.Error)
 			}
 			_ = stdin.Close()
 			_ = cmd.Wait()

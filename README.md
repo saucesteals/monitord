@@ -82,7 +82,7 @@ The worker retains the exact unacknowledged transaction bytes. If an ACK is lost
 
 ## Events and delivery
 
-`Event.ID` is an immutable source occurrence ID. Replaying the same ID and payload coalesces; reusing it for different content conflicts. Monitors suppress repeated conditions in their durable state, keeping delivery semantics explicit.
+`Event.ID` is an immutable source occurrence ID. Replaying the same ID and payload coalesces; reusing it for different content conflicts. Monitors suppress repeated conditions in their durable state, keeping delivery semantics explicit. monitord timestamps an event when it enters the durable outbox, so wall-clock delivery metadata cannot change occurrence identity.
 
 Events enter a durable per-destination outbox in the same SQLite commit. Delivery is at least once: a destination may receive a duplicate if it accepted a request immediately before the daemon lost the success marker. Retries, partial destination success, leases, and dead letters are independent of worker lifetime.
 
@@ -121,11 +121,13 @@ monitord inspect shop-restock
 monitord state get shop-restock
 monitord events list shop-restock
 monitord pause shop-restock
-monitord resume shop-restock
+monitord resume shop-restock --persistent
 monitord archive shop-restock
 monitord purge shop-restock         # permanently delete archived data
 ```
 
 Deploying an existing name preserves its immutable deployment ID and state while activating a new artifact and worker generation. Manual state changes fence the old generation. Inactive and archived deployments continue draining already committed outbox rows.
+
+Built binaries live in a global content-addressed cache. A failed deployment may leave a reusable cache entry on disk, but never creates a visible artifact or deployment row in SQLite.
 
 State schema version and concurrency revision are separate. Implement `StateVersion() int` and `MigrateState(from int, raw json.RawMessage) error` when changing the stored shape; deploy validates and migrates before activation.

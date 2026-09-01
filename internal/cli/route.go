@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/saucesteals/monitord/internal/model"
@@ -37,7 +38,7 @@ func (c *CLI) newRouteCreateCmd() *cobra.Command {
 		Short: "Create or update an OpenClaw agent route",
 		Args:  exactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return c.createOpenClawRoute(cmd.Context(), args[0], args[1], options)
+			return c.createOpenClawRoute(cmd.Context(), cmd.OutOrStdout(), args[0], args[1], options)
 		},
 	}
 	cmd.Flags().StringArrayVar(&options, "option", nil, "route setting as key=value (repeatable)")
@@ -45,7 +46,7 @@ func (c *CLI) newRouteCreateCmd() *cobra.Command {
 	return cmd
 }
 
-func (c *CLI) createOpenClawRoute(ctx context.Context, rawKind string, rawName string, values []string) error {
+func (c *CLI) createOpenClawRoute(ctx context.Context, out io.Writer, rawKind string, rawName string, values []string) error {
 	if rawKind != "openclaw" {
 		return fmt.Errorf("only openclaw agent routes are supported")
 	}
@@ -81,7 +82,7 @@ func (c *CLI) createOpenClawRoute(ctx context.Context, rawKind string, rawName s
 		return err
 	}
 
-	fmt.Printf("agent route %s created\n", name)
+	fmt.Fprintf(out, "agent route %s created\n", name)
 
 	return nil
 }
@@ -107,7 +108,7 @@ func (c *CLI) newRouteListCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				fmt.Printf("%-28s %s\n", item.Name, description)
+				fmt.Fprintf(cmd.OutOrStdout(), "%-28s %s\n", item.Name, description)
 			}
 
 			return nil
@@ -142,7 +143,7 @@ func (c *CLI) newRouteTestCmd() *cobra.Command {
 				return err
 			}
 
-			fmt.Printf("sent test notification to %s\n", route.Name)
+			fmt.Fprintf(cmd.OutOrStdout(), "sent test notification to %s\n", route.Name)
 
 			return nil
 		},

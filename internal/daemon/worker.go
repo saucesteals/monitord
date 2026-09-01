@@ -75,7 +75,7 @@ func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDe
 	go func() { w.done <- cmd.Wait() }()
 	go w.readLoop()
 	hello := monitord.Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: dep.ID, DeploymentName: dep.Name, Generation: uint64(generation.Generation), WorkerToken: hex.EncodeToString(generation.WorkerToken), ArtifactHash: dep.ArtifactHash, ConfigHash: dep.ConfigHash, StateRevision: dep.StateRevision, State: dep.State, Checkpoints: dep.Checkpoints, Secrets: secrets}
-	if err = w.send(monitord.DaemonFrame{Type: "hello", Hello: &hello}); err != nil {
+	if err = w.send(ctx, monitord.DaemonFrame{Type: "hello", Hello: &hello}); err != nil {
 		w.kill()
 		return nil, err
 	}
@@ -111,7 +111,7 @@ func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDe
 		w.kill()
 		return nil, errors.New("worker monitor frame differs from persisted artifact description")
 	}
-	if err = w.send(monitord.DaemonFrame{Type: "start", Start: &monitord.Start{Plan: persisted.Plan}}); err != nil {
+	if err = w.send(ctx, monitord.DaemonFrame{Type: "start", Start: &monitord.Start{Plan: persisted.Plan}}); err != nil {
 		w.kill()
 		return nil, err
 	}
@@ -174,9 +174,6 @@ func (w *worker) transaction(ctx context.Context, store *storage.Store, wire mon
 	}
 	events := make([]storage.OutboxEvent, 0, len(wire.Events))
 	for i, event := range wire.Events {
-		if event.Time.IsZero() {
-			event.Time = time.Now().UTC()
-		}
 		payload, err := json.Marshal(event)
 		if err != nil {
 			return err
@@ -196,7 +193,7 @@ func (w *worker) transaction(ctx context.Context, store *storage.Store, wire mon
 	if err != nil {
 		return err
 	}
-	return w.send(monitord.DaemonFrame{Type: "ack", Ack: &monitord.TransactionAck{DeploymentID: ack.DeploymentID, Generation: uint64(ack.Generation), Sequence: uint64(ack.Sequence), PayloadHash: wire.PayloadHash, ResultRevision: ack.ResultRevision, Status: ack.Status}})
+	return w.send(ctx, monitord.DaemonFrame{Type: "ack", Ack: &monitord.TransactionAck{DeploymentID: ack.DeploymentID, Generation: uint64(ack.Generation), Sequence: uint64(ack.Sequence), PayloadHash: wire.PayloadHash, ResultRevision: ack.ResultRevision, Status: ack.Status}})
 }
 
 func verifyWireHash(frame monitord.TransactionFrame) error {
@@ -207,7 +204,7 @@ func verifyWireHash(frame monitord.TransactionFrame) error {
 	}
 	return nil
 }
-func (w *worker) send(v monitord.DaemonFrame) error {
+func (w *worker) send(ctx context.Context, v monitord.DaemonFrame) error {
 	if err := v.Validate(); err != nil {
 		return err
 	}
@@ -219,10 +216,22 @@ func (w *worker) send(v monitord.DaemonFrame) error {
 	if len(raw) > monitord.MaxFrameBytes {
 		return errors.New("outbound frame too large")
 	}
-	w.writeMu.Lock()
-	defer w.writeMu.Unlock()
-	_, err = w.in.Write(raw)
-	return err
+	result := make(chan error, 1)
+	go func() {
+		w.writeMu.Lock()
+		defer w.writeMu.Unlock()
+		_, writeErr := io.Copy(w.in, bytes.NewReader(raw))
+		result <- writeErr
+	}()
+	select {
+	case err = <-result:
+		return err
+	case <-ctx.Done():
+		// Closing the pipe releases a write blocked on a worker that no longer
+		// reads stdin. The caller will retire this worker.
+		_ = w.in.Close()
+		return ctx.Err()
+	}
 }
 func (w *worker) read(ctx context.Context) (monitord.WorkerFrame, error) {
 	select {
@@ -234,8 +243,20 @@ func (w *worker) read(ctx context.Context) (monitord.WorkerFrame, error) {
 }
 func (w *worker) readLoop() {
 	for {
-		raw, err := w.out.ReadBytes('\n')
-		if err != nil {
+		raw := make([]byte, 0, 64<<10)
+		for {
+			part, err := w.out.ReadSlice('\n')
+			if len(raw)+len(part) > monitord.MaxFrameBytes {
+				w.readCh <- readResult{err: errors.New("protocol frame exceeds maximum size")}
+				return
+			}
+			raw = append(raw, part...)
+			if err == nil {
+				break
+			}
+			if errors.Is(err, bufio.ErrBufferFull) {
+				continue
+			}
 			w.readCh <- readResult{err: err}
 			return
 		}
@@ -248,7 +269,7 @@ func (w *worker) readLoop() {
 }
 func (w *worker) stop(ctx context.Context, reason string) error {
 	deadline, _ := ctx.Deadline()
-	_ = w.send(monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: reason, Deadline: deadline.UTC().Format(time.RFC3339Nano)}})
+	_ = w.send(ctx, monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: reason, Deadline: deadline.UTC().Format(time.RFC3339Nano)}})
 	select {
 	case err := <-w.done:
 		return err

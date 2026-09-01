@@ -24,17 +24,6 @@ type ActiveGeneration struct {
 	WorkerToken  []byte
 }
 
-func hashToken(token []byte) []byte {
-	sum := sha256.Sum256(token)
-	return sum[:]
-}
-
-func (s *Store) generationAuthorized(ctx context.Context, id string, generation int64, token []byte) (bool, error) {
-	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM deployments d JOIN deployment_generations g ON g.deployment_id=d.id AND g.generation=d.active_generation WHERE d.id=? AND d.status='active' AND g.generation=? AND g.status='active' AND g.worker_token_hash=?`, id, generation, hashToken(token)).Scan(&count)
-	return count == 1, err
-}
-
 // ActivateGeneration advances the deployment fence before its worker is started.
 // The returned token is the only plaintext copy; SQLite retains only its hash.
 func (s *Store) ActivateGeneration(ctx context.Context, activation GenerationActivation) (ActiveGeneration, error) {

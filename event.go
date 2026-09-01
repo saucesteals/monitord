@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 )
 
 const (
@@ -28,7 +27,6 @@ type Event struct {
 	Title    string            `json:"title"`
 	Body     string            `json:"body,omitempty"`
 	URL      string            `json:"url,omitempty"`
-	Time     time.Time         `json:"time"`
 	Data     map[string]string `json:"data,omitempty"`
 }
 

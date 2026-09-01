@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/saucesteals/monitord/internal/storage"
@@ -75,15 +76,21 @@ func (d *Daemon) stopWorkers() {
 	}
 	d.workers = map[string]*workerSlot{}
 	d.workersMu.Unlock()
+	var stopping sync.WaitGroup
 	for _, slot := range slots {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if slot.worker != nil {
-			_ = slot.worker.stop(ctx, "daemon shutdown")
-		}
-		cancel()
-		if slot.cancel != nil {
-			slot.cancel()
-		}
+		stopping.Add(1)
+		go func(slot *workerSlot) {
+			defer stopping.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if slot.worker != nil {
+				_ = slot.worker.stop(ctx, "daemon shutdown")
+			}
+			if slot.cancel != nil {
+				slot.cancel()
+			}
+		}(slot)
 	}
+	stopping.Wait()
 	d.wg.Wait()
 }

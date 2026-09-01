@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"io"
 
 	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/storage"
@@ -13,13 +14,13 @@ func (c *CLI) newInitCmd() *cobra.Command {
 		Use:   "init",
 		Short: "Initialize the monitord root",
 		Args:  noArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return c.init()
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return c.init(cmd.OutOrStdout())
 		},
 	}
 }
 
-func (c *CLI) init() error {
+func (c *CLI) init(out io.Writer) error {
 	paths, err := config.Init(c.root)
 	if err != nil {
 		return err
@@ -30,7 +31,7 @@ func (c *CLI) init() error {
 	}
 	defer func() { _ = store.Close() }()
 
-	fmt.Printf("initialized %s\n", paths.Root)
+	fmt.Fprintf(out, "initialized %s\n", paths.Root)
 
 	return nil
 }

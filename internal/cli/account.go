@@ -32,7 +32,7 @@ func (c *CLI) newAccountListCmd() *cobra.Command {
 				return err
 			}
 			for _, account := range accounts {
-				fmt.Printf("%s\t%s\n", account.Kind, account.Name)
+				fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\n", account.Kind, account.Name)
 			}
 
 			return nil
@@ -50,7 +50,7 @@ func (c *CLI) newAccountRemoveCmd() *cobra.Command {
 				return err
 			}
 
-			fmt.Printf("removed %s account %s from Keychain\n", args[0], args[1])
+			fmt.Fprintf(cmd.OutOrStdout(), "removed %s account %s from Keychain\n", args[0], args[1])
 
 			return nil
 		},
@@ -72,7 +72,7 @@ func (c *CLI) newAccountSetCmd() *cobra.Command {
 				return err
 			}
 
-			fmt.Printf("stored %s account %s in Keychain\n", args[0], args[1])
+			fmt.Fprintf(cmd.OutOrStdout(), "stored %s account %s in Keychain\n", args[0], args[1])
 
 			return nil
 		},

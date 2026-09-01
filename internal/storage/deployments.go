@@ -31,18 +31,19 @@ type Deployment struct {
 // DeployInput is the complete durable snapshot produced by one deploy. The
 // deployment and its destinations become visible together or not at all.
 type DeployInput struct {
-	Name, InfoName, SourceDir, ArtifactID, ConfigHash string
-	State                                             json.RawMessage
-	StateVersion                                      int
-	ExpiresAt                                         *time.Time
-	Destinations                                      []json.RawMessage
+	Name, InfoName, SourceDir, ConfigHash string
+	Artifact                              Artifact
+	State                                 json.RawMessage
+	StateVersion                          int
+	ExpiresAt                             *time.Time
+	Destinations                          []json.RawMessage
 	// ExpectedStateRevision prevents a build from overwriting state committed
 	// while it was compiling. Nil means this is a new deployment.
 	ExpectedStateRevision *int64
 }
 
 func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) {
-	if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.InfoName) == "" || in.ArtifactID == "" || in.ConfigHash == "" || !json.Valid(in.State) || in.StateVersion < 1 || len(in.Destinations) == 0 {
+	if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.InfoName) == "" || in.ConfigHash == "" || !json.Valid(in.State) || in.StateVersion < 1 || len(in.Destinations) == 0 {
 		return Deployment{}, errors.New("deploy requires name, info, artifact, config hash, and valid versioned state")
 	}
 	for _, destination := range in.Destinations {
@@ -55,6 +56,10 @@ func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) 
 		return Deployment{}, err
 	}
 	defer tx.Rollback()
+	artifact, err := putArtifact(ctx, tx, in.Artifact)
+	if err != nil {
+		return Deployment{}, err
+	}
 
 	now := time.Now().UTC()
 	nowMS := toMs(now)
@@ -75,7 +80,7 @@ func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) 
 			return Deployment{}, err
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO deployments(id,name,info_name,source_dir,status,artifact_id,config_revision,config_hash,state,state_version,created_at,updated_at,expires_at)
-			VALUES(?,?,?,?, 'active', ?,1,?,?,?,?,?,?)`, id, in.Name, in.InfoName, in.SourceDir, in.ArtifactID, in.ConfigHash, in.State, in.StateVersion, nowMS, nowMS, expires)
+			VALUES(?,?,?,?, 'active', ?,1,?,?,?,?,?,?)`, id, in.Name, in.InfoName, in.SourceDir, artifact.ID, in.ConfigHash, in.State, in.StateVersion, nowMS, nowMS, expires)
 	case err != nil:
 		return Deployment{}, err
 	default:
@@ -89,7 +94,7 @@ func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) 
 		if oldHash != in.ConfigHash {
 			revisionBump = 1
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE deployments SET info_name=?,source_dir=?,artifact_id=?,config_hash=?,config_revision=config_revision+?,active_generation=0,state=?,state_version=?,state_revision=state_revision+1,status='active',expires_at=?,archived_at=NULL,updated_at=? WHERE id=?`, in.InfoName, in.SourceDir, in.ArtifactID, in.ConfigHash, revisionBump, in.State, in.StateVersion, expires, nowMS, id)
+		_, err = tx.ExecContext(ctx, `UPDATE deployments SET info_name=?,source_dir=?,artifact_id=?,config_hash=?,config_revision=config_revision+?,active_generation=0,state=?,state_version=?,state_revision=state_revision+1,status='active',expires_at=?,archived_at=NULL,updated_at=? WHERE id=?`, in.InfoName, in.SourceDir, artifact.ID, in.ConfigHash, revisionBump, in.State, in.StateVersion, expires, nowMS, id)
 	}
 	if err != nil {
 		return Deployment{}, fmt.Errorf("deploy: %w", err)

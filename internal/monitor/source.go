@@ -98,9 +98,9 @@ func main() {
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
-	http "github.com/saucesteals/fhttp"
 	"github.com/saucesteals/monitord"
 )
 
@@ -137,8 +137,4 @@ func check(ctx context.Context, session *monitord.Session[State]) error {
 }
 
 const scaffoldConfig = `ttl: 24h
-deliveries:
-  - discord:
-      account: jarvis
-      channel_id: "CHANNEL_ID"
 `

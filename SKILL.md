@@ -62,7 +62,7 @@ Choose `Every(interval, fn)` for polling and `Continuous(fn)` for streams. A mon
 
 ## Event identity
 
-Use an immutable occurrence identifier for `Event.ID`, such as a chain/log identity or source record ID. A recurring condition needs a new occurrence ID. Suppress repeated conditions using durable monitor state. Delivery is durable and at least once per destination; do not promise external exactly-once behavior.
+Use an immutable occurrence identifier for `Event.ID`, such as a chain/log identity or source record ID. A recurring condition needs a new occurrence ID. Suppress repeated conditions using durable monitor state. monitord assigns the durable outbox timestamp; do not put wall-clock presentation metadata into occurrence identity. Delivery is durable and at least once per destination; do not promise external exactly-once behavior.
 
 ## Secrets
 
@@ -76,7 +76,7 @@ monitord inspect <name-or-full-id>
 monitord state get|set|clear <name-or-full-id>
 monitord events list <name-or-full-id>
 monitord pause <name-or-full-id>
-monitord resume <name-or-full-id>
+monitord resume <name-or-full-id> --persistent
 monitord archive <name-or-full-id>
 monitord purge <name-or-full-id>
 ```

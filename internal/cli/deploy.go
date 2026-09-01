@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/saucesteals/monitord/internal/model"
@@ -26,14 +27,14 @@ func (c *CLI) newDeployCmd() *cobra.Command {
 			if len(args) == 1 {
 				target = args[0]
 			}
-			return c.deploy(cmd.Context(), target, name)
+			return c.deploy(cmd.Context(), cmd.OutOrStdout(), target, name)
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "deployment name (defaults to source directory)")
 	return cmd
 }
 
-func (c *CLI) deploy(ctx context.Context, target, overrideName string) error {
+func (c *CLI) deploy(ctx context.Context, out io.Writer, target, overrideName string) error {
 	store, paths, err := c.store()
 	if err != nil {
 		return err
@@ -56,6 +57,9 @@ func (c *CLI) deploy(ctx context.Context, target, overrideName string) error {
 	}
 
 	existing, existingErr := store.GetDeployment(ctx, monitorName.String())
+	if existingErr == nil && existing.Status == "archived" {
+		return errors.New("archived deployments cannot be redeployed; purge it or choose another name")
+	}
 	req := monitor.Request{
 		Dir:    dir,
 		Name:   monitorName,
@@ -79,10 +83,6 @@ func (c *CLI) deploy(ctx context.Context, target, overrideName string) error {
 	}
 
 	built, err := monitor.Build(ctx, paths, req)
-	if err != nil {
-		return err
-	}
-	artifact, err := store.PutArtifact(ctx, built.Artifact)
 	if err != nil {
 		return err
 	}
@@ -113,7 +113,7 @@ func (c *CLI) deploy(ctx context.Context, target, overrideName string) error {
 	}
 	deployed, err := store.Deploy(ctx, storage.DeployInput{
 		Name: monitorName.String(), InfoName: built.Description.Info.Name,
-		SourceDir: dir, ArtifactID: artifact.ID, ConfigHash: configHash,
+		SourceDir: dir, Artifact: built.Artifact, ConfigHash: configHash,
 		State: built.State, StateVersion: built.Description.StateVersion,
 		ExpiresAt: expires, Destinations: destinations,
 		ExpectedStateRevision: expectedStateRevision,
@@ -121,13 +121,13 @@ func (c *CLI) deploy(ctx context.Context, target, overrideName string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("deployed %s (%s)\n", deployed.Name, deployed.ID)
-	fmt.Printf("source   %s\nartifact %s\nplan     %s\n", dir, artifact.Path, built.Description.Plan.Kind)
+	fmt.Fprintf(out, "deployed %s (%s)\n", deployed.Name, deployed.ID)
+	fmt.Fprintf(out, "source   %s\nartifact %s\nplan     %s\n", dir, built.Artifact.Path, built.Description.Plan.Kind)
 	for _, delivery := range monitorConfig.Deliveries {
-		fmt.Printf("delivery %s\n", truncate(delivery.Describe(), 80))
+		fmt.Fprintf(out, "delivery %s\n", truncate(delivery.Describe(), 80))
 	}
 	if req.CurrentVersion != 0 && req.CurrentVersion != built.Description.StateVersion {
-		fmt.Printf("state migrated v%d -> v%d\n", req.CurrentVersion, built.Description.StateVersion)
+		fmt.Fprintf(out, "state migrated v%d -> v%d\n", req.CurrentVersion, built.Description.StateVersion)
 	}
 
 	return nil

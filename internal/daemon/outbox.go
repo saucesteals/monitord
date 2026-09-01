@@ -39,7 +39,7 @@ func (s daemonDeliverySender) Send(ctx context.Context, delivery storage.Claimed
 	if err := json.Unmarshal(delivery.EventPayload, &event); err != nil {
 		return permanentDeliveryError{fmt.Errorf("decode event: %w", err)}
 	}
-	return s.daemon.deliverRoute(ctx, binding, eventMessage(delivery.DeploymentName, event))
+	return s.daemon.deliverRoute(ctx, binding, eventMessage(delivery.DeploymentName, delivery.CreatedAt, event))
 }
 
 type permanentDeliveryError struct{ error }
@@ -47,11 +47,11 @@ type permanentDeliveryError struct{ error }
 func (permanentDeliveryError) Permanent() bool           { return true }
 func (permanentDeliveryError) RetryAfter() time.Duration { return 0 }
 
-func eventMessage(deployment string, event monitord.Event) routes.Message {
+func eventMessage(deployment string, createdAt time.Time, event monitord.Event) routes.Message {
 	return routes.Message{
 		Title: event.Title, Message: event.Body, URL: event.URL,
 		Level: eventLevel(event.Severity), Fields: dataFields(event.Data),
-		Footer: deployment, Time: event.Time,
+		Footer: deployment, Time: createdAt,
 	}
 }
 
@@ -84,9 +84,13 @@ func (w *outboxWorker) process(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	var joined error
+	results := make(chan error, len(claimed))
 	for _, delivery := range claimed {
-		if err := w.sendOne(ctx, delivery); err != nil {
+		go func() { results <- w.sendOne(ctx, delivery) }()
+	}
+	var joined error
+	for range claimed {
+		if err := <-results; err != nil {
 			joined = errors.Join(joined, err)
 		}
 	}
@@ -94,23 +98,32 @@ func (w *outboxWorker) process(ctx context.Context) (int, error) {
 }
 
 func (w *outboxWorker) sendOne(ctx context.Context, delivery storage.ClaimedDelivery) error {
-	err := w.sender.Send(ctx, delivery)
+	attemptCtx, cancel := context.WithTimeout(ctx, deliveryAttemptTimeout)
+	result := make(chan error, 1)
+	go func() { result <- w.sender.Send(attemptCtx, delivery) }()
+	var err error
+	select {
+	case err = <-result:
+	case <-attemptCtx.Done():
+		err = attemptCtx.Err()
+	}
+	cancel()
 	now := w.now()
 	if err == nil {
-		return w.store.MarkDelivered(ctx, delivery.OutboxID, delivery.DestinationID, w.owner, now)
+		return w.store.MarkDelivered(ctx, delivery.OutboxID, delivery.DestinationID, delivery.LeaseOwner, now)
 	}
 	maxAttempts := math.MaxInt
 	delay := retryDelay(delivery.AttemptCount)
 	var classified deliveryError
 	if errors.As(err, &classified) {
 		if classified.Permanent() {
-			maxAttempts = 3
+			maxAttempts = 1
 		}
 		if after := classified.RetryAfter(); after > 0 {
 			delay = min(after, outboxMaxBackoff)
 		}
 	}
-	if markErr := w.store.MarkDeliveryFailed(ctx, delivery.OutboxID, delivery.DestinationID, w.owner, err.Error(), now, now.Add(delay), maxAttempts); markErr != nil {
+	if markErr := w.store.MarkDeliveryFailed(ctx, delivery.OutboxID, delivery.DestinationID, delivery.LeaseOwner, err.Error(), now, now.Add(delay), maxAttempts); markErr != nil {
 		return errors.Join(fmt.Errorf("send %s/%s: %w", delivery.OutboxID, delivery.DestinationID, err), markErr)
 	}
 	return nil

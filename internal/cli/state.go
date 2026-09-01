@@ -35,12 +35,12 @@ func (c *CLI) newStateGetCmd() *cobra.Command {
 		Short: "Print stored monitor state as JSON",
 		Args:  exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return c.stateGet(cmd.Context(), args[0])
+			return c.stateGet(cmd.Context(), cmd.OutOrStdout(), args[0])
 		},
 	}
 }
 
-func (c *CLI) stateGet(ctx context.Context, selector string) error {
+func (c *CLI) stateGet(ctx context.Context, out io.Writer, selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
@@ -52,7 +52,7 @@ func (c *CLI) stateGet(ctx context.Context, selector string) error {
 		return err
 	}
 
-	fmt.Println(indentJSON(m.State))
+	fmt.Fprintln(out, indentJSON(m.State))
 
 	return nil
 }
@@ -67,13 +67,13 @@ func (c *CLI) newStateSetCmd() *cobra.Command {
 		Short: "Replace stored monitor state",
 		Args:  exactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return c.stateSet(cmd.Context(), args[0], args[1])
+			return c.stateSet(cmd.Context(), cmd.InOrStdin(), cmd.OutOrStdout(), args[0], args[1])
 		},
 	}
 }
 
-func (c *CLI) stateSet(ctx context.Context, selector string, source string) error {
-	raw, err := readStateFile(source)
+func (c *CLI) stateSet(ctx context.Context, in io.Reader, out io.Writer, selector string, source string) error {
+	raw, err := readStateFile(in, source)
 	if err != nil {
 		return err
 	}
@@ -105,7 +105,7 @@ func (c *CLI) stateSet(ctx context.Context, selector string, source string) erro
 		return err
 	}
 
-	fmt.Printf("state updated for %s (version %d, %d bytes)\n", m.Name, m.StateVersion, len(canonical))
+	fmt.Fprintf(out, "state updated for %s (version %d, %d bytes)\n", m.Name, m.StateVersion, len(canonical))
 
 	return nil
 }
@@ -116,12 +116,12 @@ func (c *CLI) newStateClearCmd() *cobra.Command {
 		Short: "Reset stored monitor state",
 		Args:  exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return c.stateClear(cmd.Context(), args[0])
+			return c.stateClear(cmd.Context(), cmd.OutOrStdout(), args[0])
 		},
 	}
 }
 
-func (c *CLI) stateClear(ctx context.Context, selector string) error {
+func (c *CLI) stateClear(ctx context.Context, out io.Writer, selector string) error {
 	store, _, err := c.store()
 	if err != nil {
 		return err
@@ -143,14 +143,14 @@ func (c *CLI) stateClear(ctx context.Context, selector string) error {
 		return err
 	}
 
-	fmt.Printf("state cleared for %s (version %d, %d bytes)\n", m.Name, m.StateVersion, len(defaults))
+	fmt.Fprintf(out, "state cleared for %s (version %d, %d bytes)\n", m.Name, m.StateVersion, len(defaults))
 
 	return nil
 }
 
-func readStateFile(path string) ([]byte, error) {
+func readStateFile(in io.Reader, path string) ([]byte, error) {
 	if path == "-" {
-		raw, err := io.ReadAll(os.Stdin)
+		raw, err := io.ReadAll(in)
 		if err != nil {
 			return nil, fmt.Errorf("read state from stdin: %w", err)
 		}

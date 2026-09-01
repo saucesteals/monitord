@@ -44,12 +44,23 @@ func runCallback(ctx context.Context, timeout time.Duration, callback func(conte
 	if timeout > 0 {
 		callbackCtx, cancel = context.WithTimeout(ctx, timeout)
 	}
-	err := safeCallback(func() error { return callback(callbackCtx) })
-	cancel()
-	if ctx.Err() != nil {
-		return nil
+	result := make(chan error, 1)
+	go func() { result <- safeCallback(func() error { return callback(callbackCtx) }) }()
+	select {
+	case err := <-result:
+		cancel()
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	case <-callbackCtx.Done():
+		err := callbackCtx.Err()
+		cancel()
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("callback deadline exceeded: %w", err)
 	}
-	return err
 }
 
 func safeCallback(fn func() error) (err error) {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -196,6 +197,20 @@ type discordPayload struct {
 	AllowedMentions allowedMentions `json:"allowed_mentions"`
 }
 
+// HTTPError classifies a Discord response for durable delivery retries.
+type HTTPError struct {
+	StatusCode int
+	retryAfter time.Duration
+}
+
+func (e *HTTPError) Error() string { return fmt.Sprintf("discord returned HTTP %d", e.StatusCode) }
+func (e *HTTPError) Permanent() bool {
+	return e.StatusCode >= 400 && e.StatusCode < 500 &&
+		e.StatusCode != http.StatusRequestTimeout && e.StatusCode != http.StatusConflict &&
+		e.StatusCode != http.StatusTooEarly && e.StatusCode != http.StatusTooManyRequests
+}
+func (e *HTTPError) RetryAfter() time.Duration { return e.retryAfter }
+
 // Discord's documented limits.
 const (
 	maxTitle       = 256
@@ -247,10 +262,18 @@ func sendDiscord(ctx context.Context, endpoint string, authorization string, msg
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("discord returned HTTP %d", resp.StatusCode)
+		return &HTTPError{StatusCode: resp.StatusCode, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 
 	return nil
+}
+
+func parseRetryAfter(value string) time.Duration {
+	seconds, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil || seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds * float64(time.Second))
 }
 
 func validateDiscordWebhookURL(raw string) error {

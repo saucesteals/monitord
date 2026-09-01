@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -20,7 +21,7 @@ func (c *CLI) newDaemonCmd() *cobra.Command {
 		Short: "Run the monitor scheduler",
 		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return c.daemon(cmd.Context(), interval)
+			return c.daemon(cmd.Context(), cmd.OutOrStdout(), interval)
 		},
 	}
 	cmd.Flags().DurationVar(&interval, "interval", daemon.DefaultInterval, "maximum time to sleep while idle; scheduling itself is exact")
@@ -28,7 +29,7 @@ func (c *CLI) newDaemonCmd() *cobra.Command {
 	return cmd
 }
 
-func (c *CLI) daemon(parent context.Context, interval time.Duration) error {
+func (c *CLI) daemon(parent context.Context, out io.Writer, interval time.Duration) error {
 	store, paths, err := c.store()
 	if err != nil {
 		return err
@@ -42,7 +43,7 @@ func (c *CLI) daemon(parent context.Context, interval time.Duration) error {
 	// stderr to keep command output pipeable. That leaves stderr for genuine
 	// process failures, so a non-empty error log is a real signal rather than
 	// a copy of every INFO line.
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	return daemon.New(store, paths, logger, interval).Run(ctx)
 }

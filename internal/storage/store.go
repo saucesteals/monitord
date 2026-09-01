@@ -116,19 +116,6 @@ func toRoute(r db.Route) (Route, error) {
 }
 func toMs(t time.Time) int64    { return t.UTC().UnixMilli() }
 func fromMs(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
-func nullMs(t *time.Time) sql.NullInt64 {
-	if t == nil {
-		return sql.NullInt64{}
-	}
-	return sql.NullInt64{Int64: toMs(*t), Valid: true}
-}
-func msPtr(n sql.NullInt64) *time.Time {
-	if !n.Valid {
-		return nil
-	}
-	t := fromMs(n.Int64)
-	return &t
-}
 func encodeOptions(o routes.Options) (string, error) {
 	if o == nil {
 		o = routes.Options{}

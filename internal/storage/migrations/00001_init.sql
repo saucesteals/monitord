@@ -98,12 +98,14 @@ CREATE TABLE outbox_events (
     payload_hash    BLOB NOT NULL,
     created_at      INTEGER NOT NULL,
     UNIQUE (deployment_id, event_id),
+    UNIQUE (outbox_id, deployment_id),
     FOREIGN KEY (deployment_id, generation, transaction_seq)
         REFERENCES transactions(deployment_id, generation, seq) DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
 CREATE TABLE outbox_deliveries (
-    outbox_id              TEXT NOT NULL REFERENCES outbox_events(outbox_id) ON DELETE CASCADE,
+    outbox_id              TEXT NOT NULL,
+    deployment_id          TEXT NOT NULL,
     destination_id         TEXT NOT NULL,
     destination_revision   INTEGER NOT NULL,
     status                 TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sending', 'delivered', 'dead')),
@@ -114,7 +116,11 @@ CREATE TABLE outbox_deliveries (
     delivered_at           INTEGER,
     last_error             TEXT NOT NULL DEFAULT '',
     dead_at                INTEGER,
-    PRIMARY KEY (outbox_id, destination_id)
+    PRIMARY KEY (outbox_id, destination_id),
+    FOREIGN KEY (outbox_id, deployment_id)
+        REFERENCES outbox_events(outbox_id, deployment_id) ON DELETE CASCADE,
+    FOREIGN KEY (deployment_id, destination_id, destination_revision)
+        REFERENCES destination_bindings(deployment_id, id, revision)
 ) STRICT;
 
 CREATE INDEX outbox_deliveries_ready

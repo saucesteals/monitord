@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +15,7 @@ type Artifact struct {
 	CreatedAt             time.Time
 }
 
-func (s *Store) PutArtifact(ctx context.Context, artifact Artifact) (Artifact, error) {
+func putArtifact(ctx context.Context, tx *sql.Tx, artifact Artifact) (Artifact, error) {
 	if artifact.ContentHash == "" || artifact.Path == "" || !json.Valid(artifact.Describe) {
 		return Artifact{}, errors.New("artifact requires hash, path, and valid describe JSON")
 	}
@@ -24,13 +25,13 @@ func (s *Store) PutArtifact(ctx context.Context, artifact Artifact) (Artifact, e
 	if artifact.CreatedAt.IsZero() {
 		artifact.CreatedAt = time.Now().UTC()
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO artifacts(id,content_hash,path,describe_json,created_at)
+	_, err := tx.ExecContext(ctx, `INSERT INTO artifacts(id,content_hash,path,describe_json,created_at)
 		VALUES(?,?,?,?,?) ON CONFLICT(content_hash) DO NOTHING`, artifact.ID, artifact.ContentHash,
 		artifact.Path, artifact.Describe, toMs(artifact.CreatedAt))
 	if err != nil {
 		return Artifact{}, fmt.Errorf("put artifact: %w", err)
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT id,content_hash,path,describe_json,created_at FROM artifacts WHERE content_hash=?`, artifact.ContentHash)
+	row := tx.QueryRowContext(ctx, `SELECT id,content_hash,path,describe_json,created_at FROM artifacts WHERE content_hash=?`, artifact.ContentHash)
 	var created int64
 	if err := row.Scan(&artifact.ID, &artifact.ContentHash, &artifact.Path, &artifact.Describe, &created); err != nil {
 		return Artifact{}, err

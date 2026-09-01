@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/model"
@@ -17,12 +18,12 @@ func (c *CLI) newNewMonitorCmd() *cobra.Command {
 		Short: "Scaffold a monitor",
 		Args:  exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return c.newMonitor(cmd.Context(), args[0])
+			return c.newMonitor(cmd.Context(), cmd.OutOrStdout(), args[0])
 		},
 	}
 }
 
-func (c *CLI) newMonitor(ctx context.Context, rawName string) error {
+func (c *CLI) newMonitor(ctx context.Context, out io.Writer, rawName string) error {
 	name, err := model.ParseMonitorName(rawName)
 	if err != nil {
 		return err
@@ -41,10 +42,10 @@ func (c *CLI) newMonitor(ctx context.Context, rawName string) error {
 		return err
 	}
 
-	fmt.Printf("created %s\n", dir)
-	fmt.Printf("edit the Go package and %s in %s, then:\n", monitor.ConfigFileName, dir)
-	fmt.Printf("  monitord test %s\n", name)
-	fmt.Printf("  monitord deploy %s\n", name)
+	fmt.Fprintf(out, "created %s\n", dir)
+	fmt.Fprintf(out, "edit the Go package and %s in %s, then:\n", monitor.ConfigFileName, dir)
+	fmt.Fprintf(out, "  monitord test %s\n", name)
+	fmt.Fprintf(out, "  monitord deploy %s\n", name)
 
 	return nil
 }

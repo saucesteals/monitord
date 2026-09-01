@@ -46,7 +46,7 @@ type ClaimedDelivery struct {
 	EventPayload, DestinationConfig                       json.RawMessage
 	AttemptCount                                          int
 	LeaseOwner                                            string
-	LeaseExpiresAt                                        time.Time
+	LeaseExpiresAt, CreatedAt                             time.Time
 }
 
 // ClaimOutbox atomically leases due rows. Completion is intentionally generation-independent.
@@ -59,8 +59,36 @@ func (s *Store) ClaimOutbox(ctx context.Context, owner string, now time.Time, le
 		return nil, err
 	}
 	defer tx.Rollback()
+	claimID, err := randomID()
+	if err != nil {
+		return nil, err
+	}
+	claimOwner := owner + ":" + claimID
 	expires := now.Add(lease)
-	rows, err := tx.QueryContext(ctx, `UPDATE outbox_deliveries SET status='sending',lease_owner=?,lease_expires_at=? WHERE rowid IN (SELECT d.rowid FROM outbox_deliveries d WHERE (d.status='pending' AND d.next_attempt_at<=?) OR (d.status='sending' AND d.lease_expires_at<=?) ORDER BY d.next_attempt_at LIMIT ?) RETURNING outbox_id,destination_id,destination_revision,attempt_count`, owner, toMs(expires), toMs(now), toMs(now), limit)
+	result, err := tx.ExecContext(ctx, `UPDATE outbox_deliveries SET status='sending',lease_owner=?,lease_expires_at=? WHERE rowid IN (SELECT d.rowid FROM outbox_deliveries d WHERE (d.status='pending' AND d.next_attempt_at<=?) OR (d.status='sending' AND d.lease_expires_at<=?) ORDER BY d.next_attempt_at LIMIT ?)`, claimOwner, toMs(expires), toMs(now), toMs(now), limit)
+	if err != nil {
+		return nil, err
+	}
+	claimed, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if claimed == 0 {
+		if err = tx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT d.outbox_id,e.deployment_id,p.name,d.destination_id,
+		       d.destination_revision,e.payload,b.config,d.attempt_count,e.created_at
+		FROM outbox_deliveries d
+		JOIN outbox_events e ON e.outbox_id=d.outbox_id AND e.deployment_id=d.deployment_id
+		JOIN deployments p ON p.id=e.deployment_id
+		JOIN destination_bindings b ON b.deployment_id=d.deployment_id
+		 AND b.id=d.destination_id AND b.revision=d.destination_revision
+		WHERE d.status='sending' AND d.lease_owner=? AND d.lease_expires_at=?
+		ORDER BY d.next_attempt_at`, claimOwner, toMs(expires))
 	if err != nil {
 		return nil, err
 	}
@@ -68,18 +96,21 @@ func (s *Store) ClaimOutbox(ctx context.Context, owner string, now time.Time, le
 	var out []ClaimedDelivery
 	for rows.Next() {
 		var d ClaimedDelivery
-		if err = rows.Scan(&d.OutboxID, &d.DestinationID, &d.DestinationRevision, &d.AttemptCount); err != nil {
+		var created int64
+		if err = rows.Scan(&d.OutboxID, &d.DeploymentID, &d.DeploymentName,
+			&d.DestinationID, &d.DestinationRevision, &d.EventPayload,
+			&d.DestinationConfig, &d.AttemptCount, &created); err != nil {
 			return nil, err
 		}
-		d.LeaseOwner = owner
+		d.LeaseOwner = claimOwner
 		d.LeaseExpiresAt = expires
-		err = tx.QueryRowContext(ctx, `SELECT e.deployment_id,p.name,e.payload,b.config FROM outbox_events e JOIN deployments p ON p.id=e.deployment_id JOIN destination_bindings b ON b.deployment_id=e.deployment_id AND b.id=? AND b.revision=? WHERE e.outbox_id=?`, d.DestinationID, d.DestinationRevision, d.OutboxID).Scan(&d.DeploymentID, &d.DeploymentName, &d.EventPayload, &d.DestinationConfig)
-		if err != nil {
-			return nil, err
-		}
+		d.CreatedAt = fromMs(created)
 		out = append(out, d)
 	}
 	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -121,7 +152,7 @@ func (s *Store) finishDelivery(ctx context.Context, outboxID, destinationID, own
 	return nil
 }
 func (s *Store) RetryDeadDelivery(ctx context.Context, outboxID, destinationID string, now time.Time) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE outbox_deliveries SET status='pending',next_attempt_at=?,dead_at=NULL,last_error='' WHERE outbox_id=? AND destination_id=? AND status='dead'`, toMs(now), outboxID, destinationID)
+	res, err := s.db.ExecContext(ctx, `UPDATE outbox_deliveries SET status='pending',attempt_count=0,next_attempt_at=?,dead_at=NULL,last_error='' WHERE outbox_id=? AND destination_id=? AND status='dead'`, toMs(now), outboxID, destinationID)
 	if err != nil {
 		return err
 	}

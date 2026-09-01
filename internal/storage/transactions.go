@@ -259,8 +259,8 @@ func insertOutboxEvent(ctx context.Context, tx *sql.Tx, frame TransactionFrame, 
 	for _, delivery := range event.Deliveries {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO outbox_deliveries (
-				outbox_id, destination_id, destination_revision, next_attempt_at
-			) VALUES (?, ?, ?, ?)`, event.OutboxID, delivery.DestinationID,
+				outbox_id, deployment_id, destination_id, destination_revision, next_attempt_at
+			) VALUES (?, ?, ?, ?, ?)`, event.OutboxID, frame.DeploymentID, delivery.DestinationID,
 			delivery.DestinationRevision, toMs(now)); err != nil {
 			return fmt.Errorf("insert delivery %q: %w", delivery.DestinationID, err)
 		}

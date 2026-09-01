@@ -15,7 +15,8 @@ import (
 )
 
 const (
-	DefaultInterval = 5 * time.Second
+	DefaultInterval        = 5 * time.Second
+	deliveryAttemptTimeout = 30 * time.Second
 )
 
 type Daemon struct {
@@ -60,22 +61,42 @@ func (d *Daemon) run(ctx context.Context) error {
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
 	defer d.stopWorkers()
-	var outbox *outboxWorker
+	var outboxDone chan struct{}
 	if d.deliverySender != nil {
-		outbox = newOutboxWorker(d.store, d.deliverySender, fmt.Sprintf("daemon-%d", time.Now().UnixNano()))
+		outboxDone = make(chan struct{})
+		outbox := newOutboxWorker(d.store, d.deliverySender, fmt.Sprintf("daemon-%d", time.Now().UnixNano()))
+		go func() {
+			defer close(outboxDone)
+			d.runOutbox(ctx, outbox)
+		}()
 	}
+	defer func() {
+		if outboxDone != nil {
+			<-outboxDone
+		}
+	}()
 	for {
 		if err := d.reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			d.logger.Error("reconcile failed", "error", err)
 		}
-		if outbox != nil {
-			if _, err := outbox.process(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				d.logger.Error("outbox processing failed", "error", err)
-			}
-		}
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func (d *Daemon) runOutbox(ctx context.Context, outbox *outboxWorker) {
+	ticker := time.NewTicker(d.interval)
+	defer ticker.Stop()
+	for {
+		if _, err := outbox.process(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			d.logger.Error("outbox processing failed", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
 		}
 	}

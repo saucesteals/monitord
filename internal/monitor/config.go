@@ -95,10 +95,6 @@ func (raw fileConfig) validate() (Config, error) {
 		}
 	}
 
-	if len(raw.Deliveries) == 0 && len(raw.Routes) == 0 {
-		return Config{}, errors.New("at least one delivery is required")
-	}
-
 	deliveries := make([]routes.Delivery, 0, len(raw.Deliveries)+len(raw.Routes))
 	for index, item := range raw.Deliveries {
 		if item.Discord == nil {
