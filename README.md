@@ -2,7 +2,7 @@
 
 `monitord` runs small, stateful Go monitors while one daemon owns scheduling, durable state, worker generations, checkpoints, health, and at-least-once event delivery.
 
-V5 favors explicit monitor code over framework magic. A monitor declares one polling or continuous plan; optional lifecycle interfaces own reusable clients and connections; exact secret references grant only the credentials that generation needs.
+monitord favors explicit monitor code over framework magic. A monitor declares one polling or continuous plan; optional lifecycle interfaces own reusable clients and connections; exact secret references grant only the credentials that generation needs.
 
 ## Install
 
@@ -21,12 +21,6 @@ By default, the root is `~/.monitord` and the CLI symlink is `~/.local/bin/monit
 go run ./cmd/monitord --root /tmp/monitord-dev init
 go run ./cmd/monitord --root /tmp/monitord-dev daemon
 ```
-
-## V4 to V5
-
-V5 does not migrate V4 databases or monitor state schemas. Stop the old daemon, move or back up the complete V4 root, and install V5 into a clean root. Recreate deployments, then restore only intentional state through `monitord state set`.
-
-On macOS, Keychain account tokens remain available to the same OS user. Named agent routes live in the database and must be recreated. Never point V5 at a populated V4 database; the schema guard rejects incompatible roots instead of attempting an upgrade or downgrade.
 
 ## Create a monitor
 
@@ -89,7 +83,7 @@ func check(ctx context.Context, session *monitord.Session[State]) error {
 }
 ```
 
-`monitor.yaml` owns deployment policy and destinations. Choose exactly one of a lifetime or persistence:
+`monitor.yaml` owns deployment policy and destinations. Choose exactly one lifetime policy: `ttl` or `persistent`.
 
 ```yaml
 ttl: 30d

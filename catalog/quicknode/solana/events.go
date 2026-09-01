@@ -30,6 +30,8 @@ type AddressEvent struct {
 
 func (e AddressEvent) ID() string { return "solana:transaction:" + string(e.Signature) }
 
+type AddressEventUpdate[S any] func(*monitord.Tx[S]) error
+
 type addressEventsCursor struct {
 	GenesisHash GenesisHash `json:"genesis_hash"`
 	Address     PublicKey   `json:"address"`
@@ -53,7 +55,7 @@ type AddressEvents[S any] struct {
 	MaxBackfillPages      int
 	ResumeFromLatestOnGap bool
 	MatchLogs             func(LogsValue) bool
-	Handle                func(context.Context, *Client, *monitord.Tx[S], AddressEvent) error
+	Handle                func(context.Context, *Client, AddressEvent) (AddressEventUpdate[S], error)
 }
 
 var _ monitord.Monitor[struct{}] = AddressEvents[struct{}]{}
@@ -291,6 +293,7 @@ func (e AddressEvents[S]) catchUp(ctx context.Context, session *monitord.Session
 		matched, hinted := logMatches[info.Signature]
 		delete(logMatches, info.Signature)
 		var event AddressEvent
+		var update AddressEventUpdate[S]
 		if !hinted || matched {
 			payload, err := client.GetTransaction(ctx, info.Signature, TransactionOptions{Commitment: Finalized})
 			if err != nil {
@@ -307,6 +310,10 @@ func (e AddressEvents[S]) catchUp(ctx context.Context, session *monitord.Session
 				BlockTime:   info.BlockTime,
 				Transaction: append(json.RawMessage(nil), payload...),
 			}
+			update, err = e.Handle(ctx, client, event)
+			if err != nil {
+				return err
+			}
 		}
 		next := addressEventsCursor{
 			GenesisHash: client.GenesisHash(),
@@ -315,8 +322,8 @@ func (e AddressEvents[S]) catchUp(ctx context.Context, session *monitord.Session
 			Slot:        info.Slot,
 		}
 		if err := session.Commit(ctx, func(tx *monitord.Tx[S]) error {
-			if !hinted || matched {
-				if err := e.Handle(ctx, client, tx, event); err != nil {
+			if update != nil {
+				if err := update(tx); err != nil {
 					return err
 				}
 			}

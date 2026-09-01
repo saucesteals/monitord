@@ -26,14 +26,14 @@ MONITORD_SERVICE=none ./infra/install.sh
 
 The daemon normally reconciles every five seconds. Scheduling deadlines remain exact; `--interval` only bounds idle sleep.
 
-## Clean V5 installation
+## Replacing an installation
 
-V5 has one current database shape and no up/down migrations. To replace an older installation:
+monitord has one current database shape and does not transform another installation in place. To replace an installation:
 
 1. Stop or unload the existing service.
 2. Move the entire old root to a timestamped backup.
-3. Run the V5 installer into a clean root.
-4. Port or recreate only the selected monitor source against V5, then restore its group secret files.
+3. Run the installer into a clean root.
+4. Port or recreate only the selected monitor source against the installed SDK, then restore its group secret files.
 5. Recreate named routes and deploy each monitor.
 6. Restore intentional state through `state set`, then inspect health.
 
@@ -96,7 +96,7 @@ monitord state clear inventory
 
 `set` validates JSON by running it through the deployed monitor's exact state type. `clear` asks that artifact for its default state; it does not write arbitrary `null`. Every successful edit fences the old generation so an in-flight callback cannot overwrite the operator change.
 
-State has no public version or migration chain. Keep state transformations explicit and reviewable: export JSON, transform it deliberately, and feed it back through the CLI.
+Keep state transformations explicit and reviewable: export JSON, transform it deliberately, and feed it back through the CLI.
 
 ## Health and generations
 
@@ -156,4 +156,4 @@ On macOS, inspect the default service with `launchctl print gui/$(id -u)/dev.mon
 
 Stop the service before taking a whole-root backup. The simplest recoverable operation is moving the complete root aside and installing into a new directory. Keep the backup until the new daemon, all expected workers, secret availability, and first successful callbacks are verified.
 
-For a V5-to-V5 recovery at the exact same code revision, preserve the whole root together so database rows, artifacts, source, and generation metadata agree. For an architectural upgrade or incompatible state redesign, prefer a clean root and explicit state restoration rather than copying selected database tables.
+For recovery at the exact same code revision, preserve the whole root together so database rows, artifacts, source, and generation metadata agree. For an incompatible installation or state redesign, prefer a clean root and explicit state restoration rather than copying selected database tables.

@@ -43,7 +43,7 @@ return session.Commit(ctx, func(tx *monitord.Tx[State]) error {
 })
 ```
 
-State and checkpoint values are strictly decoded. Unknown fields, trailing JSON values, and incompatible Go types fail loudly. There are no state versions or migration callbacks. Change compatible structs normally; for an intentional incompatible reset, deploy with `--reset-state`, or prepare exact JSON and use `state set`.
+State and checkpoint values are strictly decoded. Unknown fields, trailing JSON values, and incompatible Go types fail loudly. Change compatible structs normally; for an intentional incompatible reset, deploy with `--reset-state`, or prepare exact JSON and use `state set`.
 
 ## Commit rules
 
@@ -111,7 +111,7 @@ The dotenv reader supports blank lines, comments, optional `export`, unquoted va
 
 ## Lifecycle-owned clients
 
-Implement `Starter` when a resource needs secrets or should live for the worker generation. `Start` completes before readiness and before callbacks begin. `Stop` runs after active callbacks end. If `Start` fails, it must clean up anything it initialized.
+When no managed catalog source owns a resource that needs secrets or should live for the worker generation, implement `Starter`. `Start` completes before readiness and before callbacks begin. `Stop` runs after active callbacks end. If `Start` fails, it must clean up anything it initialized.
 
 ```go
 var proxies = monitord.RequiredSecret("proxies", "isps")
@@ -176,7 +176,28 @@ func main() {
 
 `evm.Events` and `evm.Wallet` declare `quicknode/ethereum-mainnet-http-url` when neither `HTTPURL` nor `HTTPSecret` is set. That default also pins chain ID `0x1`. Other EVM networks should pass an exact chain-named `HTTPSecret` plus `ExpectedChainID` and `Confirmations`; `HTTPURL` remains useful when configuration already resolved the exact value. A fresh deployment starts at the current confirmed edge unless `BackfillFrom` is set. Wallet addresses are public configuration and must be supplied explicitly. Wallet covers standard ERC-20, ERC-721, ERC-1155, and successful non-zero top-level native transfers, including contract creation. Native backfill requires EIP-658 receipt status and therefore does not cover pre-Byzantium Ethereum blocks. Wallet does not infer internal calls, trace-derived transfers, arbitrary balance changes, pending transactions, or non-standard token events.
 
-`solana.AddressEvents` processes finalized transactions involving one address. It checkpoints the last committed signature, catches up through HTTP after startup and periodically thereafter, and uses `logsSubscribe` only to reduce latency. The checkpoint advances atomically with the handler's state and events. WSS setup or reconnect failure falls back to HTTP polling until the worker restarts. A fresh deployment snapshots the newest finalized signature unless `BackfillAfter` is set. `MatchLogs` may reject notifications that are conclusively irrelevant, avoiding a transaction read on the live path; transactions missing a WebSocket hint are always fetched and handled during HTTP backfill. Handlers receive the context and Solana client so enrichment reads happen without bypassing the durable source. A missing or excessively old cursor fails closed by default; monitors that prefer availability over complete replay can set `ResumeFromLatestOnGap` to checkpoint the current finalized edge after the bounded backfill attempt. The managed source defaults to `quicknode/solana-mainnet-http-url` and optionally `quicknode/solana-mainnet-websocket-url`; `HTTPSecret` and `WSSSecret` select other exact chain/network keys.
+`solana.AddressEvents` processes finalized transactions involving one address. It checkpoints the last committed signature, catches up through HTTP after startup and periodically thereafter, and uses `logsSubscribe` only to reduce latency. WSS setup or reconnect failure falls back to HTTP polling until the worker restarts. A fresh deployment snapshots the newest finalized signature unless `BackfillAfter` is set. `MatchLogs` may reject notifications that are conclusively irrelevant, avoiding a transaction read on the live path; transactions missing a WebSocket hint are always fetched and handled during HTTP replay. `Handle` receives the context and Solana client outside the commit closure, performs any enrichment, and returns a deterministic `AddressEventUpdate`. That update and the source checkpoint then commit atomically. A missing or excessively old cursor fails closed by default; monitors that prefer availability over complete replay can set `ResumeFromLatestOnGap` to checkpoint the current finalized edge after the bounded replay attempt. The managed source defaults to `quicknode/solana-mainnet-http-url` and optionally `quicknode/solana-mainnet-websocket-url`; `HTTPSecret` and `WSSSecret` select other exact chain/network keys.
+
+```go
+func main() {
+	monitord.Run(solana.AddressEvents[State]{
+		Name:      "program-events",
+		Address:   solana.PublicKey("..."),
+		MatchLogs: relevantLogs,
+		Handle:    prepareEvent,
+	})
+}
+
+func prepareEvent(ctx context.Context, client *solana.Client, event solana.AddressEvent) (solana.AddressEventUpdate[State], error) {
+	observed, err := readDetails(ctx, client, event)
+	if err != nil {
+		return nil, err
+	}
+	return func(tx *monitord.Tx[State]) error {
+		return tx.Emit(observed.Event())
+	}, nil
+}
+```
 
 Use exact URLs copied from the QuickNode dashboard:
 

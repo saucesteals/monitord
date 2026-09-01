@@ -1,6 +1,6 @@
 ---
 name: monitord
-description: Author, test, deploy, and operate V5 monitord monitors with typed state, checkpoints, lifecycle-owned resources, exact secrets, and durable event delivery. Use for work inside a monitord installation or monitor source tree.
+description: Author, validate, deploy, and operate monitord monitors with typed state, checkpoints, lifecycle-owned resources, exact secrets, and durable event delivery. Use for work inside a monitord installation or monitor source tree.
 ---
 
 # monitord
@@ -64,17 +64,17 @@ Perform network I/O, sleeping, and expensive parsing outside `Commit`. Recheck o
 
 ## Lifecycle-owned resources
 
-When a monitor needs a reusable client, proxy pool, connection, or subscription, implement `monitord.Starter` and optionally `monitord.Stopper` on the monitor. Construct it in `Start(context.Context, monitord.Environment)`, after exact secrets are available and before the worker becomes ready. Stop closes resources after callbacks have ended. A failing `Start` must clean up its partial work.
+When no managed catalog source owns a reusable client, proxy pool, connection, or subscription, implement `monitord.Starter` and optionally `monitord.Stopper` on the monitor. Construct the resource in `Start(context.Context, monitord.Environment)`, after exact secrets are available and before the worker becomes ready. Stop closes resources after callbacks have ended. A failing `Start` must clean up its partial work.
 
 For browser-compatible HTTP and proxy rotation, use `catalog/httpx`. A proxy secret is a JSON array of `http`, `https`, or `socks5` URLs. Create one `httpx.ProxyClient` in `Start`; do not recreate clients inside each check.
 
-## QuickNode
+## Chain sources and QuickNode
 
-Use `catalog/quicknode` only for provider transport. Use `catalog/quicknode/evm` or `catalog/quicknode/solana` for chain identity, types, subscriptions, and managed sources. Copy exact QuickNode provider URLs into chain-named secret refs; never derive or rewrite endpoint hosts or paths.
+Prefer a managed chain source over wiring raw subscriptions in a monitor. Use `catalog/quicknode` only for provider transport and `catalog/quicknode/evm` or `catalog/quicknode/solana` for chain identity, finality, replay, and managed monitors. Copy exact QuickNode URLs into chain-named secret refs; never derive or rewrite endpoint hosts or paths.
 
-Managed `evm.Events` and `evm.Wallet` default to the Ethereum-mainnet HTTP secret; set `HTTPSecret` for another exact EVM network key. Managed `solana.AddressEvents` uses finalized HTTP signature history as its durable source and WSS only as a wake-up, atomically advancing its checkpoint with handler output. `MatchLogs` is only a live-path optimization: signatures without a WebSocket hint are always fetched during backfill. History gaps fail closed unless a monitor explicitly chooses availability with `ResumeFromLatestOnGap`. Use `HTTPSecret` and `WSSSecret` for non-default networks. Raw clients and subscriptions are lifecycle-owned: close subscriptions before the client, and use HTTP backfill plus checkpoints whenever reconnect gaps matter.
+`evm.Events` and `evm.Wallet` use confirmed HTTP history. `solana.AddressEvents` uses finalized HTTP signature history as its durable source and WSS as a low-latency wake-up. Its handler performs enrichment before returning a deterministic `AddressEventUpdate`; that update and the source checkpoint commit atomically. `MatchLogs` can skip live transactions that are conclusively irrelevant, while signatures without a WSS hint are still fetched during replay. History gaps fail closed unless the monitor explicitly chooses availability with `ResumeFromLatestOnGap`.
 
-Chain monitors must use a durable cursor and authoritative replay by default. A raw WebSocket-only monitor is acceptable only when missed events are intentionally disposable or another source guarantees replay; document that exception in the monitor.
+Chain monitors require a durable cursor and authoritative replay by default. Use raw subscriptions only when missed events are intentionally disposable or another source guarantees replay, and document that exception in the monitor.
 
 ## Workflow
 
@@ -88,6 +88,6 @@ monitord inspect <deployment>
 
 `test` runs one callback without persisting state or sending notifications. Use `--stored-state` when behavior depends on deployed state. Redeploy preserves deployment identity and state; use `--reset-state` only for an intentional incompatible state reset.
 
-Before handing off a change, build the monitor module, run `monitord test` when its external dependencies are available, and inspect the deployed generation after rollout. Do not edit the SQLite database directly. Use `state get/set/clear`, lifecycle commands, and `events retry` for operator changes.
+Before handing off a change, build the affected monitor, run `monitord test` when its external dependencies are available, and inspect the deployed generation after rollout. Do not edit the SQLite database directly. Use `state get/set/clear`, lifecycle commands, and `events retry` for operator changes.
 
 When working in the monitord checkout, `docs/monitors.md` and `docs/operations.md` provide the full configuration and operational reference. The skill remains usable when installed by itself through `monitord skill`.
