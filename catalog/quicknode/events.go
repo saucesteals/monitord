@@ -9,6 +9,11 @@ import (
 	"github.com/saucesteals/monitord"
 )
 
+var (
+	quicknodeWebSocketURL = monitord.RequiredSecret("quicknode", "websocket-url")
+	quicknodeHTTPURL      = monitord.OptionalSecret("quicknode", "http-url")
+)
+
 const (
 	defaultPollInterval = 2 * time.Second
 	checkpointSource    = "quicknode.confirmed-blocks"
@@ -38,10 +43,10 @@ func (e Events[S]) Info() monitord.Info {
 func (e Events[S]) Plan() monitord.Plan[S] {
 	refs := []monitord.SecretRef{}
 	if e.WSSURL == "" {
-		refs = append(refs, monitord.RequiredSecret("quicknode", "QUICKNODE_WSS_URL"))
+		refs = append(refs, quicknodeWebSocketURL)
 	}
 	if e.HTTPURL == "" {
-		refs = append(refs, monitord.OptionalSecret("quicknode", "QUICKNODE_HTTP_URL"))
+		refs = append(refs, quicknodeHTTPURL)
 	}
 	return monitord.Continuous(e.run, monitord.WithSecrets(refs...))
 }
@@ -55,12 +60,12 @@ func (e Events[S]) run(ctx context.Context, s *monitord.Session[S]) error {
 	}
 	httpURL := e.HTTPURL
 	if httpURL == "" {
-		httpURL, _ = s.Secrets().Get("quicknode", "QUICKNODE_HTTP_URL")
+		httpURL, _ = s.Secrets().Get(quicknodeHTTPURL)
 	}
 	if httpURL == "" {
 		wss := e.WSSURL
 		if wss == "" {
-			wss, _ = s.Secrets().Get("quicknode", "QUICKNODE_WSS_URL")
+			wss, _ = s.Secrets().Get(quicknodeWebSocketURL)
 		}
 		var err error
 		httpURL, err = HTTPFromWSS(wss)

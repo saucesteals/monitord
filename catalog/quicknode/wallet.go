@@ -9,6 +9,8 @@ import (
 	"github.com/saucesteals/monitord"
 )
 
+var quicknodeWalletAddress = monitord.RequiredSecret("quicknode", "wallet-address")
+
 type Wallet struct {
 	Name            string
 	WSSURL          string
@@ -46,13 +48,13 @@ func (w Wallet) Plan() monitord.Plan[WalletState] {
 func (w Wallet) secretRefs() []monitord.SecretRef {
 	r := []monitord.SecretRef{}
 	if w.WSSURL == "" {
-		r = append(r, monitord.RequiredSecret("quicknode", "QUICKNODE_WSS_URL"))
+		r = append(r, quicknodeWebSocketURL)
 	}
 	if w.HTTPURL == "" {
-		r = append(r, monitord.OptionalSecret("quicknode", "QUICKNODE_HTTP_URL"))
+		r = append(r, quicknodeHTTPURL)
 	}
 	if w.Address == "" {
-		r = append(r, monitord.RequiredSecret("quicknode", "WALLET_ADDRESS"))
+		r = append(r, quicknodeWalletAddress)
 	}
 	return r
 }
@@ -60,7 +62,7 @@ func (w Wallet) secretRefs() []monitord.SecretRef {
 func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error {
 	address := w.Address
 	if address == "" {
-		v, err := s.Secrets().Require("quicknode", "WALLET_ADDRESS")
+		v, err := s.Secrets().Require(quicknodeWalletAddress)
 		if err != nil {
 			return err
 		}
@@ -81,12 +83,12 @@ func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error
 	}
 	httpURL := w.HTTPURL
 	if httpURL == "" {
-		httpURL, _ = s.Secrets().Get("quicknode", "QUICKNODE_HTTP_URL")
+		httpURL, _ = s.Secrets().Get(quicknodeHTTPURL)
 	}
 	if httpURL == "" {
 		ws := w.WSSURL
 		if ws == "" {
-			ws, _ = s.Secrets().Get("quicknode", "QUICKNODE_WSS_URL")
+			ws, _ = s.Secrets().Get(quicknodeWebSocketURL)
 		}
 		var err error
 		httpURL, err = HTTPFromWSS(ws)

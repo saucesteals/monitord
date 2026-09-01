@@ -33,15 +33,10 @@ func WithSecrets(refs ...SecretRef) CommonOption {
 }
 func (r SecretRef) Validate() error {
 	if !infoNamePattern.MatchString(r.Group) {
-		return fmt.Errorf("invalid secret group %q", r.Group)
+		return fmt.Errorf("secret group %q must be lower-case kebab case", r.Group)
 	}
-	if r.Key == "" {
-		return errors.New("secret key is required")
-	}
-	for _, c := range r.Key {
-		if !(c == '_' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
-			return fmt.Errorf("invalid secret key %q", r.Key)
-		}
+	if !infoNamePattern.MatchString(r.Key) {
+		return fmt.Errorf("secret key %q must be lower-case kebab case", r.Key)
 	}
 	return nil
 }
@@ -65,16 +60,19 @@ func normalizeSecretRefs(in []SecretRef) ([]SecretRef, error) {
 }
 
 type SecretSet interface {
-	Get(group, key string) (string, bool)
-	Require(group, key string) (string, error)
+	Get(SecretRef) (string, bool)
+	Require(SecretRef) (string, error)
 }
 type secretSet map[string]string
 
-func (s secretSet) Get(g, k string) (string, bool) { v, ok := s[g+"\x00"+k]; return v, ok }
-func (s secretSet) Require(g, k string) (string, error) {
-	v, ok := s.Get(g, k)
+func (s secretSet) Get(ref SecretRef) (string, bool) {
+	v, ok := s[ref.Group+"\x00"+ref.Key]
+	return v, ok
+}
+func (s secretSet) Require(ref SecretRef) (string, error) {
+	v, ok := s.Get(ref)
 	if !ok || v == "" {
-		return "", fmt.Errorf("required secret %s/%s is unavailable", g, k)
+		return "", fmt.Errorf("required secret %s/%s is unavailable", ref.Group, ref.Key)
 	}
 	return v, nil
 }

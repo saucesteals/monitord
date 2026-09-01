@@ -41,13 +41,8 @@ func ValidateRef(ref Ref) error {
 	if !safeComponent(ref.Group) {
 		return fmt.Errorf("invalid secret group %q", ref.Group)
 	}
-	if ref.Key == "" || strings.ContainsAny(ref.Key, "=\x00\r\n") {
+	if !safeComponent(ref.Key) {
 		return fmt.Errorf("invalid secret key %q", ref.Key)
-	}
-	for _, r := range ref.Key {
-		if !(r == '_' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
-			return fmt.Errorf("invalid secret key %q", ref.Key)
-		}
 	}
 	return nil
 }
@@ -57,7 +52,7 @@ func safeComponent(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if !(r == '-' || r == '_' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
+		if !(r == '-' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
 			return false
 		}
 	}

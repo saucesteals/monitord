@@ -2,9 +2,20 @@ package monitord
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
+
+type callbackStillRunningError struct{ cause error }
+
+func (e *callbackStillRunningError) Error() string { return e.cause.Error() }
+func (e *callbackStillRunningError) Unwrap() error { return e.cause }
+
+func callbackStillRunning(err error) bool {
+	var target *callbackStillRunningError
+	return errors.As(err, &target)
+}
 
 func runPlan[S any](ctx context.Context, session *Session[S], plan Plan[S], once bool) error {
 	node := plan.node
@@ -57,9 +68,13 @@ func runCallback(ctx context.Context, timeout time.Duration, callback func(conte
 		err := callbackCtx.Err()
 		cancel()
 		if ctx.Err() != nil {
+			// Lifecycle cleanup must not overlap a callback that still owns its
+			// resources. The daemon's shutdown deadline bounds an uncooperative
+			// callback by terminating the worker process.
+			<-result
 			return nil
 		}
-		return fmt.Errorf("callback deadline exceeded: %w", err)
+		return &callbackStillRunningError{cause: fmt.Errorf("callback deadline exceeded: %w", err)}
 	}
 }
 

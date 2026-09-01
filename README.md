@@ -6,7 +6,7 @@ The authoring model has two layers: a monitor declares its identity and opaque p
 
 ## Upgrading from V4
 
-V5 is an intentional clean break. Export or back up a V4 root before opening it with this release. Route and account configuration remains reusable, but deployments must be created again because runtime identity and storage are deployment-based. Proxy pools were removed because the current runtime does not consume them.
+V5 is an intentional clean break. Export or back up a V4 root before opening it with this release. Route and account configuration remains reusable, but deployments must be created again because runtime identity and storage are deployment-based. Monitors that need proxies declare an exact secret and construct a lifecycle-owned client with `catalog/httpx`.
 
 ## A monitor
 
@@ -91,12 +91,14 @@ Events enter a durable per-destination outbox in the same SQLite commit. Deliver
 Plans request exact group/key references:
 
 ```go
+var ordersWebSocketURL = monitord.RequiredSecret("orders", "websocket-url")
+
 monitord.Continuous(watch, monitord.WithSecrets(
-	monitord.RequiredSecret("orders", "ORDERS_WSS_URL"),
+	ordersWebSocketURL,
 ))
 ```
 
-Only requested keys cross the generation-bound handshake. Read them with `session.Secrets().Require("orders", "ORDERS_WSS_URL")`. Resolution precedence is deployment credential override, monitor-local `.env`, `~/.monitord/secrets/<group>.env`, global `~/.monitord/.env`, then a declared non-secret default. Workers and compiler subprocesses receive scrubbed environments.
+Only requested keys cross the generation-bound handshake. Read them with `session.Secrets().Require(ordersWebSocketURL)`. Resolution precedence is deployment credential override, monitor-local `.env`, `~/.monitord/secrets/<group>.env`, global `~/.monitord/.env`, then a declared non-secret default. Workers and compiler subprocesses receive scrubbed environments.
 
 ## QuickNode catalog
 

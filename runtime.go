@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 )
 
 func dispatchMonitor[S any](m Monitor[S]) error {
@@ -40,7 +41,7 @@ func dispatchMonitor[S any](m Monitor[S]) error {
 	}
 }
 
-func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io.Writer) error {
+func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io.Writer) (returnErr error) {
 	w := newWire(in, out)
 	helloMsg, _, err := w.readInbound()
 	if err != nil {
@@ -82,6 +83,28 @@ func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io
 	for source, raw := range hello.Checkpoints {
 		session.checkpoints[source] = append(json.RawMessage(nil), raw...)
 	}
+	startCtx, cancelStart := lifecycleContext(monitorStartTimeout, time.Time{})
+	err = startMonitor(startCtx, m, Environment{secrets: session.Secrets()})
+	cancelStart()
+	if err != nil {
+		return err
+	}
+	lifecycleStarted := true
+	var stopDeadline time.Time
+	stopLifecycle := func() error {
+		if !lifecycleStarted {
+			return nil
+		}
+		lifecycleStarted = false
+		stopCtx, cancelStop := lifecycleContext(monitorStopTimeout, stopDeadline)
+		defer cancelStop()
+		return stopMonitor(stopCtx, m)
+	}
+	defer func() {
+		if lifecycleStarted {
+			returnErr = errors.Join(returnErr, stopLifecycle())
+		}
+	}()
 	if err = w.send(WorkerFrame{Type: "ready", Ready: &ReadyFrame{Generation: hello.Generation}}); err != nil {
 		return err
 	}
@@ -91,19 +114,38 @@ func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io
 	done := make(chan error, 1)
 	go func() { done <- runPlan(ctx, session, m.Plan(), start.Start.Once) }()
 	select {
-	case err := <-done:
-		stopped := &StoppedFrame{Generation: hello.Generation, Clean: err == nil}
-		if err != nil {
-			stopped.Error = err.Error()
+	case runErr := <-done:
+		cancel()
+		var stopErr error
+		if callbackStillRunning(runErr) {
+			// The process is about to exit, which releases its resources safely.
+			// Calling Stop here could race the callback that exceeded its deadline.
+			lifecycleStarted = false
+		} else {
+			stopErr = stopLifecycle()
+		}
+		resultErr := errors.Join(runErr, stopErr)
+		stopped := &StoppedFrame{Generation: hello.Generation, Clean: resultErr == nil}
+		if resultErr != nil {
+			stopped.Error = resultErr.Error()
 		}
 		return w.send(WorkerFrame{Type: "stopped", Stopped: stopped})
-	case <-coord.stop:
+	case request := <-coord.stop:
+		if request.Deadline != "" {
+			stopDeadline, _ = time.Parse(time.RFC3339Nano, request.Deadline)
+		}
 		cancel()
 		<-done
-		return w.send(WorkerFrame{Type: "stopped", Stopped: &StoppedFrame{Generation: hello.Generation, Clean: true}})
-	case err := <-coord.fatal:
+		stopErr := stopLifecycle()
+		stopped := &StoppedFrame{Generation: hello.Generation, Clean: stopErr == nil}
+		if stopErr != nil {
+			stopped.Error = stopErr.Error()
+		}
+		return w.send(WorkerFrame{Type: "stopped", Stopped: stopped})
+	case fatalErr := <-coord.fatal:
 		cancel()
-		return err
+		<-done
+		return fatalErr
 	}
 }
 
