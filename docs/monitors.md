@@ -210,6 +210,16 @@ content must be stable: confirmed replay is inclusive and the durable outbox
 coalesces an identical event ID, while different content for the same ID is an
 error.
 
+Standard ERC-20 metadata is one exact-block helper call from a monitor:
+
+```go
+metadata, err := client.ERC20Metadata(ctx, transfer.Token, log.BlockHash)
+```
+
+`TotalSupply` is required. Since ERC-20 makes `Name`, `Symbol`, and `Decimals`
+optional, unsupported or malformed optional fields are empty instead of
+rejecting the token. Transport failures still return an error.
+
 `Log.Confirmed` distinguishes canonical HTTP replay from the immediate WSS
 observation. `Events` journals matching live logs until the confirmation
 boundary. It passes an orphan back with `Log.Removed`, either from the live
@@ -253,6 +263,16 @@ func prepareEvent(ctx context.Context, client *solana.Client, event solana.Addre
 	}, nil
 }
 ```
+
+Metaplex token metadata is available directly by mint:
+
+```go
+metadata, err := client.TokenMetadata(ctx, mint, solana.Confirmed)
+```
+
+The result includes the mint, metadata-account address, name, symbol, and URI.
+A mint without a Metaplex metadata account returns empty descriptive fields,
+not an error.
 
 Use exact URLs copied from the QuickNode dashboard:
 

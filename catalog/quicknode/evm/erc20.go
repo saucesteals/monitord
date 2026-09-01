@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/saucesteals/monitord/catalog/quicknode"
+	"golang.org/x/sync/errgroup"
 )
 
 const ERC20TransferTopic Hash = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -18,6 +22,14 @@ type ERC20Transfer struct {
 	From   Address
 	To     Address
 	Amount *big.Int
+}
+
+type ERC20Metadata struct {
+	Token       Address
+	Name        string
+	Symbol      string
+	Decimals    *uint8
+	TotalSupply *big.Int
 }
 
 // ERC20TransfersTo is the exact server-side filter for standard Transfer logs
@@ -73,9 +85,109 @@ func IsContractResultError(err error) bool {
 	return errors.As(err, &target)
 }
 
+// ERC20Metadata reads standard token metadata from the exact canonical fork
+// identified by blockHash. Name, symbol, and decimals are optional in ERC-20;
+// unsupported or malformed optional fields are left empty.
+func (c *Client) ERC20Metadata(ctx context.Context, token Address, blockHash Hash) (ERC20Metadata, error) {
+	result := ERC20Metadata{Token: token}
+	group, ctx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		value, err := c.erc20String(ctx, token, blockHash, "0x06fdde03")
+		if optionalERC20Result(err) {
+			return nil
+		}
+		result.Name = value
+		return err
+	})
+	group.Go(func() error {
+		value, err := c.erc20String(ctx, token, blockHash, "0x95d89b41")
+		if optionalERC20Result(err) {
+			return nil
+		}
+		result.Symbol = value
+		return err
+	})
+	group.Go(func() error {
+		value, err := c.erc20Uint8(ctx, token, blockHash, "0x313ce567")
+		if optionalERC20Result(err) {
+			return nil
+		}
+		result.Decimals = value
+		return err
+	})
+	group.Go(func() error {
+		value, err := c.ERC20TotalSupply(ctx, token, blockHash)
+		result.TotalSupply = value
+		return err
+	})
+	if err := group.Wait(); err != nil {
+		return ERC20Metadata{}, err
+	}
+	return result, nil
+}
+
+func optionalERC20Result(err error) bool { return err != nil && IsContractResultError(err) }
+
 // ERC20TotalSupply reads totalSupply from the exact canonical fork identified
 // by blockHash using EIP-1898.
 func (c *Client) ERC20TotalSupply(ctx context.Context, token Address, blockHash Hash) (*big.Int, error) {
+	data, err := c.contractCall(ctx, token, blockHash, "0x18160ddd")
+	if err != nil {
+		return nil, err
+	}
+	if len(data) != 32 {
+		return nil, unusableContractResult("invalid totalSupply encoding")
+	}
+	return new(big.Int).SetBytes(data), nil
+}
+
+func (c *Client) erc20String(ctx context.Context, token Address, blockHash Hash, selector string) (string, error) {
+	data, err := c.contractCall(ctx, token, blockHash, selector)
+	if err != nil {
+		return "", err
+	}
+	var value []byte
+	switch {
+	case len(data) == 32:
+		value = data
+	case len(data) >= 64:
+		offset := new(big.Int).SetBytes(data[:32])
+		if !offset.IsUint64() || offset.Uint64() > uint64(len(data)-32) {
+			return "", unusableContractResult("invalid string offset")
+		}
+		start := int(offset.Uint64())
+		size := new(big.Int).SetBytes(data[start : start+32])
+		if !size.IsUint64() || size.Uint64() > uint64(len(data)-start-32) {
+			return "", unusableContractResult("invalid string length")
+		}
+		value = data[start+32 : start+32+int(size.Uint64())]
+	default:
+		return "", unusableContractResult("invalid string encoding")
+	}
+	value = []byte(strings.TrimSpace(strings.TrimRight(string(value), "\x00")))
+	if !utf8.Valid(value) {
+		return "", unusableContractResult("string is not UTF-8")
+	}
+	return string(value), nil
+}
+
+func (c *Client) erc20Uint8(ctx context.Context, token Address, blockHash Hash, selector string) (*uint8, error) {
+	data, err := c.contractCall(ctx, token, blockHash, selector)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) != 32 {
+		return nil, unusableContractResult("invalid uint8 encoding")
+	}
+	value := new(big.Int).SetBytes(data)
+	if !value.IsUint64() || value.Uint64() > 255 {
+		return nil, unusableContractResult("uint8 result is out of range")
+	}
+	parsed := uint8(value.Uint64())
+	return &parsed, nil
+}
+
+func (c *Client) contractCall(ctx context.Context, token Address, blockHash Hash, selector string) ([]byte, error) {
 	if _, err := ParseAddress(string(token)); err != nil {
 		return nil, err
 	}
@@ -84,7 +196,7 @@ func (c *Client) ERC20TotalSupply(ctx context.Context, token Address, blockHash 
 	}
 	var result json.RawMessage
 	if err := c.call(ctx, "eth_call", []any{
-		map[string]string{"to": string(token), "data": "0x18160ddd"},
+		map[string]string{"to": string(token), "data": selector},
 		map[string]any{"blockHash": blockHash, "requireCanonical": true},
 	}, &result); err != nil {
 		var rpcErr *quicknode.RPCError
@@ -95,11 +207,15 @@ func (c *Client) ERC20TotalSupply(ctx context.Context, token Address, blockHash 
 	}
 	var encoded string
 	if err := json.Unmarshal(result, &encoded); err != nil {
-		return nil, &ContractResultError{cause: errors.New("totalSupply result is not hex data")}
+		return nil, unusableContractResult("result is not hex data")
 	}
 	data, err := decodeHex(encoded)
-	if err != nil || len(data) != 32 {
-		return nil, &ContractResultError{cause: errors.New("invalid totalSupply encoding")}
+	if err != nil {
+		return nil, unusableContractResult("invalid hex result")
 	}
-	return new(big.Int).SetBytes(data), nil
+	return data, nil
+}
+
+func unusableContractResult(reason string) error {
+	return &ContractResultError{cause: fmt.Errorf("quicknode evm: %s", reason)}
 }

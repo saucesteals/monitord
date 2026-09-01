@@ -99,6 +99,8 @@ Matching live logs remain in a durable journal until replay confirms them;
 orphaned entries return to the handler with `Removed`, even when the WebSocket
 was disconnected during the reorganization. Use the log block hash with
 EIP-1898 for state reads and stable `log.ID()` identities for emitted events.
+Use `client.ERC20Metadata(ctx, token, log.BlockHash)` for exact-fork ERC-20
+name, symbol, decimals, and total supply; optional ERC-20 fields may be empty.
 
 `solana.AddressEvents` uses QuickNode `transactionSubscribe` with the monitored
 account applied at the provider. The live notification contains the full
@@ -106,6 +108,9 @@ transaction; `MatchLogs` narrows it locally before the handler runs. Finalized
 QuickNode `getTransactionsForAddress` history repairs gaps with complete,
 ascending pages from the saved slot and transaction index. It does not perform a
 serial signature lookup followed by one transaction request per record.
+Use `client.TokenMetadata(ctx, mint, commitment)` for Metaplex name, symbol,
+URI, and metadata-account identity instead of implementing PDA or Borsh parsing
+inside a monitor.
 
 Keep the live handler deterministic and short. Use stable event IDs and content
 so inclusive replay coalesces in the durable outbox. Do not put third-party
