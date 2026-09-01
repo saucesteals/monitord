@@ -25,13 +25,7 @@ func (c *Client) SubscribeLogs(ctx context.Context, filter Logs) (*quicknode.Sub
 	if err := filter.Validate(); err != nil {
 		return nil, err
 	}
-	arg := map[string]any{}
-	if len(filter.Addresses) > 0 {
-		arg["address"] = filter.Addresses
-	}
-	if len(filter.Topics) > 0 {
-		arg["topics"] = filter.Topics
-	}
+	arg := filter.rpcArgs()
 	return subscribe(ctx, c, "logs", func(raw json.RawMessage) (Log, error) {
 		var wire rpcLog
 		if err := json.Unmarshal(raw, &wire); err != nil {

@@ -71,7 +71,7 @@ func Subscribe[T any](ctx context.Context, client *Client, spec SubscriptionSpec
 		decode: decode,
 		ctx:    subscriptionCtx,
 		cancel: cancel,
-		values: make(chan T, 16),
+		values: make(chan T, 256),
 		errs:   make(chan error, 1),
 	}
 	conn, id, err := s.open(ctx)

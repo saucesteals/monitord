@@ -91,7 +91,22 @@ deliveries:
 
 Prefer a managed chain source over wiring raw subscriptions in a monitor. Use `catalog/quicknode` only for provider transport and `catalog/quicknode/evm` or `catalog/quicknode/solana` for chain identity, finality, replay, and managed monitors. Copy exact QuickNode URLs into chain-named secret refs; never derive or rewrite endpoint hosts or paths.
 
-`evm.Events` and `evm.Wallet` use confirmed HTTP history. `solana.AddressEvents` uses finalized HTTP signature history as its durable source and WSS as a low-latency wake-up. Its handler performs enrichment before returning a deterministic `AddressEventUpdate`; that update and the source checkpoint commit atomically. `MatchLogs` can skip live transactions that are conclusively irrelevant, while signatures without a WSS hint are still fetched during replay. History gaps fail closed unless the monitor explicitly chooses availability with `ResumeFromLatestOnGap`.
+`evm.Events` sends an exact address/topic filter to `eth_subscribe` and handles
+matching logs immediately. Ranged `eth_getLogs` replay advances a confirmed
+durable cursor and repairs startup or reconnect gaps without scanning blocks one
+at a time. `Confirmations` controls replay finality, not notification latency.
+
+`solana.AddressEvents` uses QuickNode `transactionSubscribe` with the monitored
+account applied at the provider. The live notification contains the full
+transaction; `MatchLogs` narrows it locally before the handler runs. Finalized
+HTTP signature history repairs gaps and checkpoints progress. History gaps fail
+closed unless the monitor explicitly chooses availability with
+`ResumeFromLatestOnGap`.
+
+Keep the live handler deterministic and short. Use stable event IDs and content
+so inclusive replay coalesces in the durable outbox. Do not put third-party
+market-data or indexing APIs in the detection path; enrich later or only when
+the alert contract truly requires it.
 
 Chain monitors require a durable cursor and authoritative replay by default. Use raw subscriptions only when missed events are intentionally disposable or another source guarantees replay, and document that exception in the monitor.
 

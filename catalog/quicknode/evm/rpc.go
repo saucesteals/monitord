@@ -3,35 +3,15 @@ package evm
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 )
 
 type rpcBlock struct {
-	Number       string           `json:"number"`
-	Hash         Hash             `json:"hash"`
-	ParentHash   Hash             `json:"parentHash"`
-	Transactions []rpcTransaction `json:"transactions"`
-}
-type rpcBlockWire struct {
-	Number       string          `json:"number"`
-	Hash         Hash            `json:"hash"`
-	ParentHash   Hash            `json:"parentHash"`
-	Transactions json.RawMessage `json:"transactions"`
-}
-type rpcTransaction struct {
-	Hash             Hash     `json:"hash"`
-	From             Address  `json:"from"`
-	To               *Address `json:"to"`
-	Value            string   `json:"value"`
-	TransactionIndex string   `json:"transactionIndex"`
-}
-type rpcReceipt struct {
-	Status          string   `json:"status"`
-	BlockHash       Hash     `json:"blockHash"`
-	ContractAddress *Address `json:"contractAddress"`
+	Number     string `json:"number"`
+	Hash       Hash   `json:"hash"`
+	ParentHash Hash   `json:"parentHash"`
 }
 type rpcLog struct {
 	BlockNumber      string  `json:"blockNumber"`
@@ -52,25 +32,21 @@ func (c *Client) blockNumber(ctx context.Context) (uint64, error) {
 	}
 	return parseUintQuantity(q)
 }
-func (c *Client) blockByNumber(ctx context.Context, n uint64, full bool) (rpcBlock, error) {
-	var wire rpcBlockWire
-	err := c.call(ctx, "eth_getBlockByNumber", []any{fmt.Sprintf("0x%x", n), full}, &wire)
+func (c *Client) blockByNumber(ctx context.Context, n uint64) (rpcBlock, error) {
+	var block rpcBlock
+	err := c.call(ctx, "eth_getBlockByNumber", []any{fmt.Sprintf("0x%x", n), false}, &block)
 	if err == nil {
-		number, parseErr := parseUintQuantity(wire.Number)
+		number, parseErr := parseUintQuantity(block.Number)
 		if parseErr != nil || number != n {
 			return rpcBlock{}, errors.New("quicknode: invalid block response")
 		}
-		if _, parseErr = ParseHash(string(wire.Hash)); parseErr != nil {
+		if _, parseErr = ParseHash(string(block.Hash)); parseErr != nil {
 			return rpcBlock{}, parseErr
 		}
-		if _, parseErr = ParseHash(string(wire.ParentHash)); parseErr != nil {
+		if _, parseErr = ParseHash(string(block.ParentHash)); parseErr != nil {
 			return rpcBlock{}, parseErr
 		}
-		b := rpcBlock{Number: wire.Number, Hash: wire.Hash, ParentHash: wire.ParentHash}
-		if full && json.Unmarshal(wire.Transactions, &b.Transactions) != nil {
-			return rpcBlock{}, errors.New("quicknode: invalid full block transactions")
-		}
-		return b, nil
+		return block, nil
 	}
 	return rpcBlock{}, err
 }
@@ -78,15 +54,9 @@ func (c *Client) logs(ctx context.Context, f Logs, from, to uint64) ([]Log, erro
 	arg := map[string]any{"fromBlock": fmt.Sprintf("0x%x", from), "toBlock": fmt.Sprintf("0x%x", to)}
 	return c.logsWithArg(ctx, f, arg)
 }
-func (c *Client) logsByBlockHash(ctx context.Context, f Logs, hash Hash) ([]Log, error) {
-	return c.logsWithArg(ctx, f, map[string]any{"blockHash": hash})
-}
 func (c *Client) logsWithArg(ctx context.Context, f Logs, arg map[string]any) ([]Log, error) {
-	if len(f.Addresses) > 0 {
-		arg["address"] = f.Addresses
-	}
-	if len(f.Topics) > 0 {
-		arg["topics"] = f.Topics
+	for key, value := range f.rpcArgs() {
+		arg[key] = value
 	}
 	var raw []rpcLog
 	if err := c.call(ctx, "eth_getLogs", []any{arg}, &raw); err != nil {
@@ -101,25 +71,6 @@ func (c *Client) logsWithArg(ctx context.Context, f Logs, arg map[string]any) ([
 		out = append(out, log)
 	}
 	return out, nil
-}
-func (c *Client) transactionReceipt(ctx context.Context, hash Hash) (rpcReceipt, error) {
-	var receipt rpcReceipt
-	if err := c.call(ctx, "eth_getTransactionReceipt", []any{hash}, &receipt); err != nil {
-		return rpcReceipt{}, err
-	}
-	status, err := parseUintQuantity(receipt.Status)
-	if err != nil || status > 1 {
-		return rpcReceipt{}, errors.New("quicknode evm: invalid transaction receipt status")
-	}
-	if receipt.ContractAddress != nil {
-		if _, err := ParseAddress(string(*receipt.ContractAddress)); err != nil {
-			return rpcReceipt{}, err
-		}
-	}
-	if _, err := ParseHash(string(receipt.BlockHash)); err != nil {
-		return rpcReceipt{}, err
-	}
-	return receipt, nil
 }
 func decodeRPCLog(r rpcLog, chain ChainID) (Log, error) {
 	if _, e := ParseHash(string(r.BlockHash)); e != nil {

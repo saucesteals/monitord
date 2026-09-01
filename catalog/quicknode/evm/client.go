@@ -9,11 +9,21 @@ import (
 	"github.com/saucesteals/monitord/catalog/quicknode"
 )
 
-var quicknodeEthereumMainnetHTTPURL = monitord.RequiredSecret("quicknode", "ethereum-mainnet-http-url")
+var (
+	quicknodeEthereumMainnetHTTPURL = monitord.RequiredSecret("quicknode", "ethereum-mainnet-http-url")
+	quicknodeEthereumMainnetWSSURL  = monitord.RequiredSecret("quicknode", "ethereum-mainnet-websocket-url")
+)
 
 func httpSecret(configured monitord.SecretRef) (monitord.SecretRef, bool) {
 	if configured.Group == "" && configured.Key == "" {
 		return quicknodeEthereumMainnetHTTPURL, true
+	}
+	return configured, false
+}
+
+func wssSecret(configured monitord.SecretRef) (monitord.SecretRef, bool) {
+	if configured.Group == "" && configured.Key == "" {
+		return quicknodeEthereumMainnetWSSURL, true
 	}
 	return configured, false
 }

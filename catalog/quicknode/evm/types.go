@@ -58,65 +58,6 @@ func canonicalQuantity(s string) (string, error) {
 	return "0x" + digits, nil
 }
 
-type TransferKind uint8
-
-const (
-	ERC20 TransferKind = iota + 1
-	ERC721
-	ERC1155
-	Native
-)
-
-type TransferKinds uint8
-
-const (
-	TokenTransfers TransferKinds = 1 << iota
-	NativeTransactions
-	AllTransfers = TokenTransfers | NativeTransactions
-)
-
-type Checkpoint struct {
-	ChainID         ChainID       `json:"chain_id"`
-	NextBlock       uint64        `json:"next_block"`
-	CanonicalParent Hash          `json:"canonical_parent"`
-	CurrentBlock    Hash          `json:"current_block,omitempty"`
-	TransferOffset  uint64        `json:"transfer_offset,omitempty"`
-	Address         Address       `json:"address"`
-	Events          TransferKinds `json:"events"`
-}
-
-type Transfer struct {
-	ChainID     ChainID
-	Kind        TransferKind
-	BlockNumber uint64
-	BlockHash   Hash
-	TxHash      Hash
-	TxIndex     uint
-	LogIndex    *uint
-	// BatchIndex distinguishes entries in one ERC-1155 TransferBatch log.
-	BatchIndex *uint
-	From       Address
-	To         Address
-	Contract   Address
-	TokenID    string
-	Amount     string
-	Removed    bool
-}
-
-func (t Transfer) ID() string {
-	if t.Kind == Native {
-		return fmt.Sprintf("evm:%s:native:%s:%s", t.ChainID, t.BlockHash, t.TxHash)
-	}
-	if t.LogIndex == nil {
-		return ""
-	}
-	id := fmt.Sprintf("evm:%s:log:%s:%s:%d", t.ChainID, t.BlockHash, t.TxHash, *t.LogIndex)
-	if t.BatchIndex != nil {
-		return fmt.Sprintf("%s:%d", id, *t.BatchIndex)
-	}
-	return id
-}
-
 type Log struct {
 	ChainID     ChainID
 	BlockNumber uint64
@@ -156,17 +97,46 @@ func (f Logs) Clone() Logs {
 }
 
 func (f Logs) Validate() error {
+	hasFilter := len(f.Addresses) > 0
 	for _, a := range f.Addresses {
 		if _, err := ParseAddress(string(a)); err != nil {
 			return err
 		}
 	}
 	for _, set := range f.Topics {
+		hasFilter = hasFilter || len(set) > 0
 		for _, h := range set {
 			if _, err := ParseHash(string(h)); err != nil {
 				return fmt.Errorf("topic: %w", err)
 			}
 		}
 	}
+	if !hasFilter {
+		return errors.New("log filter requires an address or topic")
+	}
 	return nil
+}
+
+func (f Logs) rpcArgs() map[string]any {
+	args := map[string]any{}
+	if len(f.Addresses) == 1 {
+		args["address"] = f.Addresses[0]
+	} else if len(f.Addresses) > 1 {
+		args["address"] = f.Addresses
+	}
+	if len(f.Topics) > 0 {
+		topics := make([]any, len(f.Topics))
+		for i, choices := range f.Topics {
+			switch len(choices) {
+			case 0:
+				topics[i] = nil
+			case 1:
+				topics[i] = choices[0]
+			default:
+				topics[i] = choices
+			}
+		}
+		args["topics"] = topics
+	}
+	return args
 }
