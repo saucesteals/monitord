@@ -1,147 +1,104 @@
 # monitord
 
-**Run tiny Go monitors with durable state, safe redeploys, and reliable notifications—without rebuilding the runtime around every watch.**
+**The runtime for monitors that cannot afford to miss.**
 
-monitord is a daemon and authoring SDK for focused, stateful monitors. Your code talks to the source and decides what changed. monitord handles scheduling, persistence, worker lifecycle, health, and delivery.
+Catch the seat that opens for thirty seconds. The filing that lands overnight. The product page that quietly changes. The stream event that arrives while your process is restarting.
 
-Use it to poll an API, watch inventory, consume a stream, or follow on-chain activity. A monitor is a normal Go package—not a configuration language or a long-running service you have to operate on its own.
+monitord turns focused Go programs into durable, observable monitors. Your code decides what changed. One daemon runs the system around that decision.
 
-## Your logic, its runtime
+## Small monitors, serious infrastructure
 
-| You write | monitord owns |
+A useful monitor may be only a request, a comparison, and an event. Operating it is the hard part.
+
+Networks fail. Processes restart. Deploys overlap. Streams disconnect. Notifications rate-limit. Sources repeat data, rewrite history, or disappear for days. State must survive all of it without turning every monitor into its own service.
+
+monitord provides that missing runtime:
+
+| Capability | What it gives you |
 | --- | --- |
-| One polling or continuous Go callback | Scheduling, non-overlap, timeouts, and restarts |
-| A typed state transition | Strict decoding and durable state |
-| Checkpoints and events inside `Commit` | One atomic transaction for state, progress, and events |
-| A stable `Event.ID` | Occurrence deduplication and a durable per-destination outbox |
-| Lifetime and destinations in `monitor.yaml` | TTL expiry, health, retries, rate limits, and dead letters |
+| Typed durable state | Memory that survives restarts and remains inspectable and editable |
+| Atomic commits | State, source checkpoints, and events advance together—or not at all |
+| Worker-generation fencing | Old processes cannot write after a deploy, pause, edit, or restart |
+| Immutable event identity | Replays coalesce while conflicting reuse fails loudly |
+| Durable delivery outbox | Every destination retries independently without rerunning monitor logic |
+| Health and lifecycle supervision | Readiness, failures, recovery, timeouts, backoff, and graceful shutdown |
+| Exact secret grants | Each monitor receives only the credentials it declares |
+| Reusable network resources | Long-lived clients, connections, rate limiters, and rotating proxy pools |
 
-Deployments are built as immutable artifacts. Redeploying preserves compatible state, while worker-generation fencing prevents an old process from writing after a deploy, pause, state edit, or restart.
+The result is a monitor that stays conceptually small even when its reliability requirements are not.
 
-## A monitor is just Go
+## One decision, committed durably
 
-This monitor remembers the last inventory observation and emits only when the state changes. Source-specific network I/O happens before the small atomic decision:
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"github.com/saucesteals/monitord"
-)
-
-type State struct {
-	InStock  bool   `json:"in_stock"`
-	Observed bool   `json:"observed"`
-	Changes  uint64 `json:"changes"`
-}
-
-func main() {
-	monitord.Run(monitord.Define(
-		monitord.Info{Name: "restock", Description: "Watches product availability"},
-		monitord.Every(5*time.Minute, check),
-	))
-}
-
-func check(ctx context.Context, session *monitord.Session[State]) error {
-	inStock, err := fetchProduct(ctx) // ordinary, source-specific Go
-	if err != nil {
-		return err
-	}
-
-	return session.Commit(ctx, func(tx *monitord.Tx[State]) error {
-		previous := tx.State.InStock
-		if !tx.State.Observed {
-			tx.State.Observed, tx.State.InStock = true, inStock
-			return nil
-		}
-		if previous == inStock {
-			return nil
-		}
-
-		tx.State.InStock = inStock
-		tx.State.Changes++
-		title, severity := "Out of stock", monitord.SeverityWarn
-		if inStock {
-			title, severity = "Back in stock", monitord.SeverityInfo
-		}
-		return tx.Emit(monitord.Event{
-			ID:       fmt.Sprintf("availability:%d", tx.State.Changes),
-			Severity: severity,
-			Title:    title,
-		})
-	})
-}
+```text
+ source observation
+        │
+        ▼
+  monitor logic
+        │
+        ▼
+ ┌─────────────────────────────────────┐
+ │ atomic commit                       │
+ │                                     │
+ │ typed state + checkpoints + events │
+ └─────────────────────────────────────┘
+        │
+        ▼
+ durable per-destination outbox
+        │
+        ├── Discord bot
+        └── Discord webhook
 ```
 
-The corresponding deployment policy stays small:
+If a worker loses its acknowledgement after committing, it can replay the same transaction and receive the stored result. If a retired worker tries to commit late, generation fencing rejects it. If delivery fails, the outbox retries it without touching monitor state.
 
-```yaml
-ttl: 30d
-deliveries:
-  - discord:
-      account: personal
-      channel_id: "123456789012345678"
-    rate_limit:
-      per_second: 1
-      burst: 5
+Those guarantees are shared by every monitor instead of being reimplemented imperfectly in each one.
+
+## Poll anything. Follow anything.
+
+monitord supports two deliberately small execution models:
+
+- Polling monitors run immediately and then on a non-overlapping interval.
+- Continuous monitors own a long-lived stream or subscription under supervised lifecycle control.
+
+Both use the same state, checkpoint, event, health, secret, and delivery machinery. A five-line watcher and a durable streaming source get the same operational foundation.
+
+The included catalogs cover browser-compatible HTTP, direct and rotating-proxy clients, QuickNode transport, and managed EVM and Solana sources. On-chain monitoring is one supported workload among many, not a special runtime.
+
+## Designed for change
+
+Deployments are immutable artifacts with stable identities. Redeploying activates a fresh fenced generation while preserving compatible state. Operators can pause, resume, inspect, edit state, recover checkpoints, retry deliveries, archive, and purge without reaching into SQLite or inventing monitor-specific tooling.
+
+```bash
+monitord list
+monitord inspect <name>
+monitord state get <name>
+monitord events list <name>
+monitord pause <name>
 ```
 
-`Commit` publishes the new state and event together. Identical replays of an event coalesce; conflicting reuse of the same ID fails loudly. Delivery is at least once, with independent retry state for each destination.
+Configuration owns deployment policy and destinations. Go owns source behavior. The daemon owns runtime correctness. Each concern has one obvious home.
 
-## From clone to first deployment
+## Built to be operated
 
-The installer builds a self-contained installation under `~/.monitord` and installs a launchd user service on macOS or a systemd user service on Linux.
+- Health tracks starting, healthy, failing, unhealthy, and stopped workers.
+- Bounded, redacted errors remain available through inspection and daemon logs.
+- Delivery retries respect destination-level rate limits and end in inspectable dead letters.
+- Committed deliveries continue draining while a deployment is paused or archived.
+- Checkpoints make offline recovery and HTTP backfill explicit for durable sources.
+- Checkpoint recovery resets source progress without discarding deployment identity or typed state.
+
+monitord is intentionally local-first and self-contained: a Go toolchain, one SQLite database, immutable worker artifacts, and a launchd or systemd user service.
+
+## Explore
+
+- [Monitor authoring](docs/monitors.md) — the Go contract, state, checkpoints, events, lifecycle resources, and secrets.
+- [Operations](docs/operations.md) — installation, deployment lifecycle, health, logs, delivery recovery, and backups.
+- [HTTP watch](examples/http-watch) — a complete package-structured monitor.
+- [`catalog/httpx`](catalog/httpx) — browser-compatible clients and rotating proxy pools.
+- [`catalog/quicknode`](catalog/quicknode) — provider transport and managed chain sources.
 
 ```bash
 git clone https://github.com/saucesteals/monitord.git
 cd monitord
 ./infra/install.sh
-
-monitord new restock
 ```
-
-Edit `~/.monitord/monitors/restock/`, add a destination to its `monitor.yaml`, then test one callback locally before deploying:
-
-```bash
-# macOS: store a Discord bot token in Keychain
-monitord account set discord personal --token "$DISCORD_TOKEN"
-
-monitord test restock
-monitord deploy restock
-monitord inspect restock
-```
-
-`monitord test` builds the real monitor and shows emitted events and state changes without persisting state or sending notifications. On Linux, direct Discord webhooks are available without the macOS Keychain account backend. See [operations](docs/operations.md#accounts-and-destinations) for destination setup and installer options.
-
-Once deployed, the everyday surface stays compact:
-
-```bash
-monitord list
-monitord inspect restock
-monitord state get restock
-monitord events list restock
-monitord pause restock
-```
-
-## Built for monitors that need memory
-
-- Poll immediately and then on a non-overlapping interval with `Every`, or own one long-lived stream with `Continuous`.
-- Keep operator-editable data in typed state and source progress in durable checkpoints.
-- Grant each worker generation only the exact secrets declared by its plan.
-- Reuse lifecycle-owned clients and connections, including browser-compatible HTTP and proxy pools.
-- Start EVM and Solana monitors from the QuickNode catalogs with chain identity, finality, and replay behavior already modeled.
-- Let committed deliveries drain even while a deployment is paused, expired, or archived.
-
-## Go deeper
-
-- [Monitor authoring](docs/monitors.md) — state, checkpoints, event identity, secrets, lifecycle resources, and the complete `monitor.yaml` reference.
-- [Operations](docs/operations.md) — installation layout, deployments, health, logs, delivery recovery, and backups.
-- [HTTP watch example](examples/http-watch) — a package-structured monitor over multiple targets.
-- [`catalog/httpx`](catalog/httpx) — browser-compatible direct and rotating-proxy clients.
-- [`catalog/quicknode`](catalog/quicknode) — provider transport plus managed [EVM](catalog/quicknode/evm) and [Solana](catalog/quicknode/solana) sources.
-
-Use `monitord <command> --help` for the exact CLI surface.
