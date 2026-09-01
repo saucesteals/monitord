@@ -1,11 +1,72 @@
 ---
 name: monitord
-description: Build, test, deploy, and operate durable monitord monitors with typed state, polling or continuous plans, exact scoped secrets, and at-least-once notification delivery.
+description: Author, test, deploy, and operate V5 monitord monitors with typed state, checkpoints, lifecycle-owned resources, exact secrets, and durable event delivery. Use for work inside a monitord installation or monitor source tree.
 ---
 
 # monitord
 
-Use monitord for a recurring or streaming watch that needs durable state and reliable event handoff.
+Use monitord for recurring or streaming watches that need durable progress and reliable notification handoff. Inspect the existing monitor and `monitor.yaml` before changing behavior; preserve its source semantics, destinations, and deployment name unless the user asks otherwise.
+
+## Authoring model
+
+A monitor is a small Go package with one `Monitor[S]`, one polling or continuous plan, and a `monitor.yaml`. Keep entrypoint, metadata, plan, and state together. Split source-specific fetching or parsing only where it forms a useful boundary; do not impose a file-count rule.
+
+```go
+package main
+
+import (
+	"context"
+	"time"
+
+	"github.com/saucesteals/monitord"
+)
+
+var ordersURL = monitord.RequiredSecret("orders", "websocket-url")
+
+type State struct {
+	Cursor uint64 `json:"cursor"`
+}
+
+func main() {
+	monitord.Run(monitord.Define(
+		monitord.Info{Name: "orders", Description: "Watches new orders"},
+		monitord.Continuous(watch, monitord.WithSecrets(ordersURL)),
+	))
+}
+
+func watch(ctx context.Context, session *monitord.Session[State]) error {
+	endpoint, err := session.Secrets().Require(ordersURL)
+	if err != nil {
+		return err
+	}
+	return consumeOrders(ctx, endpoint, func(order Order) error {
+		return session.Commit(ctx, func(tx *monitord.Tx[State]) error {
+			if order.Cursor <= tx.State.Cursor {
+				return nil
+			}
+			tx.State.Cursor = order.Cursor
+			return tx.Emit(monitord.Event{ID: "order:" + order.ID, Title: "New order"})
+		})
+	})
+}
+```
+
+Use lower-case kebab-case for monitor names and secret group/key components. `SecretSet.Require` and `Get` accept the declared `SecretRef`, not raw strings.
+
+## Choose the right durable primitive
+
+- State is user-meaningful monitor memory and configuration that operators may inspect or edit with `monitord state`.
+- Checkpoints are daemon-owned source progress or observations used for replay, cursors, baselines, and transition counters.
+- Events are immutable source occurrences. Use a source ID or a state/checkpoint-backed sequence; never use the current time merely to manufacture uniqueness.
+- State, checkpoint updates, and events written in one `Commit` are atomic.
+
+Perform network I/O, sleeping, and expensive parsing outside `Commit`. Recheck ordering and repeated-condition predicates inside the closure. Keep it bounded and deterministic; do not retain `tx.State` references or launch goroutines from it. The SDK retains and resends an unacknowledged transaction, so never implement ACK retry by rerunning a closure.
+
+## Lifecycle-owned resources
+
+When a monitor needs a reusable client, proxy pool, connection, or subscription, implement `monitord.Starter` and optionally `monitord.Stopper` on the monitor. Construct it in `Start(context.Context, monitord.Environment)`, after exact secrets are available and before the worker becomes ready. Stop closes resources after callbacks have ended. A failing `Start` must clean up its partial work.
+
+For browser-compatible HTTP and proxy rotation, use `catalog/httpx`. A proxy secret is a JSON array of `http`, `https`, or `socks5` URLs. Create one `httpx.ProxyClient` in `Start`; do not recreate clients inside each check.
 
 ## Workflow
 
@@ -17,68 +78,8 @@ monitord deploy <name> [--name <deployment>]
 monitord inspect <deployment>
 ```
 
-Run the local test command before deploy. Deployment names select instances; `Info.Name` identifies Go behavior and is not a persistence key. Keep the entrypoint, metadata, plan, and state contract in `monitor.go`; split source or domain logic into additional files only when the boundary is useful.
+`test` runs one callback without persisting state or sending notifications. Use `--stored-state` when behavior depends on deployed state. Redeploy preserves deployment identity and state; use `--reset-state` only for an intentional incompatible state reset.
 
-## Authoring contract
+Before handing off a change, build the monitor module, run `monitord test` when its external dependencies are available, and inspect the deployed generation after rollout. Do not edit the SQLite database directly. Use `state get/set/clear`, lifecycle commands, and `events retry` for operator changes.
 
-```go
-type State struct { Cursor uint64 `json:"cursor"` }
-
-func main() {
-	monitord.Run(monitord.Define(
-		monitord.Info{Name: "orders"},
-		monitord.Continuous(watch,
-			monitord.WithSecrets(monitord.RequiredSecret("orders", "ORDERS_WSS_URL"))),
-	))
-}
-
-func watch(ctx context.Context, session *monitord.Session[State]) error {
-	endpoint, err := session.Secrets().Require("orders", "ORDERS_WSS_URL")
-	if err != nil { return err }
-	stream, err := connect(ctx, endpoint)
-	if err != nil { return err }
-	for stream.Next(ctx) {
-		record := stream.Record()
-		if err := session.Commit(ctx, func(tx *monitord.Tx[State]) error {
-			if record.Cursor <= tx.State.Cursor { return nil }
-			tx.State.Cursor = record.Cursor
-			return tx.Emit(monitord.Event{ID: "order:"+record.ID, Title: "New order"})
-		}); err != nil { return err }
-	}
-	return stream.Err()
-}
-```
-
-Choose `Every(interval, fn)` for polling and `Continuous(fn)` for streams. A monitor has one plan; use separate deployments for independent work. Callback errors are returned to the daemon, which owns restart and backoff.
-
-## Transaction rules
-
-- Perform network I/O, sleeping, and expensive parsing before `Commit`.
-- Recheck cursors, ordering, and repeated-condition predicates against `tx.State`.
-- Keep the closure bounded and deterministic; do not launch goroutines or retain `tx.State` references.
-- Use `Tx.Checkpoint` for source resume boundaries and `Session.Checkpoint` to read them.
-- Handler state, checkpoints, events, and outbox rows commit together.
-- Do not implement retries by rerunning a closure. The SDK retains and resends the exact frame until its durable ACK is known.
-
-## Event identity
-
-Use an immutable occurrence identifier for `Event.ID`, such as a chain/log identity or source record ID. A recurring condition needs a new occurrence ID. Suppress repeated conditions using durable monitor state. monitord assigns the durable outbox timestamp; do not put wall-clock presentation metadata into occurrence identity. Delivery is durable and at least once per destination; do not promise external exactly-once behavior.
-
-## Secrets
-
-Declare exact refs with `WithSecrets`; never read arbitrary environment variables, put values in source/config, or log secret-bearing URLs. Only requested values enter the worker handshake. `describe` reports references, never values.
-
-## Operations
-
-```bash
-monitord list
-monitord inspect <name-or-full-id>
-monitord state get|set|clear <name-or-full-id>
-monitord events list <name-or-full-id>
-monitord pause <name-or-full-id>
-monitord resume <name-or-full-id> --persistent
-monitord archive <name-or-full-id>
-monitord purge <name-or-full-id>
-```
-
-State changes and resume/redeploy create a new fenced worker generation. Pausing and archiving do not discard queued deliveries. Purge is destructive and must report pending deliveries.
+When working in the monitord checkout, `docs/monitors.md` and `docs/operations.md` provide the full configuration and operational reference. The skill remains usable when installed by itself through `monitord skill`.

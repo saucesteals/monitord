@@ -81,20 +81,23 @@ func commitObservation(tx *monitord.Tx[State], result observation) error {
 	}
 
 	previous, seen := tx.State.Targets[result.target.Name]
-	next := TargetState{Status: result.status, Reachable: result.err == nil}
-	tx.State.Targets[result.target.Name] = next
+	next := TargetState{Status: result.status, Reachable: result.err == nil, Transitions: previous.Transitions}
 	if next.Reachable && next.Status < http.StatusBadRequest {
 		tx.State.LastOK = result.time
 	}
 
-	unchanged := seen && previous == next
+	unchanged := seen && previous.Status == next.Status && previous.Reachable == next.Reachable
 	initiallyHealthy := !seen && next.Reachable && next.Status < http.StatusBadRequest
+	if !unchanged && !initiallyHealthy {
+		next.Transitions++
+	}
+	tx.State.Targets[result.target.Name] = next
 	if unchanged || initiallyHealthy {
 		return nil
 	}
 
 	event := monitord.Event{
-		ID:       fmt.Sprintf("http:%s:%d", result.target.Name, result.time.UnixNano()),
+		ID:       fmt.Sprintf("http:%s:%d", result.target.Name, next.Transitions),
 		Severity: monitord.SeverityWarn,
 		Title:    fmt.Sprintf("%s returned HTTP %d", result.target.Name, result.status),
 	}

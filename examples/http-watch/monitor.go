@@ -14,8 +14,9 @@ type State struct {
 }
 
 type TargetState struct {
-	Status    int  `json:"status,omitempty"`
-	Reachable bool `json:"reachable"`
+	Status      int    `json:"status,omitempty"`
+	Reachable   bool   `json:"reachable"`
+	Transitions uint64 `json:"transitions,omitempty"`
 }
 
 func main() {

@@ -1,37 +1,64 @@
 # monitord
 
-`monitord` runs small, stateful Go monitors while the daemon owns deployment identity, scheduling, durable state, worker fencing, checkpoints, event delivery, and recovery.
+`monitord` runs small, stateful Go monitors while one daemon owns scheduling, durable state, worker generations, checkpoints, health, and at-least-once event delivery.
 
-The authoring model has two layers: a monitor declares its identity and opaque plan; `monitord.Run` compiles that plan into a daemon-owned session. State belongs to an immutable deployment ID, not a Go implementation name or source directory.
+V5 favors explicit monitor code over framework magic. A monitor declares one polling or continuous plan; optional lifecycle interfaces own reusable clients and connections; exact secret references grant only the credentials that generation needs.
 
-## Upgrading from V4
+## Install
 
-V5 is an intentional clean break. Export or back up a V4 root before opening it with this release. Route and account configuration remains reusable, but deployments must be created again because runtime identity and storage are deployment-based. Monitors that need proxies declare an exact secret and construct a lifecycle-owned client with `catalog/httpx`.
+The installer creates a self-contained root, builds the CLI, and installs a user service with launchd on macOS or systemd on Linux:
 
-## A monitor
+```bash
+git clone https://github.com/saucesteals/monitord.git
+cd monitord
+./infra/install.sh
+monitord version
+```
 
-Treat each monitor as a small Go package. Keep its contract together and split
-out only the implementation that has a useful domain boundary:
+By default, the root is `~/.monitord` and the CLI symlink is `~/.local/bin/monitord`. Use `./infra/install.sh --help` for a different root, ref, repository, or service mode. A manual development daemon is also valid:
+
+```bash
+go run ./cmd/monitord --root /tmp/monitord-dev init
+go run ./cmd/monitord --root /tmp/monitord-dev daemon
+```
+
+## V4 to V5
+
+V5 does not migrate V4 databases or monitor state schemas. Stop the old daemon, move or back up the complete V4 root, and install V5 into a clean root. Recreate deployments, then restore only intentional state through `monitord state set`.
+
+On macOS, Keychain account tokens remain available to the same OS user. Named agent routes live in the database and must be recreated. Never point V5 at a populated V4 database; the schema guard rejects incompatible roots instead of attempting an upgrade or downgrade.
+
+## Create a monitor
+
+```bash
+monitord new restock
+```
+
+Treat the generated directory as a small Go package. Keep its contract together and split fetching or parsing only when the boundary is useful:
 
 ```text
 restock/
 ├── monitor.go
-├── check.go
 └── monitor.yaml
 ```
 
-`monitor.go` contains the entrypoint, metadata, plan, and durable schema:
+For a monitor this small, `monitor.go` can contain the whole implementation. Split fetching or parsing into another file only when it becomes a useful domain boundary.
 
 ```go
 package main
 
 import (
+	"context"
+	"fmt"
 	"time"
 
 	"github.com/saucesteals/monitord"
 )
 
-type State struct { InStock bool `json:"in_stock"` }
+type State struct {
+	InStock bool   `json:"in_stock"`
+	Changes uint64 `json:"changes"`
+}
 
 func main() {
 	monitord.Run(monitord.Define(
@@ -39,113 +66,87 @@ func main() {
 		monitord.Every(5*time.Minute, check),
 	))
 }
-```
-
-`check.go` owns the polling behavior:
-
-```go
-package main
-
-import (
-	"context"
-
-	"github.com/saucesteals/monitord"
-)
 
 func check(ctx context.Context, session *monitord.Session[State]) error {
 	inStock, err := fetchProduct(ctx) // network I/O stays outside Commit
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	return session.Commit(ctx, func(tx *monitord.Tx[State]) error {
-		wasInStock := tx.State.InStock
-		tx.State.InStock = inStock
-		if inStock && !wasInStock {
-			return tx.Emit(monitord.Event{ID: "restock:2026-08-31", Title: "Back in stock"})
+		if tx.State.InStock == inStock {
+			return nil
 		}
-		return nil
+		tx.State.InStock = inStock
+		tx.State.Changes++
+		if !inStock {
+			return nil
+		}
+		return tx.Emit(monitord.Event{
+			ID:    fmt.Sprintf("restock:%d", tx.State.Changes),
+			Title: "Back in stock",
+		})
 	})
 }
 ```
 
-`Every` runs immediately and then without overlap. `Continuous` runs one long-lived source. A monitor has exactly one plan; deploy separate monitors for independent polling or streaming work.
-
-## Durable sessions
-
-- `Session.State()` decodes a fresh state value. Maps, slices, pointers, and `big.Int` values never alias canonical state.
-- `Session.Commit` admits one bounded deterministic closure at a time. Fetch and decode externally before entering it, then recheck ordering against `tx.State`.
-- `Tx.Emit` and `Tx.Checkpoint` become durable atomically with state.
-- `Session.Checkpoint(source, &value)` reads a fresh daemon-owned checkpoint snapshot.
-- A closure error, panic, encoding failure, or cancellation before admission publishes nothing.
-
-The worker retains the exact unacknowledged transaction bytes. If an ACK is lost it resends those bytes; the daemon returns the ledgered ACK for the same `(deployment, generation, sequence, payload hash)`. Cancellation after admission does not reconstruct or abandon the frame.
-
-## Events and delivery
-
-`Event.ID` is an immutable source occurrence ID. Replaying the same ID and payload coalesces; reusing it for different content conflicts. Monitors suppress repeated conditions in their durable state, keeping delivery semantics explicit. monitord timestamps an event when it enters the durable outbox, so wall-clock delivery metadata cannot change occurrence identity.
-
-Events enter a durable per-destination outbox in the same SQLite commit. Delivery is at least once: a destination may receive a duplicate if it accepted a request immediately before the daemon lost the success marker. Retries, partial destination success, leases, and dead letters are independent of worker lifetime.
-
-Delivery throughput is configured beside each destination in `monitor.yaml`. The
-limit applies to attempts for that binding, including retries:
+`monitor.yaml` owns deployment policy and destinations. Choose exactly one of a lifetime or persistence:
 
 ```yaml
+ttl: 30d
+health:
+  failure_threshold: 3
+events:
+  max_per_transaction: 20
+  retention: 30d
 deliveries:
   - discord:
-      account: jarvis
+      account: personal
       channel_id: "123456789012345678"
     rate_limit:
       per_second: 1
       burst: 5
 ```
 
-Omitting `rate_limit` leaves the destination unthrottled. Terminal outbox data
-is removed after the deployment's `events.retention` window; pending and leased
-deliveries are never pruned because of age.
-
-## Exact secrets
-
-Plans request exact group/key references:
-
-```go
-var ordersWebSocketURL = monitord.RequiredSecret("orders", "websocket-url")
-
-monitord.Continuous(watch, monitord.WithSecrets(
-	ordersWebSocketURL,
-))
-```
-
-Only requested keys cross the generation-bound handshake. Read them with `session.Secrets().Require(ordersWebSocketURL)`. Resolution precedence is deployment credential override, monitor-local `.env`, `~/.monitord/secrets/<group>.env`, global `~/.monitord/.env`, then a declared non-secret default. Workers and compiler subprocesses receive scrubbed environments.
-
-## QuickNode catalog
-
-The turnkey case is intentionally small:
-
-```go
-func main() {
-	monitord.Run(quicknode.Wallet{Address: quicknode.Address("0x7130...7777")})
-}
-```
-
-The catalog also exposes managed confirmed `quicknode.Events[S]` and a raw JSON-RPC client. Wallet monitoring covers ERC-20/721/1155 Transfer logs and non-zero top-level native transactions; it does not imply internal traces or every balance change.
-
-## CLI workflow
+Store the Discord token in Keychain, then test and deploy:
 
 ```bash
-monitord new restock
+monitord account set discord personal --token "$DISCORD_TOKEN"
 monitord test restock
-monitord deploy restock --name shop-restock
-monitord deploy restock --name shop-restock --reset-state # incompatible schema change
-monitord list
-monitord inspect shop-restock
-monitord state get shop-restock
-monitord events list shop-restock
-monitord pause shop-restock
-monitord resume shop-restock --persistent
-monitord archive shop-restock
-monitord purge shop-restock         # permanently delete archived data
+monitord deploy restock
+monitord inspect restock
 ```
 
-Deploying an existing name preserves its immutable deployment ID and state while activating a new artifact and worker generation. Manual state changes fence the old generation. Inactive and archived deployments continue draining already committed outbox rows.
+`test` runs one callback locally without saving state or sending deliveries. Deploying an existing name keeps its immutable deployment ID and compatible state while activating a newly built artifact and worker generation.
 
-Built binaries live in a global content-addressed cache. A failed deployment may leave a reusable cache entry on disk, but never creates a visible artifact or deployment row in SQLite.
+## Core semantics
 
-State is strictly decoded into the monitor's Go type. Use `state get/set/clear` for ordinary edits. For an incompatible Go schema change, redeploy with `--reset-state` so the new monitor supplies its defaults. State edits fence stale workers automatically.
+- `Every` runs immediately and then at its interval without overlap. `Continuous` runs one long-lived callback.
+- `Session.State()` returns a fresh typed copy. Strict decoding rejects unknown fields.
+- `Session.Commit` atomically persists state, checkpoints, and events.
+- `Event.ID` identifies one source occurrence. Duplicate IDs with identical payloads coalesce; conflicting reuse fails.
+- Events enter a durable per-destination outbox. Delivery is at least once, so an external destination can rarely receive a duplicate.
+- Worker generations fence stale writes after deploys, state edits, pauses, or restarts.
+- Ordinary callback failures update health and continue polling. Fatal callbacks and continuous-plan exits restart with backoff.
+
+## Documentation
+
+- [Monitor authoring](docs/monitors.md): state, checkpoints, events, lifecycle clients, proxy pools, secrets, and the complete `monitor.yaml` shape.
+- [Operations](docs/operations.md): installation layout, deployments, health, logs, outbox recovery, state editing, and clean-root recovery.
+- [`catalog/httpx`](catalog/httpx): browser-compatible direct and rotating proxy clients.
+- [`catalog/quicknode`](catalog/quicknode): raw EVM access, confirmed event handling, and turnkey wallet monitoring.
+
+## Common CLI workflow
+
+```bash
+monitord list
+monitord inspect restock
+monitord state get restock
+monitord events list restock
+monitord pause restock
+monitord resume restock --persistent
+monitord pause restock
+monitord archive restock
+monitord purge restock
+```
+
+Use `monitord <command> --help` for flags and destructive-operation requirements.
