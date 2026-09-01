@@ -202,6 +202,8 @@ client, err := solana.Open(ctx, solana.Config{
 
 Solana defaults to `finalized`; `GetBlock` and `GetTransaction` reject `processed`, explicitly support transaction version zero by default, and retain variable block and transaction bodies as `json.RawMessage`. The context passed to `Subscribe` bounds its opening handshake; close subscriptions before their client in `Stop`. Subscriptions reconnect with bounded attempts but do not replay missed notifications, so durable monitors need HTTP backfill, checkpoints, and stable event IDs.
 
+Treat a durable cursor and authoritative replay as the default for chain monitors. Raw WebSocket-only monitoring is reserved for explicitly disposable signals or protocols with another guaranteed replay source; the monitor should document why losing a notification is acceptable.
+
 ## monitor.yaml
 
 Choose exactly one lifetime mode:

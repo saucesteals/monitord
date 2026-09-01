@@ -74,6 +74,8 @@ Use `catalog/quicknode` only for provider transport. Use `catalog/quicknode/evm`
 
 Managed `evm.Events` and `evm.Wallet` default to the Ethereum-mainnet HTTP secret; set `HTTPSecret` for another exact EVM network key. Managed `solana.AddressEvents` uses finalized HTTP signature history as its durable source and WSS only as a wake-up, atomically advancing its checkpoint with handler output. `MatchLogs` is only a live-path optimization: signatures without a WebSocket hint are always fetched during backfill. Use `HTTPSecret` and `WSSSecret` for non-default networks. Raw clients and subscriptions are lifecycle-owned: close subscriptions before the client, and use HTTP backfill plus checkpoints whenever reconnect gaps matter.
 
+Chain monitors must use a durable cursor and authoritative replay by default. A raw WebSocket-only monitor is acceptable only when missed events are intentionally disposable or another source guarantees replay; document that exception in the monitor.
+
 ## Workflow
 
 ```bash
