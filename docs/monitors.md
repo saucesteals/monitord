@@ -75,6 +75,11 @@ return tx.Emit(monitord.Event{
 
 Do not use the current time merely to manufacture uniqueness. Replaying the same ID and payload coalesces; reusing an ID for different content conflicts while that occurrence is retained. monitord assigns delivery timestamps when the event enters the outbox.
 
+A correction is a new immutable event whose `CorrectionOf` names the original
+event ID. Give the correction its own stable ID. Delivery adapters show the
+relationship as a `corrects` field; they never rewrite or delete a notification
+that may already have been seen.
+
 The valid severities are `info`, `warn`, and `critical`. Keep scraped or untrusted text in event fields; delivery adapters constrain mentions so source text cannot create arbitrary pings.
 
 ## Exact secrets
@@ -198,12 +203,20 @@ secrets and set `ExpectedChainID` and `Confirmations`. A fresh deployment starts
 at the current confirmed edge unless `BackfillFrom` is set.
 
 Filters should include every address and indexed topic known in advance. A
-handler may perform a small deterministic read at the event's exact block, then
-return an `EventUpdate`. Event IDs and content must be stable: confirmed replay
-is inclusive and the durable outbox coalesces an identical event ID, while
-different content for the same ID is an error. Live logs may have `Removed` set
-after an EVM reorganization; monitors that alert before confirmation must choose
-how to represent that correction.
+handler may perform a small deterministic read using the event's block hash,
+then return an `EventUpdate`. EIP-1898 calls should set `requireCanonical` so a
+fork change cannot silently substitute state from another block. Event IDs and
+content must be stable: confirmed replay is inclusive and the durable outbox
+coalesces an identical event ID, while different content for the same ID is an
+error.
+
+`Log.Confirmed` distinguishes canonical HTTP replay from the immediate WSS
+observation. `Events` journals matching live logs until the confirmation
+boundary. It passes an orphan back with `Log.Removed`, either from the live
+subscription or after comparing the durable journal with canonical replay.
+That journal makes corrections survive a disconnected WebSocket. A monitor
+that alerts immediately should remember which live logs actually emitted and
+return a correction only for those occurrences.
 
 `solana.AddressEvents` uses QuickNode `transactionSubscribe` with vote and failed
 transactions excluded and the monitored address applied at the provider. Each

@@ -59,16 +59,17 @@ func canonicalQuantity(s string) (string, error) {
 }
 
 type Log struct {
-	ChainID     ChainID
-	BlockNumber uint64
-	BlockHash   Hash
-	TxHash      Hash
-	TxIndex     uint
-	LogIndex    uint
-	Address     Address
-	Topics      []Hash
-	Data        []byte
-	Removed     bool
+	ChainID     ChainID `json:"chain_id"`
+	BlockNumber uint64  `json:"block_number"`
+	BlockHash   Hash    `json:"block_hash"`
+	TxHash      Hash    `json:"transaction_hash"`
+	TxIndex     uint    `json:"transaction_index"`
+	LogIndex    uint    `json:"log_index"`
+	Address     Address `json:"address"`
+	Topics      []Hash  `json:"topics"`
+	Data        []byte  `json:"data"`
+	Removed     bool    `json:"removed,omitempty"`
+	Confirmed   bool    `json:"confirmed,omitempty"`
 }
 
 func (l Log) ID() string {

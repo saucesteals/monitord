@@ -50,6 +50,18 @@ func (c *Client) blockByNumber(ctx context.Context, n uint64) (rpcBlock, error) 
 	}
 	return rpcBlock{}, err
 }
+
+// IsCanonicalBlock reports whether hash is currently canonical at number.
+func (c *Client) IsCanonicalBlock(ctx context.Context, number uint64, hash Hash) (bool, error) {
+	if _, err := ParseHash(string(hash)); err != nil {
+		return false, err
+	}
+	block, err := c.blockByNumber(ctx, number)
+	if err != nil {
+		return false, err
+	}
+	return block.Hash == hash, nil
+}
 func (c *Client) logs(ctx context.Context, f Logs, from, to uint64) ([]Log, error) {
 	arg := map[string]any{"fromBlock": fmt.Sprintf("0x%x", from), "toBlock": fmt.Sprintf("0x%x", to)}
 	return c.logsWithArg(ctx, f, arg)

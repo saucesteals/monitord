@@ -14,8 +14,10 @@ import (
 
 const (
 	eventsCursorSource     = "quicknode.evm.events-cursor"
+	eventsLiveSource       = "quicknode.evm.events-live"
 	defaultBackfillRange   = uint64(10_000)
 	defaultReconcilePeriod = 2 * time.Second
+	maxLiveLogs            = 256
 )
 
 type eventsCursor struct {
@@ -25,6 +27,12 @@ type eventsCursor struct {
 	CanonicalParent Hash    `json:"canonical_parent,omitempty"`
 	CurrentBlock    Hash    `json:"current_block,omitempty"`
 	NextLog         uint64  `json:"next_log,omitempty"`
+}
+
+type eventsLive struct {
+	ChainID ChainID `json:"chain_id"`
+	Filter  Logs    `json:"filter"`
+	Logs    []Log   `json:"logs,omitempty"`
 }
 
 type EventUpdate[S any] func(*monitord.Tx[S]) error
@@ -108,6 +116,10 @@ func (e Events[S]) run(ctx context.Context, session *monitord.Session[S]) error 
 	if err != nil {
 		return err
 	}
+	live, err := e.loadLive(session, client)
+	if err != nil {
+		return err
+	}
 	interval := e.ReconcileInterval
 	if interval <= 0 {
 		interval = defaultReconcilePeriod
@@ -123,7 +135,7 @@ func (e Events[S]) run(ctx context.Context, session *monitord.Session[S]) error 
 				if !ok {
 					return errors.New("quicknode evm: log subscription closed")
 				}
-				if err := e.handle(ctx, session, client, log, nil); err != nil {
+				if err := e.handleLive(ctx, session, client, &live, log); err != nil {
 					return err
 				}
 			default:
@@ -131,7 +143,7 @@ func (e Events[S]) run(ctx context.Context, session *monitord.Session[S]) error 
 			}
 		}
 	reconcile:
-		caughtUp, err := e.reconcileOne(ctx, session, client, confirmations, &cursor)
+		caughtUp, err := e.reconcileOne(ctx, session, client, confirmations, &cursor, &live)
 		if err != nil {
 			return err
 		}
@@ -145,7 +157,7 @@ func (e Events[S]) run(ctx context.Context, session *monitord.Session[S]) error 
 			if !ok {
 				return errors.New("quicknode evm: log subscription closed")
 			}
-			if err := e.handle(ctx, session, client, log, nil); err != nil {
+			if err := e.handleLive(ctx, session, client, &live, log); err != nil {
 				return err
 			}
 		case err, ok := <-subscription.Err():
@@ -208,18 +220,76 @@ func (e Events[S]) loadCursor(ctx context.Context, session *monitord.Session[S],
 			cursor.NextBlock = head - confirmations + 1
 		}
 	}
-	return cursor, e.commit(ctx, session, cursor, nil)
+	return cursor, e.commit(ctx, session, &cursor, nil, nil)
 }
 
-func (e Events[S]) reconcileOne(ctx context.Context, session *monitord.Session[S], client *Client, confirmations uint64, cursor *eventsCursor) (bool, error) {
+func (e Events[S]) loadLive(session *monitord.Session[S], client *Client) (eventsLive, error) {
+	live := eventsLive{ChainID: client.ChainID(), Filter: e.Filter.Clone()}
+	found, err := session.Checkpoint(eventsLiveSource, &live)
+	if err != nil {
+		return live, err
+	}
+	if found && (live.ChainID != client.ChainID() || !reflect.DeepEqual(live.Filter, e.Filter.Clone())) {
+		return live, errors.New("quicknode evm: saved live source differs from this chain or filter")
+	}
+	if len(live.Logs) > maxLiveLogs {
+		return live, errors.New("quicknode evm: live log journal exceeds its bound")
+	}
+	return live, nil
+}
+
+func (e Events[S]) handleLive(ctx context.Context, session *monitord.Session[S], client *Client, live *eventsLive, log Log) error {
+	index := liveLogIndex(live.Logs, log.ID())
+	if log.Removed {
+		if index < 0 {
+			return nil
+		}
+		removed := live.Logs[index].Clone()
+		removed.Removed = true
+		update, err := e.Handle(ctx, client, removed)
+		if err != nil {
+			return err
+		}
+		next := live.Clone()
+		next.Logs = append(next.Logs[:index], next.Logs[index+1:]...)
+		if err := e.commit(ctx, session, nil, &next, update); err != nil {
+			return err
+		}
+		*live = next
+		return nil
+	}
+	if index >= 0 {
+		return nil
+	}
+	if len(live.Logs) == maxLiveLogs {
+		return errors.New("quicknode evm: live log journal is full")
+	}
+	log.Confirmed = false
+	update, err := e.Handle(ctx, client, log.Clone())
+	if err != nil {
+		return err
+	}
+	next := live.Clone()
+	next.Logs = append(next.Logs, log.Clone())
+	if err := e.commit(ctx, session, nil, &next, update); err != nil {
+		return err
+	}
+	*live = next
+	return nil
+}
+
+func (e Events[S]) reconcileOne(ctx context.Context, session *monitord.Session[S], client *Client, confirmations uint64, cursor *eventsCursor, live *eventsLive) (bool, error) {
 	head, err := client.blockNumber(ctx)
 	if err != nil {
 		return false, err
 	}
-	if head < confirmations || cursor.NextBlock > head-confirmations {
+	if head < confirmations {
 		return true, nil
 	}
 	target := head - confirmations
+	if cursor.NextBlock > target {
+		return true, nil
+	}
 	rangeSize := e.BackfillRange
 	if rangeSize == 0 {
 		rangeSize = defaultBackfillRange
@@ -230,6 +300,10 @@ func (e Events[S]) reconcileOne(ctx context.Context, session *monitord.Session[S
 	}
 	logs, err := client.logs(ctx, e.Filter, cursor.NextBlock, to)
 	if err != nil {
+		return false, err
+	}
+	removed, err := e.reconcileRangeOrphan(ctx, session, client, cursor.NextBlock, to, logs, live)
+	if err != nil || removed {
 		return false, err
 	}
 	sort.Slice(logs, func(i, j int) bool {
@@ -245,23 +319,65 @@ func (e Events[S]) reconcileOne(ctx context.Context, session *monitord.Session[S
 		if reconciled(*cursor, log) {
 			continue
 		}
+		log.Confirmed = true
 		next := *cursor
 		next.NextBlock, next.CurrentBlock, next.NextLog = log.BlockNumber, log.BlockHash, uint64(log.LogIndex)+1
-		if err := e.handle(ctx, session, client, log, &next); err != nil {
+		nextLive := live.Clone()
+		if index := liveLogIndex(nextLive.Logs, log.ID()); index >= 0 {
+			nextLive.Logs = append(nextLive.Logs[:index], nextLive.Logs[index+1:]...)
+		}
+		update, err := e.Handle(ctx, client, log.Clone())
+		if err != nil {
+			return false, err
+		}
+		if err := e.commit(ctx, session, &next, &nextLive, update); err != nil {
 			return false, err
 		}
 		*cursor = next
+		*live = nextLive
 	}
 	end, err := client.blockByNumber(ctx, to)
 	if err != nil {
 		return false, err
 	}
 	next := eventsCursor{ChainID: client.ChainID(), Filter: cursor.Filter.Clone(), NextBlock: to + 1, CanonicalParent: end.Hash}
-	if err := e.commit(ctx, session, next, nil); err != nil {
+	if err := e.commit(ctx, session, &next, nil, nil); err != nil {
 		return false, err
 	}
 	*cursor = next
 	return to == target, nil
+}
+
+func (e Events[S]) reconcileRangeOrphan(ctx context.Context, session *monitord.Session[S], client *Client, from, to uint64, canonical []Log, live *eventsLive) (bool, error) {
+	for index, observed := range live.Logs {
+		if observed.BlockNumber < from || observed.BlockNumber > to {
+			continue
+		}
+		if liveLogIndex(canonical, observed.ID()) >= 0 {
+			continue
+		}
+		block, err := client.blockByNumber(ctx, observed.BlockNumber)
+		if err != nil {
+			return false, err
+		}
+		if block.Hash == observed.BlockHash {
+			return false, fmt.Errorf("quicknode evm: canonical log %s is temporarily absent from replay", observed.ID())
+		}
+		removed := observed.Clone()
+		removed.Removed = true
+		update, err := e.Handle(ctx, client, removed)
+		if err != nil {
+			return false, err
+		}
+		next := live.Clone()
+		next.Logs = append(next.Logs[:index], next.Logs[index+1:]...)
+		if err := e.commit(ctx, session, nil, &next, update); err != nil {
+			return false, err
+		}
+		*live = next
+		return true, nil
+	}
+	return false, nil
 }
 
 func (c *Client) validateBoundary(ctx context.Context, cursor eventsCursor) error {
@@ -288,29 +404,40 @@ func (c *Client) validateBoundary(ctx context.Context, cursor eventsCursor) erro
 	return nil
 }
 
-func (e Events[S]) handle(ctx context.Context, session *monitord.Session[S], client *Client, log Log, cursor *eventsCursor) error {
-	update, err := e.Handle(ctx, client, log.Clone())
-	if err != nil {
-		return err
-	}
-	if update == nil && cursor == nil {
-		return nil
-	}
-	return e.commit(ctx, session, valueOrZero(cursor), update)
-}
-
-func (e Events[S]) commit(ctx context.Context, session *monitord.Session[S], cursor eventsCursor, update EventUpdate[S]) error {
+func (e Events[S]) commit(ctx context.Context, session *monitord.Session[S], cursor *eventsCursor, live *eventsLive, update EventUpdate[S]) error {
 	return session.Commit(ctx, func(tx *monitord.Tx[S]) error {
 		if update != nil {
 			if err := update(tx); err != nil {
 				return err
 			}
 		}
-		if cursor.ChainID != "" {
-			return tx.Checkpoint(eventsCursorSource, cursor)
+		if cursor != nil {
+			if err := tx.Checkpoint(eventsCursorSource, *cursor); err != nil {
+				return err
+			}
+		}
+		if live != nil {
+			return tx.Checkpoint(eventsLiveSource, *live)
 		}
 		return nil
 	})
+}
+
+func (l eventsLive) Clone() eventsLive {
+	clone := eventsLive{ChainID: l.ChainID, Filter: l.Filter.Clone(), Logs: make([]Log, len(l.Logs))}
+	for i := range l.Logs {
+		clone.Logs[i] = l.Logs[i].Clone()
+	}
+	return clone
+}
+
+func liveLogIndex(logs []Log, id string) int {
+	for i := range logs {
+		if logs[i].ID() == id {
+			return i
+		}
+	}
+	return -1
 }
 
 func reconciled(cursor eventsCursor, log Log) bool {
@@ -318,14 +445,6 @@ func reconciled(cursor eventsCursor, log Log) bool {
 		return true
 	}
 	return log.BlockNumber == cursor.NextBlock && cursor.CurrentBlock == log.BlockHash && uint64(log.LogIndex) < cursor.NextLog
-}
-
-func valueOrZero[T any](value *T) T {
-	if value == nil {
-		var zero T
-		return zero
-	}
-	return *value
 }
 
 func confirmationDepth(chain ChainID, configured uint64) (uint64, error) {

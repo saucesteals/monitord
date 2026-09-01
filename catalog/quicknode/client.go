@@ -198,6 +198,17 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
+// RPCError is a credential-safe error returned by the remote JSON-RPC method.
+// Transport and HTTP failures use different error types.
+type RPCError struct {
+	Code    int
+	Message string
+}
+
+func (e *RPCError) Error() string {
+	return fmt.Sprintf("JSON-RPC error %d: %s", e.Code, e.Message)
+}
+
 func (c *Client) safeRPCError(e *rpcError) error {
 	message := e.Message
 	for _, raw := range []string{c.cfg.Endpoint.HTTPURL, c.cfg.Endpoint.WSSURL} {
@@ -220,7 +231,7 @@ func (c *Client) safeRPCError(e *rpcError) error {
 			}
 		}
 	}
-	return fmt.Errorf("JSON-RPC error %d: %s", e.Code, message)
+	return &RPCError{Code: e.Code, Message: message}
 }
 
 func (c *Client) callHTTP(ctx context.Context, method string, params, out any, retry bool) error {

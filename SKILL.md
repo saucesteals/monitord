@@ -95,6 +95,10 @@ Prefer a managed chain source over wiring raw subscriptions in a monitor. Use `c
 matching logs immediately. Ranged `eth_getLogs` replay advances a confirmed
 durable cursor and repairs startup or reconnect gaps without scanning blocks one
 at a time. `Confirmations` controls replay finality, not notification latency.
+Matching live logs remain in a durable journal until replay confirms them;
+orphaned entries return to the handler with `Removed`, even when the WebSocket
+was disconnected during the reorganization. Use the log block hash with
+EIP-1898 for state reads and stable `log.ID()` identities for emitted events.
 
 `solana.AddressEvents` uses QuickNode `transactionSubscribe` with the monitored
 account applied at the provider. The live notification contains the full
