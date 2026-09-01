@@ -11,8 +11,7 @@ import (
 	"time"
 
 	monitord "github.com/saucesteals/monitord"
-	"github.com/saucesteals/monitord/internal/model"
-	"github.com/saucesteals/monitord/internal/routes"
+	"github.com/saucesteals/monitord/internal/delivery"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -23,7 +22,7 @@ const ConfigFileName = "monitor.yaml"
 type Config struct {
 	TTL        time.Duration
 	Persistent bool
-	Deliveries []routes.Delivery
+	Deliveries []delivery.Delivery
 	Policy     monitord.DeploymentPolicy
 }
 
@@ -31,7 +30,6 @@ type fileConfig struct {
 	TTL        string         `yaml:"ttl"`
 	Persistent bool           `yaml:"persistent"`
 	Deliveries []fileDelivery `yaml:"deliveries"`
-	Routes     []fileRoute    `yaml:"routes"`
 	Health     fileHealth     `yaml:"health"`
 	Events     fileEvents     `yaml:"events"`
 }
@@ -47,6 +45,7 @@ type fileEvents struct {
 
 type fileDelivery struct {
 	Discord   *fileDiscord  `yaml:"discord"`
+	OpenClaw  *fileOpenClaw `yaml:"openclaw"`
 	RateLimit fileRateLimit `yaml:"rate_limit"`
 }
 
@@ -58,10 +57,11 @@ type fileDiscord struct {
 	Mentions   string `yaml:"mentions"`
 }
 
-type fileRoute struct {
-	Route     string         `yaml:"route"`
-	Options   map[string]any `yaml:"options"`
-	RateLimit fileRateLimit  `yaml:"rate_limit"`
+type fileOpenClaw struct {
+	Account string `yaml:"account"`
+	Prompt  string `yaml:"prompt"`
+	AgentID string `yaml:"agent_id"`
+	URL     string `yaml:"url"`
 }
 
 type fileRateLimit struct {
@@ -69,8 +69,8 @@ type fileRateLimit struct {
 	Burst     int     `yaml:"burst"`
 }
 
-func (limit fileRateLimit) rateLimit() routes.RateLimit {
-	return routes.RateLimit{PerSecond: limit.PerSecond, Burst: limit.Burst}
+func (limit fileRateLimit) rateLimit() delivery.RateLimit {
+	return delivery.RateLimit{PerSecond: limit.PerSecond, Burst: limit.Burst}
 }
 
 // LoadConfig reads and validates one monitor's authored configuration.
@@ -143,40 +143,30 @@ func (raw fileConfig) validate() (Config, error) {
 		}
 	}
 
-	deliveries := make([]routes.Delivery, 0, len(raw.Deliveries)+len(raw.Routes))
+	deliveries := make([]delivery.Delivery, 0, len(raw.Deliveries))
 	for index, item := range raw.Deliveries {
-		if item.Discord == nil {
-			return Config{}, fmt.Errorf("deliveries[%d]: discord is required", index)
+		destination := delivery.Delivery{RateLimit: item.RateLimit.rateLimit()}
+		if item.Discord != nil {
+			destination.Discord = &delivery.Discord{
+				Account:    strings.TrimSpace(item.Discord.Account),
+				ChannelID:  strings.TrimSpace(item.Discord.ChannelID),
+				ThreadID:   strings.TrimSpace(item.Discord.ThreadID),
+				WebhookURL: strings.TrimSpace(item.Discord.WebhookURL),
+				Mentions:   strings.TrimSpace(item.Discord.Mentions),
+			}
 		}
-		delivery := routes.Delivery{Discord: &routes.Discord{
-			Account:    strings.TrimSpace(item.Discord.Account),
-			ChannelID:  strings.TrimSpace(item.Discord.ChannelID),
-			ThreadID:   strings.TrimSpace(item.Discord.ThreadID),
-			WebhookURL: strings.TrimSpace(item.Discord.WebhookURL),
-			Mentions:   strings.TrimSpace(item.Discord.Mentions),
-		}, RateLimit: item.RateLimit.rateLimit()}
-		if err := delivery.Validate(); err != nil {
+		if item.OpenClaw != nil {
+			destination.OpenClaw = &delivery.OpenClaw{
+				Account: strings.TrimSpace(item.OpenClaw.Account),
+				Prompt:  strings.TrimSpace(item.OpenClaw.Prompt),
+				AgentID: strings.TrimSpace(item.OpenClaw.AgentID),
+				URL:     strings.TrimSpace(item.OpenClaw.URL),
+			}
+		}
+		if err := destination.Validate(); err != nil {
 			return Config{}, fmt.Errorf("deliveries[%d]: %w", index, err)
 		}
-
-		deliveries = append(deliveries, delivery)
-	}
-	for index, item := range raw.Routes {
-		name, err := model.ParseRouteName(strings.TrimSpace(item.Route))
-		if err != nil {
-			return Config{}, fmt.Errorf("routes[%d]: %w", index, err)
-		}
-		options, err := scalarOptions(item.Options)
-		if err != nil {
-			return Config{}, fmt.Errorf("route %s: %w", name, err)
-		}
-		delivery := routes.Delivery{
-			Route: name, Options: options, RateLimit: item.RateLimit.rateLimit(),
-		}
-		if err := delivery.Validate(); err != nil {
-			return Config{}, fmt.Errorf("routes[%d]: %w", index, err)
-		}
-		deliveries = append(deliveries, delivery)
+		deliveries = append(deliveries, destination)
 	}
 
 	return Config{
@@ -200,36 +190,6 @@ func parseDuration(value string) (time.Duration, error) {
 		return 0, errors.New("must be positive")
 	}
 	return duration, nil
-}
-
-func scalarOptions(raw map[string]any) (routes.Options, error) {
-	options := make(routes.Options, len(raw))
-	for key, value := range raw {
-		key = routes.NormalizeOptionKey(key)
-		if key == "" {
-			return nil, errors.New("route option names must not be empty")
-		}
-		switch typed := value.(type) {
-		case string:
-			options[key] = typed
-		case bool:
-			options[key] = strconv.FormatBool(typed)
-		case int:
-			options[key] = strconv.Itoa(typed)
-		case int64:
-			options[key] = strconv.FormatInt(typed, 10)
-		case uint64:
-			options[key] = strconv.FormatUint(typed, 10)
-		case float64:
-			options[key] = strconv.FormatFloat(typed, 'g', -1, 64)
-		case nil:
-			options[key] = ""
-		default:
-			return nil, fmt.Errorf("route option %q must be a scalar value", key)
-		}
-	}
-
-	return options, nil
 }
 
 func requiredDuration(field string, value string) (time.Duration, error) {

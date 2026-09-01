@@ -93,10 +93,9 @@ deliveries:
     rate_limit:
       per_second: 1
       burst: 5
-
-routes:
-  - route: openclaw:analyst
-    options:
+  - openclaw:
+      account: local
+      agent_id: analyst
       prompt: Investigate this event and explain why it matters.
     rate_limit:
       per_second: 0.2
@@ -104,7 +103,7 @@ routes:
 ```
 
 - Discord receives constrained rich embeds through a bot account or direct webhook.
-- OpenClaw receives the event plus a monitor-specific prompt as an agent task.
+- OpenClaw receives the event plus a monitor-specific prompt as an agent task; it owns session, model, and outbound-channel policy.
 - Every destination has independent retry, leasing, rate limiting, and terminal state.
 - Committed deliveries keep draining while a monitor is paused or archived.
 

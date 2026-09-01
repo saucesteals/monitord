@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/saucesteals/monitord/internal/routes"
+	"github.com/saucesteals/monitord/internal/delivery"
 	"github.com/saucesteals/monitord/internal/storage"
 	"golang.org/x/time/rate"
 )
@@ -31,16 +31,19 @@ type DeliverySender interface {
 
 type daemonDeliverySender struct{ daemon *Daemon }
 
-func (s daemonDeliverySender) Send(ctx context.Context, delivery storage.ClaimedDelivery) error {
-	var binding routes.Delivery
-	if err := json.Unmarshal(delivery.DestinationConfig, &binding); err != nil {
+func (s daemonDeliverySender) Send(ctx context.Context, claimed storage.ClaimedDelivery) error {
+	var binding delivery.Delivery
+	if err := json.Unmarshal(claimed.DestinationConfig, &binding); err != nil {
 		return permanentDeliveryError{fmt.Errorf("decode destination binding: %w", err)}
 	}
-	var message routes.Message
-	if err := json.Unmarshal(delivery.MessagePayload, &message); err != nil {
+	if err := binding.Validate(); err != nil {
+		return permanentDeliveryError{fmt.Errorf("invalid destination binding: %w", err)}
+	}
+	var message delivery.Message
+	if err := json.Unmarshal(claimed.MessagePayload, &message); err != nil {
 		return permanentDeliveryError{fmt.Errorf("decode message: %w", err)}
 	}
-	return s.daemon.deliverRoute(ctx, binding, message)
+	return s.daemon.deliverDestination(ctx, binding, message)
 }
 
 type permanentDeliveryError struct{ error }
@@ -147,9 +150,9 @@ func (w *outboxWorker) sendOne(ctx context.Context, delivery storage.ClaimedDeli
 	return fmt.Errorf("delivery %s/%s failed", delivery.OutboxID, delivery.DestinationID)
 }
 
-func (w *outboxWorker) reserveDestination(delivery storage.ClaimedDelivery) (time.Duration, error) {
-	var binding routes.Delivery
-	if err := json.Unmarshal(delivery.DestinationConfig, &binding); err != nil {
+func (w *outboxWorker) reserveDestination(claimed storage.ClaimedDelivery) (time.Duration, error) {
+	var binding delivery.Delivery
+	if err := json.Unmarshal(claimed.DestinationConfig, &binding); err != nil {
 		return 0, permanentDeliveryError{fmt.Errorf("decode destination binding: %w", err)}
 	}
 	if err := binding.RateLimit.Validate(); err != nil {
@@ -159,7 +162,7 @@ func (w *outboxWorker) reserveDestination(delivery storage.ClaimedDelivery) (tim
 		return 0, nil
 	}
 
-	key := destinationLimitKey{delivery.DeploymentID, delivery.DestinationID, delivery.DestinationRevision}
+	key := destinationLimitKey{claimed.DeploymentID, claimed.DestinationID, claimed.DestinationRevision}
 	w.limitsMu.Lock()
 	limiter := w.limits[key]
 	if limiter == nil {

@@ -68,6 +68,25 @@ When no managed catalog source owns a reusable client, proxy pool, connection, o
 
 For browser-compatible HTTP and proxy rotation, use `catalog/httpx`. A proxy secret is a JSON array of `http`, `https`, or `socks5` URLs. Create one `httpx.ProxyClient` in `Start`; do not recreate clients inside each check.
 
+## Delivery
+
+Declare each destination inline under `deliveries` in `monitor.yaml`. A delivery
+contains exactly one backend plus its own optional `rate_limit`. Discord accepts
+either a named bot account with a channel or a direct webhook. OpenClaw requires
+an account token and task prompt; `agent_id` and `url` are optional. Leave
+session, model, thinking, timeout, and outbound-channel policy to OpenClaw.
+
+```yaml
+deliveries:
+  - openclaw:
+      account: local
+      agent_id: analyst
+      prompt: Investigate this event and explain why it matters.
+    rate_limit:
+      per_second: 0.2
+      burst: 1
+```
+
 ## Chain sources and QuickNode
 
 Prefer a managed chain source over wiring raw subscriptions in a monitor. Use `catalog/quicknode` only for provider transport and `catalog/quicknode/evm` or `catalog/quicknode/solana` for chain identity, finality, replay, and managed monitors. Copy exact QuickNode URLs into chain-named secret refs; never derive or rewrite endpoint hosts or paths.

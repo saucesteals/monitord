@@ -1,13 +1,3 @@
--- Operator-owned delivery routes live independently of deployment runtime
--- state.
-CREATE TABLE routes (
-    name        TEXT PRIMARY KEY,
-    kind        TEXT NOT NULL,
-    config      TEXT NOT NULL DEFAULT '{}',
-    created_at  INTEGER NOT NULL,
-    updated_at  INTEGER NOT NULL
-) STRICT;
-
 CREATE TABLE artifacts (
     id              TEXT PRIMARY KEY,
     content_hash    TEXT NOT NULL UNIQUE,

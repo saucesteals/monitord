@@ -8,7 +8,7 @@ import (
 	"time"
 
 	monitord "github.com/saucesteals/monitord"
-	"github.com/saucesteals/monitord/internal/routes"
+	"github.com/saucesteals/monitord/internal/delivery"
 	"github.com/saucesteals/monitord/internal/secrets"
 	"github.com/spf13/cobra"
 )
@@ -170,7 +170,7 @@ func (c *CLI) inspect(ctx context.Context, out io.Writer, selector string) error
 		fmt.Fprintln(out, "  none")
 	}
 	for _, binding := range view.Destinations {
-		var delivery routes.Delivery
+		var delivery delivery.Delivery
 		if err = json.Unmarshal(binding.Config, &delivery); err != nil {
 			return fmt.Errorf("decode destination %s: %w", binding.ID, err)
 		}

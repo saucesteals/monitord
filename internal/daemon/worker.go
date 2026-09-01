@@ -19,8 +19,8 @@ import (
 	"time"
 
 	monitord "github.com/saucesteals/monitord"
+	"github.com/saucesteals/monitord/internal/delivery"
 	"github.com/saucesteals/monitord/internal/monitor"
-	"github.com/saucesteals/monitord/internal/routes"
 	"github.com/saucesteals/monitord/internal/secrets"
 	"github.com/saucesteals/monitord/internal/storage"
 )
@@ -237,7 +237,7 @@ func (w *worker) transaction(ctx context.Context, store *storage.Store, wire mon
 	}
 	events := make([]storage.OutboxEvent, 0, len(wire.Events))
 	for i, event := range wire.Events {
-		message := routes.Message{
+		message := delivery.Message{
 			Title: event.Title, Message: event.Body, URL: event.URL,
 			Level: eventLevel(event.Severity), Fields: dataFields(event.Data),
 			Footer: w.deployment.Name,

@@ -262,17 +262,24 @@ A Discord destination uses either `account` plus `channel_id`, or `webhook_url`;
 
 Defaults are failure threshold `3`, maximum `256` events per transaction, and `30d` event retention. Set a lower event cap when a monitor should bound notification bursts. `max_per_transaction` must be between 1 and 256. Retention controls pruning only after every destination is terminal; pending and leased deliveries are not deleted because of age.
 
-Named agent routes are configured by the daemon and referenced separately:
+OpenClaw is another inline delivery. `account` selects its hook token, `prompt`
+defines the task, and `agent_id` optionally selects a configured OpenClaw agent:
 
 ```yaml
-routes:
-  - route: openclaw:analyst
-    options:
+deliveries:
+  - openclaw:
+      account: local
+      agent_id: analyst # optional
       prompt: Summarize this occurrence and explain why it matters.
+      # url: https://openclaw.example/hooks/agent # optional; defaults to the local gateway
     rate_limit:
       per_second: 0.2
       burst: 1
 ```
+
+OpenClaw owns its session, model, thinking level, timeout, and outbound-channel
+policy. Those are intentionally not monitor options. The monitor event is treated
+as untrusted context beneath the authored prompt.
 
 Unknown YAML fields and multiple YAML documents are rejected.
 

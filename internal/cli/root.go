@@ -38,7 +38,6 @@ func New() *cobra.Command {
 	root.AddCommand(
 		c.newInitCmd(),
 		c.newDaemonCmd(),
-		c.newRouteCmd(),
 		c.newAccountCmd(),
 		c.newNewMonitorCmd(),
 		c.newTestCmd(),

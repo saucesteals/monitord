@@ -2,17 +2,10 @@ package model
 
 import (
 	"fmt"
-	"strings"
 )
 
 // MonitorName identifies a deployed monitor.
 type MonitorName string
-
-// RouteKind identifies a notification route backend.
-type RouteKind string
-
-// RouteName identifies a daemon-owned notification route.
-type RouteName string
 
 // ParseMonitorName validates a monitor name.
 func ParseMonitorName(value string) (MonitorName, error) {
@@ -21,38 +14,6 @@ func ParseMonitorName(value string) (MonitorName, error) {
 	}
 
 	return MonitorName(value), nil
-}
-
-// ParseRouteKind validates a route kind.
-func ParseRouteKind(value string) (RouteKind, error) {
-	kind := RouteKind(value)
-	if err := kind.Validate(); err != nil {
-		return "", err
-	}
-
-	return kind, nil
-}
-
-// NewRouteName constructs a route name from kind and local name.
-func NewRouteName(kind RouteKind, name string) (RouteName, error) {
-	if err := kind.Validate(); err != nil {
-		return "", err
-	}
-	if !validName(name) {
-		return "", fmt.Errorf("invalid route target %q", name)
-	}
-
-	return RouteName(string(kind) + ":" + name), nil
-}
-
-// ParseRouteName validates a full route name.
-func ParseRouteName(value string) (RouteName, error) {
-	route := RouteName(value)
-	if err := route.Validate(); err != nil {
-		return "", err
-	}
-
-	return route, nil
 }
 
 // String returns the raw monitor name.
@@ -64,37 +25,6 @@ func (n MonitorName) String() string {
 func (n MonitorName) Validate() error {
 	if !validName(string(n)) {
 		return fmt.Errorf("invalid monitor name %q", n)
-	}
-
-	return nil
-}
-
-// String returns the raw route kind.
-func (k RouteKind) String() string { return string(k) }
-
-// String returns the raw route name.
-func (n RouteName) String() string { return string(n) }
-
-// Validate checks whether a route kind is safe for storage and route names.
-func (k RouteKind) Validate() error {
-	if !validName(string(k)) {
-		return fmt.Errorf("invalid route kind %q", k)
-	}
-
-	return nil
-}
-
-// Validate checks whether a route name has a valid kind and safe target.
-func (n RouteName) Validate() error {
-	kind, target, ok := strings.Cut(string(n), ":")
-	if !ok || kind == "" || target == "" {
-		return fmt.Errorf("invalid route name %q", n)
-	}
-	if _, err := ParseRouteKind(kind); err != nil {
-		return err
-	}
-	if !validName(target) {
-		return fmt.Errorf("invalid route target %q", target)
 	}
 
 	return nil

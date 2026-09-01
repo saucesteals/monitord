@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/saucesteals/monitord/internal/routes"
+	"github.com/saucesteals/monitord/internal/delivery"
 )
 
 type RunStatus string
@@ -266,16 +266,16 @@ func enqueueHealthNotification(ctx context.Context, tx *sql.Tx, deploymentID, de
 	if _, err := tx.ExecContext(ctx, `UPDATE deployment_health SET unhealthy_notified=? WHERE deployment_id=?`, unhealthy, deploymentID); err != nil {
 		return fmt.Errorf("mark health notification state: %w", err)
 	}
-	message := routes.Message{Footer: deploymentName, Time: at.UTC(), MuteMentions: true}
+	message := delivery.Message{Footer: deploymentName, Time: at.UTC(), MuteMentions: true}
 	switch status {
 	case "unhealthy":
 		message.Title = "Monitor unhealthy"
 		message.Message = "The monitor has failed " + strconv.Itoa(failures) + " consecutive times."
-		message.Level = routes.LevelFailure
+		message.Level = delivery.LevelFailure
 	case "recovered":
 		message.Title = "Monitor recovered"
 		message.Message = "The monitor is healthy again."
-		message.Level = routes.LevelSuccess
+		message.Level = delivery.LevelSuccess
 	default:
 		return fmt.Errorf("unsupported health notification %q", status)
 	}

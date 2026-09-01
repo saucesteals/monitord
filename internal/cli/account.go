@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/saucesteals/monitord/internal/routes"
+	"github.com/saucesteals/monitord/internal/delivery"
 	"github.com/spf13/cobra"
 )
 
@@ -27,7 +27,7 @@ func (c *CLI) newAccountListCmd() *cobra.Command {
 		Short: "List Keychain delivery accounts",
 		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			accounts, err := routes.ListAccounts(cmd.Context())
+			accounts, err := delivery.ListAccounts(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -46,7 +46,7 @@ func (c *CLI) newAccountRemoveCmd() *cobra.Command {
 		Short: "Remove a Keychain delivery account",
 		Args:  exactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := routes.RemoveAccount(cmd.Context(), args[0], args[1]); err != nil {
+			if err := delivery.RemoveAccount(cmd.Context(), args[0], args[1]); err != nil {
 				return err
 			}
 
@@ -68,7 +68,7 @@ func (c *CLI) newAccountSetCmd() *cobra.Command {
 			if token == "" {
 				return fmt.Errorf("--token is required")
 			}
-			if err := routes.StoreAccountToken(cmd.Context(), args[0], args[1], strings.TrimSpace(token)); err != nil {
+			if err := delivery.StoreAccountToken(cmd.Context(), args[0], args[1], strings.TrimSpace(token)); err != nil {
 				return err
 			}
 

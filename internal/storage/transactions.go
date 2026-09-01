@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/saucesteals/monitord/internal/routes"
+	"github.com/saucesteals/monitord/internal/delivery"
 )
 
 var (
@@ -35,7 +35,7 @@ type OutboxDelivery struct {
 type OutboxEvent struct {
 	OutboxID   string
 	EventID    string
-	Message    routes.Message
+	Message    delivery.Message
 	Deliveries []OutboxDelivery
 }
 
@@ -241,7 +241,7 @@ func lookupTransaction(ctx context.Context, tx *sql.Tx, frame TransactionFrame) 
 
 func insertOutboxEvent(ctx context.Context, tx *sql.Tx, frame TransactionFrame, event OutboxEvent, now time.Time) error {
 	// The payload is already destination-neutral. Stamp it once when the
-	// transaction commits so every retry and route renders the same occurrence.
+	// transaction commits so every retry and destination renders the same occurrence.
 	identityPayload, err := json.Marshal(event.Message)
 	if err != nil {
 		return fmt.Errorf("encode event message identity %q: %w", event.EventID, err)

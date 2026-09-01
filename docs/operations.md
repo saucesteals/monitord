@@ -34,7 +34,7 @@ monitord has one current database shape and does not transform another installat
 2. Move the entire old root to a timestamped backup.
 3. Run the installer into a clean root.
 4. Port or recreate only the selected monitor source against the installed SDK, then restore its group secret files.
-5. Recreate named routes and deploy each monitor.
+5. Deploy each monitor with its destinations declared in `monitor.yaml`.
 6. Restore intentional state through `state set`, then inspect health.
 
 Do not copy the old SQLite database, artifacts, generation data, or checkpoints. A format sentinel rejects nonempty incompatible databases rather than guessing how to transform them. On macOS, Keychain account tokens are outside the root and remain available to the same OS user.
@@ -52,18 +52,23 @@ monitord account remove discord personal
 
 The current named-account backend invokes the macOS `security` command. On Linux, direct Discord `webhook_url` destinations work without it; named Discord bot and OpenClaw accounts require a compatible credential backend before use.
 
-Direct Discord destinations are declared in each `monitor.yaml`. Named agent routes are database-owned configuration:
+Discord and OpenClaw destinations are declared directly in each `monitor.yaml`.
+An OpenClaw destination requires `account` and `prompt`, accepts an optional
+`agent_id`, and defaults to `http://127.0.0.1:18789/hooks/agent`. Set `url` only
+when the hook is served elsewhere:
 
-```bash
-monitord route create openclaw analyst \
-  --option account=local \
-  --option agent_id=main \
-  --option timeout_seconds=60s
-monitord route list
-monitord route test openclaw:analyst
+```yaml
+deliveries:
+  - openclaw:
+      account: local
+      agent_id: analyst
+      prompt: Investigate this event and explain why it matters.
 ```
 
-OpenClaw defaults to `http://127.0.0.1:18789/hooks/agent`. Supported route options are `url`, `account`, `agent_id`, `session_key`, `wake_mode`, `deliver`, `channel`, `to`, `model`, `thinking`, and `timeout_seconds`. A monitor referencing the route must provide its `prompt` option in `monitor.yaml`.
+OpenClaw owns session selection, model and thinking configuration, run timeout,
+and any outbound announcement channel. monitord only starts the agent task and
+applies its normal durable retry and rate-limit policy to that hook request.
+See OpenClaw's [agent hook reference](https://github.com/openclaw/openclaw/blob/main/docs/gateway/configuration-reference.md#hooks) for gateway-side configuration.
 
 ## Deployment lifecycle
 

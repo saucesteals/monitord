@@ -11,7 +11,6 @@ import (
 
 	"github.com/saucesteals/monitord/internal/model"
 	"github.com/saucesteals/monitord/internal/monitor"
-	"github.com/saucesteals/monitord/internal/routes"
 	"github.com/saucesteals/monitord/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -73,19 +72,6 @@ func (c *CLI) deploy(ctx context.Context, out io.Writer, target, overrideName st
 	if existingErr == nil && !resetState {
 		req.Current = existing.State
 	}
-	for _, delivery := range monitorConfig.Deliveries {
-		if delivery.Discord != nil {
-			continue
-		}
-		route, err := store.GetRoute(ctx, delivery.Route)
-		if err != nil {
-			return err
-		}
-		if err := routes.ValidateMonitor(route.Kind, delivery.Options); err != nil {
-			return fmt.Errorf("route %s: %w", delivery.Route, err)
-		}
-	}
-
 	built, err := monitor.Build(ctx, paths, req)
 	if err != nil {
 		return err
