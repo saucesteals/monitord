@@ -1,28 +1,25 @@
-package quicknode
+package evm
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"time"
 
 	"github.com/saucesteals/monitord"
-)
-
-var (
-	quicknodeWebSocketURL = monitord.RequiredSecret("quicknode", "websocket-url")
-	quicknodeHTTPURL      = monitord.OptionalSecret("quicknode", "http-url")
+	"github.com/saucesteals/monitord/catalog/quicknode"
 )
 
 const (
 	defaultPollInterval = 2 * time.Second
-	checkpointSource    = "quicknode.confirmed-blocks"
-	eventsCursorSource  = "quicknode.events-cursor"
+	eventsCursorSource  = "quicknode.evm.events-cursor"
 )
 
 type eventsCursor struct {
 	ChainID         ChainID `json:"chain_id"`
+	Filter          Logs    `json:"filter"`
 	NextBlock       uint64  `json:"next_block"`
 	CanonicalParent Hash    `json:"canonical_parent,omitempty"`
 	CurrentBlock    Hash    `json:"current_block,omitempty"`
@@ -37,9 +34,10 @@ type Events[S any] struct {
 	Filter          Logs
 	ExpectedChainID ChainID
 	Confirmations   uint64
+	BackfillFrom    *uint64
 	Handle          func(*monitord.Tx[S], Log) error
-	WSSURL          string
 	HTTPURL         string
+	HTTPSecret      monitord.SecretRef
 }
 
 func (e Events[S]) Info() monitord.Info {
@@ -47,16 +45,14 @@ func (e Events[S]) Info() monitord.Info {
 	if name == "" {
 		name = "quicknode-events"
 	}
-	return monitord.Info{Name: name, Description: "Confirmed QuickNode Ethereum logs"}
+	return monitord.Info{Name: name, Description: "Confirmed QuickNode EVM logs"}
 }
 
 func (e Events[S]) Plan() monitord.Plan[S] {
 	refs := []monitord.SecretRef{}
-	if e.WSSURL == "" {
-		refs = append(refs, quicknodeWebSocketURL)
-	}
 	if e.HTTPURL == "" {
-		refs = append(refs, quicknodeHTTPURL)
+		ref, _ := httpSecret(e.HTTPSecret)
+		refs = append(refs, ref)
 	}
 	return monitord.Continuous(e.run, monitord.WithSecrets(refs...))
 }
@@ -69,27 +65,26 @@ func (e Events[S]) run(ctx context.Context, s *monitord.Session[S]) error {
 		return err
 	}
 	httpURL := e.HTTPURL
+	_, defaultEndpoint := httpSecret(e.HTTPSecret)
 	if httpURL == "" {
-		httpURL, _ = s.Secrets().Get(quicknodeHTTPURL)
-	}
-	if httpURL == "" {
-		wss := e.WSSURL
-		if wss == "" {
-			wss, _ = s.Secrets().Get(quicknodeWebSocketURL)
-		}
+		ref, _ := httpSecret(e.HTTPSecret)
 		var err error
-		httpURL, err = HTTPFromWSS(wss)
+		httpURL, err = s.Secrets().Require(ref)
 		if err != nil {
 			return err
 		}
 	}
-	c, err := Open(ctx, Config{HTTPURL: httpURL})
+	c, err := Open(ctx, Config{Endpoint: quicknode.Endpoint{HTTPURL: httpURL}})
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	if e.ExpectedChainID != "" && c.ChainID() != e.ExpectedChainID {
-		return fmt.Errorf("quicknode: expected chain %s, endpoint is %s", e.ExpectedChainID, c.ChainID())
+	expectedChainID := e.ExpectedChainID
+	if expectedChainID == "" && e.HTTPURL == "" && defaultEndpoint {
+		expectedChainID = "0x1"
+	}
+	if expectedChainID != "" && c.ChainID() != expectedChainID {
+		return fmt.Errorf("quicknode evm: expected chain %s, endpoint is %s", expectedChainID, c.ChainID())
 	}
 	confirmations, err := confirmationDepth(c.ChainID(), e.Confirmations)
 	if err != nil {
@@ -104,6 +99,9 @@ func (e Events[S]) run(ctx context.Context, s *monitord.Session[S]) error {
 		if cursor.ChainID != c.ChainID() {
 			return fmt.Errorf("quicknode: events cursor chain %s differs from endpoint %s", cursor.ChainID, c.ChainID())
 		}
+		if !reflect.DeepEqual(cursor.Filter, e.Filter.Clone()) {
+			return errors.New("quicknode evm: event filter differs from the saved cursor")
+		}
 		if (cursor.CurrentBlock == "") != (cursor.NextLog == 0) {
 			return errors.New("quicknode: events cursor has an inconsistent current block and log position")
 		}
@@ -112,6 +110,23 @@ func (e Events[S]) run(ctx context.Context, s *monitord.Session[S]) error {
 		}
 	} else {
 		cursor.ChainID = c.ChainID()
+		cursor.Filter = e.Filter.Clone()
+		if e.BackfillFrom != nil {
+			cursor.NextBlock = *e.BackfillFrom
+		} else {
+			head, err := c.blockNumber(ctx)
+			if err != nil {
+				return err
+			}
+			if head >= confirmations {
+				cursor.NextBlock = head - confirmations + 1
+			}
+		}
+		if err := s.Commit(ctx, func(tx *monitord.Tx[S]) error {
+			return tx.Checkpoint(eventsCursorSource, cursor)
+		}); err != nil {
+			return err
+		}
 	}
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
@@ -123,7 +138,7 @@ func (e Events[S]) run(ctx context.Context, s *monitord.Session[S]) error {
 		if head >= confirmations {
 			target := head - confirmations
 			for cursor.NextBlock <= target {
-				if err := e.processBlock(ctx, s, c, &cursor, confirmations); err != nil {
+				if err := e.processBlock(ctx, s, c, &cursor); err != nil {
 					return err
 				}
 			}
@@ -136,17 +151,17 @@ func (e Events[S]) run(ctx context.Context, s *monitord.Session[S]) error {
 	}
 }
 
-func (e Events[S]) processBlock(ctx context.Context, s *monitord.Session[S], c *Client, cursor *eventsCursor, confirmations uint64) error {
+func (e Events[S]) processBlock(ctx context.Context, s *monitord.Session[S], c *Client, cursor *eventsCursor) error {
 	n := cursor.NextBlock
 	block, err := c.blockByNumber(ctx, n, false)
 	if err != nil {
 		return err
 	}
 	if cursor.CanonicalParent != "" && block.ParentHash != cursor.CanonicalParent {
-		return rewindEventsCursor(ctx, s, cursor, confirmations)
+		return fmt.Errorf("quicknode evm: finalized chain changed before block %d; operator review required", n)
 	}
 	if cursor.CurrentBlock != "" && block.Hash != cursor.CurrentBlock {
-		return rewindEventsCursor(ctx, s, cursor, confirmations)
+		return fmt.Errorf("quicknode evm: finalized block %d changed while processing; operator review required", n)
 	}
 	logs, err := c.logs(ctx, e.Filter, n, n)
 	if err != nil {
@@ -164,6 +179,7 @@ func (e Events[S]) processBlock(ctx context.Context, s *monitord.Session[S], c *
 		log = log.Clone()
 		nextCursor := eventsCursor{
 			ChainID:         c.ChainID(),
+			Filter:          cursor.Filter.Clone(),
 			NextBlock:       n,
 			CanonicalParent: block.ParentHash,
 			CurrentBlock:    block.Hash,
@@ -179,30 +195,13 @@ func (e Events[S]) processBlock(ctx context.Context, s *monitord.Session[S], c *
 		}
 		*cursor = nextCursor
 	}
-	nextCursor := eventsCursor{ChainID: c.ChainID(), NextBlock: n + 1, CanonicalParent: block.Hash}
+	nextCursor := eventsCursor{ChainID: c.ChainID(), Filter: cursor.Filter.Clone(), NextBlock: n + 1, CanonicalParent: block.Hash}
 	if err := s.Commit(ctx, func(tx *monitord.Tx[S]) error {
 		return tx.Checkpoint(eventsCursorSource, nextCursor)
 	}); err != nil {
 		return err
 	}
 	*cursor = nextCursor
-	return nil
-}
-
-func rewindEventsCursor[S any](ctx context.Context, s *monitord.Session[S], cursor *eventsCursor, depth uint64) error {
-	next := uint64(0)
-	if cursor.NextBlock > depth {
-		next = cursor.NextBlock - depth
-	}
-	// The cursor can replay confirmed source records after a finality breach, but
-	// generic state changed by Handle is intentionally not treated as reversible.
-	rewound := eventsCursor{ChainID: cursor.ChainID, NextBlock: next}
-	if err := s.Commit(ctx, func(tx *monitord.Tx[S]) error {
-		return tx.Checkpoint(eventsCursorSource, rewound)
-	}); err != nil {
-		return err
-	}
-	*cursor = rewound
 	return nil
 }
 
@@ -214,17 +213,4 @@ func confirmationDepth(chain ChainID, configured uint64) (uint64, error) {
 		return 12, nil
 	}
 	return 0, fmt.Errorf("quicknode: confirmations are required for chain %s", chain)
-}
-
-func HTTPFromWSS(raw string) (string, error) {
-	u, err := endpoint(raw, "ws", "wss")
-	if err != nil {
-		return "", fmt.Errorf("quicknode: derive HTTP endpoint: %w", err)
-	}
-	if u.Scheme == "wss" {
-		u.Scheme = "https"
-	} else {
-		u.Scheme = "http"
-	}
-	return u.String(), nil
 }

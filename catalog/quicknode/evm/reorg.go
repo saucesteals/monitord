@@ -1,4 +1,4 @@
-package quicknode
+package evm
 
 import (
 	"context"

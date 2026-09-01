@@ -158,17 +158,49 @@ isps='["http://user:pass@proxy-1.invalid:8080","socks5://proxy-2.invalid:1080"]'
 
 ## Catalog monitors
 
-The QuickNode catalog has three deliberately separate levels. `quicknode.Client` is raw JSON-RPC and leaves lifecycle, progress, and finality to the caller. `quicknode.Events[S]` processes confirmed logs and checkpoints source progress atomically with its handler. `quicknode.Wallet` is the turnkey confirmed-transfer monitor:
+QuickNode support has one provider layer and separate chain layers:
+
+- `catalog/quicknode` owns exact provider endpoints, JSON-RPC transport, limiting, retrying HTTP reads, credential-safe errors, and reconnecting subscriptions. It has no chain types or finality model.
+- `catalog/quicknode/evm` owns EVM identity, types, subscriptions, confirmed logs, and wallet transfers.
+- `catalog/quicknode/solana` owns Solana cluster identity, commitments, addresses, signatures, RPC methods, subscriptions, and finalized address-event processing.
+
+The EVM wallet monitor is deliberately small:
 
 ```go
 func main() {
-	monitord.Run(quicknode.Wallet{
-		Address: quicknode.Address("0x7130000000000000000000000000000000007777"),
+	monitord.Run(evm.Wallet{
+		Address: evm.Address("0x7130000000000000000000000000000000007777"),
 	})
 }
 ```
 
-Managed QuickNode monitors declare `quicknode/websocket-url`, optionally use `quicknode/http-url`, and use `quicknode/wallet-address` when `Wallet.Address` is empty. Wallet covers standard ERC-20, ERC-721, ERC-1155, and non-zero top-level native transfers. It does not infer internal calls, trace-derived transfers, arbitrary balance changes, pending transactions, or non-standard token events.
+`evm.Events` and `evm.Wallet` declare `quicknode/ethereum-mainnet-http-url` when neither `HTTPURL` nor `HTTPSecret` is set. That default also pins chain ID `0x1`. Other EVM networks should pass an exact chain-named `HTTPSecret` plus `ExpectedChainID` and `Confirmations`; `HTTPURL` remains useful when configuration already resolved the exact value. A fresh deployment starts at the current confirmed edge unless `BackfillFrom` is set. Wallet addresses are public configuration and must be supplied explicitly. Wallet covers standard ERC-20, ERC-721, ERC-1155, and successful non-zero top-level native transfers, including contract creation. Native backfill requires EIP-658 receipt status and therefore does not cover pre-Byzantium Ethereum blocks. Wallet does not infer internal calls, trace-derived transfers, arbitrary balance changes, pending transactions, or non-standard token events.
+
+`solana.AddressEvents` processes finalized transactions involving one address. It checkpoints the last committed signature, catches up through HTTP after startup and periodically thereafter, and uses `logsSubscribe` only to reduce latency. WSS setup or reconnect failure falls back to HTTP polling until the worker restarts. A fresh deployment snapshots the newest finalized signature unless `BackfillAfter` is set. The managed source defaults to `quicknode/solana-mainnet-http-url` and optionally `quicknode/solana-mainnet-websocket-url`; `HTTPSecret` and `WSSSecret` select other exact chain/network keys.
+
+Use exact URLs copied from the QuickNode dashboard:
+
+```dotenv
+# ~/.monitord/secrets/quicknode.env
+ethereum-mainnet-http-url="<exact Ethereum mainnet HTTP URL>"
+ethereum-mainnet-websocket-url="<exact Ethereum mainnet WSS URL>"
+robinhood-mainnet-http-url="<exact Robinhood Chain mainnet HTTP URL>"
+robinhood-mainnet-websocket-url="<exact Robinhood Chain mainnet WSS URL>"
+solana-mainnet-http-url="<exact Solana mainnet HTTP URL>"
+solana-mainnet-websocket-url="<exact Solana mainnet WSS URL>"
+```
+
+The catalog never derives or rewrites QuickNode hosts or paths. Managed sources declare the documented HTTP keys and the optional Solana WSS key; raw-monitor authors declare whichever exact refs their client consumes, including the conventional Ethereum WSS key above. Open the appropriate chain client in `Start`:
+
+```go
+client, err := solana.Open(ctx, solana.Config{
+	Endpoint:            quicknode.Endpoint{HTTPURL: httpURL, WSSURL: websocketURL},
+	Commitment:          solana.Finalized,
+	ExpectedGenesisHash: solana.MainnetGenesisHash,
+})
+```
+
+Solana defaults to `finalized`; `GetBlock` and `GetTransaction` reject `processed`, explicitly support transaction version zero by default, and retain variable block and transaction bodies as `json.RawMessage`. The context passed to `Subscribe` bounds its opening handshake; close subscriptions before their client in `Stop`. Subscriptions reconnect with bounded attempts but do not replay missed notifications, so durable monitors need HTTP backfill, checkpoints, and stable event IDs.
 
 ## monitor.yaml
 

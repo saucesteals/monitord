@@ -139,7 +139,7 @@ The daemon writes structured operational logs to stdout and reserves stderr for 
 ~/.monitord/logs/monitord.err.log
 ```
 
-A nonempty macOS stderr log indicates a process-level failure rather than a copy of routine INFO output. The default Linux systemd service sends both streams to the user journal. Persisted health and delivery errors are bounded and secret values are redacted; avoid returning scraped credentials or complete authenticated URLs from monitor code.
+A nonempty macOS stderr log indicates a process-level failure rather than a copy of routine INFO output. The default Linux systemd service sends both streams to the user journal. Persisted health and delivery errors are bounded and secret values are redacted; avoid returning scraped credentials or complete authenticated URLs from monitor code. Preserve chain-named QuickNode endpoint values exactly as issued and never write them to events or logs.
 
 Useful checks:
 

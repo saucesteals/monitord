@@ -133,7 +133,9 @@ monitord inspect restock
 - [Monitor authoring](docs/monitors.md): state, checkpoints, events, lifecycle clients, proxy pools, secrets, and the complete `monitor.yaml` shape.
 - [Operations](docs/operations.md): installation layout, deployments, health, logs, outbox recovery, state editing, and clean-root recovery.
 - [`catalog/httpx`](catalog/httpx): browser-compatible direct and rotating proxy clients.
-- [`catalog/quicknode`](catalog/quicknode): raw EVM access, confirmed event handling, and turnkey wallet monitoring.
+- [`catalog/quicknode`](catalog/quicknode): chain-neutral QuickNode JSON-RPC transport and subscriptions.
+- [`catalog/quicknode/evm`](catalog/quicknode/evm): EVM identity, subscriptions, confirmed logs, and wallet monitoring.
+- [`catalog/quicknode/solana`](catalog/quicknode/solana): Solana RPC, subscriptions, and finalized address-event processing.
 
 ## Common CLI workflow
 

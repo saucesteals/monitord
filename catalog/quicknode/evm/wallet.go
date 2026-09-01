@@ -1,4 +1,4 @@
-package quicknode
+package evm
 
 import (
 	"context"
@@ -7,23 +7,21 @@ import (
 	"time"
 
 	"github.com/saucesteals/monitord"
+	"github.com/saucesteals/monitord/catalog/quicknode"
 )
-
-var quicknodeWalletAddress = monitord.RequiredSecret("quicknode", "wallet-address")
 
 type Wallet struct {
 	Name            string
-	WSSURL          string
 	HTTPURL         string
+	HTTPSecret      monitord.SecretRef
 	ExpectedChainID ChainID
 	Address         Address
 	Events          TransferKinds
 	Confirmations   uint64
+	BackfillFrom    *uint64
 	Map             func(Transfer) monitord.Event
 }
-type WalletState struct {
-	Checkpoint Checkpoint `json:"checkpoint"`
-}
+type WalletState struct{}
 type walletJournal struct {
 	Blocks []walletJournalBlock `json:"blocks"`
 }
@@ -33,7 +31,10 @@ type walletJournalBlock struct {
 	Transfers []Transfer `json:"transfers"`
 }
 
-const walletJournalSource = "quicknode.wallet-canonical-journal"
+const (
+	walletCursorSource  = "quicknode.evm.wallet-cursor"
+	walletJournalSource = "quicknode.evm.wallet-canonical-journal"
+)
 
 func (w Wallet) Info() monitord.Info {
 	name := w.Name
@@ -47,14 +48,9 @@ func (w Wallet) Plan() monitord.Plan[WalletState] {
 }
 func (w Wallet) secretRefs() []monitord.SecretRef {
 	r := []monitord.SecretRef{}
-	if w.WSSURL == "" {
-		r = append(r, quicknodeWebSocketURL)
-	}
 	if w.HTTPURL == "" {
-		r = append(r, quicknodeHTTPURL)
-	}
-	if w.Address == "" {
-		r = append(r, quicknodeWalletAddress)
+		ref, _ := httpSecret(w.HTTPSecret)
+		r = append(r, ref)
 	}
 	return r
 }
@@ -62,14 +58,7 @@ func (w Wallet) secretRefs() []monitord.SecretRef {
 func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error {
 	address := w.Address
 	if address == "" {
-		v, err := s.Secrets().Require(quicknodeWalletAddress)
-		if err != nil {
-			return err
-		}
-		address, err = ParseAddress(v)
-		if err != nil {
-			return err
-		}
+		return errors.New("quicknode evm: Wallet.Address is required")
 	}
 	if _, err := ParseAddress(string(address)); err != nil {
 		return err
@@ -79,34 +68,40 @@ func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error
 		kinds = AllTransfers
 	}
 	if kinds&^AllTransfers != 0 {
-		return errors.New("quicknode: invalid wallet transfer kinds")
+		return errors.New("quicknode evm: invalid wallet transfer kinds")
 	}
 	httpURL := w.HTTPURL
+	_, defaultEndpoint := httpSecret(w.HTTPSecret)
 	if httpURL == "" {
-		httpURL, _ = s.Secrets().Get(quicknodeHTTPURL)
-	}
-	if httpURL == "" {
-		ws := w.WSSURL
-		if ws == "" {
-			ws, _ = s.Secrets().Get(quicknodeWebSocketURL)
-		}
+		ref, _ := httpSecret(w.HTTPSecret)
 		var err error
-		httpURL, err = HTTPFromWSS(ws)
+		httpURL, err = s.Secrets().Require(ref)
 		if err != nil {
 			return err
 		}
 	}
-	c, err := Open(ctx, Config{HTTPURL: httpURL})
+	c, err := Open(ctx, Config{Endpoint: quicknode.Endpoint{HTTPURL: httpURL}})
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	if w.ExpectedChainID != "" && w.ExpectedChainID != c.ChainID() {
-		return fmt.Errorf("quicknode: expected chain %s, endpoint is %s", w.ExpectedChainID, c.ChainID())
+	expectedChainID := w.ExpectedChainID
+	if expectedChainID == "" && w.HTTPURL == "" && defaultEndpoint {
+		expectedChainID = "0x1"
 	}
-	checkpoint := s.State().Checkpoint
+	if expectedChainID != "" && expectedChainID != c.ChainID() {
+		return fmt.Errorf("quicknode evm: expected chain %s, endpoint is %s", expectedChainID, c.ChainID())
+	}
+	var checkpoint Checkpoint
+	found, err := s.Checkpoint(walletCursorSource, &checkpoint)
+	if err != nil {
+		return err
+	}
 	if checkpoint.ChainID != "" && checkpoint.ChainID != c.ChainID() {
 		return fmt.Errorf("quicknode: checkpoint chain %s differs from endpoint %s", checkpoint.ChainID, c.ChainID())
+	}
+	if found && (checkpoint.Address != address || checkpoint.Events != kinds) {
+		return errors.New("quicknode evm: wallet address or transfer selection differs from the saved cursor")
 	}
 	depth, err := confirmationDepth(c.ChainID(), w.Confirmations)
 	if err != nil {
@@ -118,6 +113,25 @@ func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error
 	if err != nil {
 		return err
 	}
+	if !found {
+		if w.BackfillFrom != nil {
+			next = *w.BackfillFrom
+		} else {
+			head, err := c.blockNumber(ctx)
+			if err != nil {
+				return err
+			}
+			if head >= depth {
+				next = head - depth + 1
+			}
+		}
+		if err := s.Commit(ctx, func(tx *monitord.Tx[WalletState]) error {
+			checkpoint = Checkpoint{ChainID: c.ChainID(), NextBlock: next, Address: address, Events: kinds}
+			return tx.Checkpoint(walletCursorSource, checkpoint)
+		}); err != nil {
+			return err
+		}
+	}
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 	for {
@@ -127,12 +141,12 @@ func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error
 		}
 		if head >= depth {
 			target := head - depth
-			if next > 0 && s.State().Checkpoint.CanonicalParent != "" {
+			if next > 0 && checkpoint.CanonicalParent != "" {
 				prior, loadErr := c.blockByNumber(ctx, next-1, false)
 				if loadErr != nil {
 					return loadErr
 				}
-				if prior.Hash != s.State().Checkpoint.CanonicalParent {
+				if prior.Hash != checkpoint.CanonicalParent {
 					rewind, orphaned, reconcileErr := reconcileJournal(ctx, c, journal, next)
 					if reconcileErr != nil {
 						return reconcileErr
@@ -145,8 +159,8 @@ func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error
 								return emitErr
 							}
 						}
-						tx.State.Checkpoint = Checkpoint{ChainID: c.ChainID(), NextBlock: rewind}
-						if cpErr := tx.Checkpoint(checkpointSource, tx.State.Checkpoint); cpErr != nil {
+						checkpoint = Checkpoint{ChainID: c.ChainID(), NextBlock: rewind, Address: address, Events: kinds}
+						if cpErr := tx.Checkpoint(walletCursorSource, checkpoint); cpErr != nil {
 							return cpErr
 						}
 						return tx.Checkpoint(walletJournalSource, journal)
@@ -170,6 +184,7 @@ func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error
 				if len(nextJournal.Blocks) > 256 {
 					nextJournal.Blocks = append([]walletJournalBlock(nil), nextJournal.Blocks[len(nextJournal.Blocks)-256:]...)
 				}
+				nextCheckpoint := Checkpoint{ChainID: c.ChainID(), NextBlock: next + 1, CanonicalParent: block.Hash, Address: address, Events: kinds}
 				if err = s.Commit(ctx, func(tx *monitord.Tx[WalletState]) error {
 					for _, tr := range transfers {
 						ev := w.mapEventFor(tr, address)
@@ -177,8 +192,7 @@ func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error
 							return err
 						}
 					}
-					tx.State.Checkpoint = Checkpoint{ChainID: c.ChainID(), NextBlock: next + 1, CanonicalParent: block.Hash}
-					if err := tx.Checkpoint(checkpointSource, tx.State.Checkpoint); err != nil {
+					if err := tx.Checkpoint(walletCursorSource, nextCheckpoint); err != nil {
 						return err
 					}
 					if err := tx.Checkpoint(walletJournalSource, nextJournal); err != nil {
@@ -189,6 +203,7 @@ func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error
 					return err
 				}
 				journal = nextJournal
+				checkpoint = nextCheckpoint
 				next++
 			}
 		}

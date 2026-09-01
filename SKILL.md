@@ -68,6 +68,12 @@ When a monitor needs a reusable client, proxy pool, connection, or subscription,
 
 For browser-compatible HTTP and proxy rotation, use `catalog/httpx`. A proxy secret is a JSON array of `http`, `https`, or `socks5` URLs. Create one `httpx.ProxyClient` in `Start`; do not recreate clients inside each check.
 
+## QuickNode
+
+Use `catalog/quicknode` only for provider transport. Use `catalog/quicknode/evm` or `catalog/quicknode/solana` for chain identity, types, subscriptions, and managed sources. Copy exact QuickNode provider URLs into chain-named secret refs; never derive or rewrite endpoint hosts or paths.
+
+Managed `evm.Events` and `evm.Wallet` default to the Ethereum-mainnet HTTP secret; set `HTTPSecret` for another exact EVM network key. Managed `solana.AddressEvents` uses finalized HTTP signature history as its durable source and WSS only as a wake-up, with `HTTPSecret` and `WSSSecret` for non-default networks. Raw clients and subscriptions are lifecycle-owned: create them in `Start`, close subscriptions before the client in `Stop`, and use HTTP backfill plus checkpoints whenever reconnect gaps matter.
+
 ## Workflow
 
 ```bash

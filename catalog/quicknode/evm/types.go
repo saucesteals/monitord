@@ -1,4 +1,4 @@
-package quicknode
+package evm
 
 import (
 	"encoding/hex"
@@ -76,9 +76,11 @@ const (
 )
 
 type Checkpoint struct {
-	ChainID         ChainID `json:"chain_id"`
-	NextBlock       uint64  `json:"next_block"`
-	CanonicalParent Hash    `json:"canonical_parent"`
+	ChainID         ChainID       `json:"chain_id"`
+	NextBlock       uint64        `json:"next_block"`
+	CanonicalParent Hash          `json:"canonical_parent"`
+	Address         Address       `json:"address"`
+	Events          TransferKinds `json:"events"`
 }
 
 type Transfer struct {
@@ -136,8 +138,19 @@ func (l Log) Clone() Log {
 }
 
 type Logs struct {
-	Addresses []Address
-	Topics    [][]Hash
+	Addresses []Address `json:"addresses,omitempty"`
+	Topics    [][]Hash  `json:"topics,omitempty"`
+}
+
+func (f Logs) Clone() Logs {
+	clone := Logs{Addresses: append([]Address(nil), f.Addresses...)}
+	if len(f.Topics) > 0 {
+		clone.Topics = make([][]Hash, len(f.Topics))
+		for i := range f.Topics {
+			clone.Topics[i] = append([]Hash(nil), f.Topics[i]...)
+		}
+	}
+	return clone
 }
 
 func (f Logs) Validate() error {

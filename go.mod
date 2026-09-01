@@ -4,6 +4,7 @@ go 1.25.7
 
 require (
 	github.com/coder/websocket v1.8.15
+	github.com/mr-tron/base58 v1.2.0
 	github.com/saucesteals/fhttp v1.0.1
 	github.com/saucesteals/mimic v1.0.2
 	github.com/spf13/cobra v1.10.2

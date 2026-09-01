@@ -1,4 +1,4 @@
-package quicknode
+package evm
 
 import (
 	"context"
@@ -43,6 +43,16 @@ func (w Wallet) blockTransfers(ctx context.Context, c *Client, wallet Address, k
 				to = *tx.To
 			}
 			if equalAddress(tx.From, wallet) || equalAddress(to, wallet) {
+				receipt, err := c.transactionReceipt(ctx, tx.Hash)
+				if err != nil {
+					return nil, err
+				}
+				if receipt.Status == "0x0" {
+					continue
+				}
+				if tx.To == nil && receipt.ContractAddress != nil {
+					to = *receipt.ContractAddress
+				}
 				idx, err := parseUintQuantity(tx.TransactionIndex)
 				if err != nil {
 					return nil, err
