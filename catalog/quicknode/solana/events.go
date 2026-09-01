@@ -40,19 +40,20 @@ type addressEventsCursor struct {
 // AddressEvents processes finalized transactions involving one Solana address.
 // HTTP history is authoritative; WSS notifications only reduce polling latency.
 type AddressEvents[S any] struct {
-	Name                string
-	Description         string
-	Address             PublicKey
-	ExpectedGenesisHash GenesisHash
-	HTTPURL             string
-	WSSURL              string
-	HTTPSecret          monitord.SecretRef
-	WSSSecret           monitord.SecretRef
-	BackfillAfter       Signature
-	PollInterval        time.Duration
-	MaxBackfillPages    int
-	MatchLogs           func(LogsValue) bool
-	Handle              func(context.Context, *Client, *monitord.Tx[S], AddressEvent) error
+	Name                  string
+	Description           string
+	Address               PublicKey
+	ExpectedGenesisHash   GenesisHash
+	HTTPURL               string
+	WSSURL                string
+	HTTPSecret            monitord.SecretRef
+	WSSSecret             monitord.SecretRef
+	BackfillAfter         Signature
+	PollInterval          time.Duration
+	MaxBackfillPages      int
+	ResumeFromLatestOnGap bool
+	MatchLogs             func(LogsValue) bool
+	Handle                func(context.Context, *Client, *monitord.Tx[S], AddressEvent) error
 }
 
 var _ monitord.Monitor[struct{}] = AddressEvents[struct{}]{}
@@ -239,6 +240,7 @@ func (e AddressEvents[S]) catchUp(ctx context.Context, session *monitord.Session
 	before := Signature("")
 	seen := map[Signature]bool{}
 	pending := []SignatureInfo{}
+	var latest *SignatureInfo
 	hasCursor := cursor.Signature != ""
 	reachedCursor := false
 	for page := 0; page < maxPages; page++ {
@@ -249,6 +251,10 @@ func (e AddressEvents[S]) catchUp(ctx context.Context, session *monitord.Session
 		})
 		if err != nil {
 			return err
+		}
+		if page == 0 && len(batch) > 0 {
+			value := batch[0]
+			latest = &value
 		}
 		for _, info := range batch {
 			if hasCursor && info.Signature == cursor.Signature {
@@ -265,13 +271,15 @@ func (e AddressEvents[S]) catchUp(ctx context.Context, session *monitord.Session
 		}
 		if len(batch) < pageSize {
 			if hasCursor {
-				return fmt.Errorf("quicknode solana: saved signature %s is unavailable in address history", cursor.Signature)
+				return e.historyGap(ctx, session, client, cursor, logMatches, latest,
+					fmt.Errorf("quicknode solana: saved signature %s is unavailable in address history", cursor.Signature))
 			}
 			reachedCursor = true
 			break
 		}
 		if page+1 == maxPages {
-			return fmt.Errorf("quicknode solana: address backfill exceeded %d pages", maxPages)
+			return e.historyGap(ctx, session, client, cursor, logMatches, latest,
+				fmt.Errorf("quicknode solana: address backfill exceeded %d pages", maxPages))
 		}
 		before = batch[len(batch)-1].Signature
 	}
@@ -318,5 +326,32 @@ func (e AddressEvents[S]) catchUp(ctx context.Context, session *monitord.Session
 		}
 		*cursor = next
 	}
+	return nil
+}
+
+func (e AddressEvents[S]) historyGap(
+	ctx context.Context,
+	session *monitord.Session[S],
+	client *Client,
+	cursor *addressEventsCursor,
+	logMatches map[Signature]bool,
+	latest *SignatureInfo,
+	cause error,
+) error {
+	if !e.ResumeFromLatestOnGap {
+		return cause
+	}
+	next := addressEventsCursor{GenesisHash: client.GenesisHash(), Address: e.Address}
+	if latest != nil {
+		next.Signature = latest.Signature
+		next.Slot = latest.Slot
+	}
+	if err := session.Commit(ctx, func(tx *monitord.Tx[S]) error {
+		return tx.Checkpoint(addressEventsCursorSource, next)
+	}); err != nil {
+		return err
+	}
+	*cursor = next
+	clear(logMatches)
 	return nil
 }
