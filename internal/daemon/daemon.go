@@ -53,7 +53,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 	defer lock.Close()
-	d.logger.Info("monitord daemon started", "root", d.paths.Root, "max_wait", d.interval)
+	if err := d.store.RecoverGenerations(ctx, time.Now().UTC()); err != nil {
+		return err
+	}
+	d.logger.Info("monitord daemon started", "root", d.paths.Root, "reconcile_interval", d.interval)
 	return d.run(ctx)
 }
 
@@ -90,14 +93,27 @@ func (d *Daemon) run(ctx context.Context) error {
 func (d *Daemon) runOutbox(ctx context.Context, outbox *outboxWorker) {
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
+	pruneTicker := time.NewTicker(time.Hour)
+	defer pruneTicker.Stop()
+	prune := func() {
+		count, err := d.store.PruneTerminalOutbox(ctx, time.Now().UTC())
+		if err != nil && !errors.Is(err, context.Canceled) {
+			d.logger.Error("outbox pruning failed", "error", err)
+		} else if count > 0 {
+			d.logger.Debug("pruned terminal outbox events", "count", count)
+		}
+	}
+	prune()
 	for {
 		if _, err := outbox.process(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			d.logger.Error("outbox processing failed", "error", err)
+			d.logger.Warn("outbox delivery failed", "error", err)
 		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		case <-pruneTicker.C:
+			prune()
 		}
 	}
 }

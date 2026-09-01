@@ -22,7 +22,6 @@ var (
 type Deployment struct {
 	ID, Name, InfoName, SourceDir, Status, ArtifactID, ConfigHash string
 	ConfigRevision, ActiveGeneration, StateRevision               int64
-	StateVersion                                                  int
 	FailureThreshold, MaxEventsPerTransaction                     int
 	EventRetention                                                time.Duration
 	State                                                         json.RawMessage
@@ -36,7 +35,6 @@ type DeployInput struct {
 	Name, InfoName, SourceDir, ConfigHash     string
 	Artifact                                  Artifact
 	State                                     json.RawMessage
-	StateVersion                              int
 	FailureThreshold, MaxEventsPerTransaction int
 	EventRetention                            time.Duration
 	ExpiresAt                                 *time.Time
@@ -47,8 +45,8 @@ type DeployInput struct {
 }
 
 func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) {
-	if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.InfoName) == "" || in.ConfigHash == "" || !json.Valid(in.State) || in.StateVersion < 1 || len(in.Destinations) == 0 || in.FailureThreshold < 1 || in.MaxEventsPerTransaction < 1 || in.MaxEventsPerTransaction > 256 || in.EventRetention <= 0 {
-		return Deployment{}, errors.New("deploy requires name, info, artifact, config hash, and valid versioned state")
+	if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.InfoName) == "" || in.ConfigHash == "" || !json.Valid(in.State) || len(in.Destinations) == 0 || in.FailureThreshold < 1 || in.MaxEventsPerTransaction < 1 || in.MaxEventsPerTransaction > 256 || in.EventRetention <= 0 {
+		return Deployment{}, errors.New("deploy requires name, info, artifact, config hash, and valid state")
 	}
 	for _, destination := range in.Destinations {
 		if !json.Valid(destination) {
@@ -83,8 +81,8 @@ func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) 
 		if err != nil {
 			return Deployment{}, err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO deployments(id,name,info_name,source_dir,status,artifact_id,config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,state,state_version,created_at,updated_at,expires_at)
-			VALUES(?,?,?,?, 'active', ?,1,?,?,?,?,?,?,?,?,?)`, id, in.Name, in.InfoName, in.SourceDir, artifact.ID, in.ConfigHash, in.FailureThreshold, in.MaxEventsPerTransaction, in.EventRetention.Milliseconds(), in.State, in.StateVersion, nowMS, nowMS, expires)
+		_, err = tx.ExecContext(ctx, `INSERT INTO deployments(id,name,info_name,source_dir,status,artifact_id,config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,state,created_at,updated_at,expires_at)
+			VALUES(?,?,?,?, 'active', ?,1,?,?,?,?,?,?,?,?)`, id, in.Name, in.InfoName, in.SourceDir, artifact.ID, in.ConfigHash, in.FailureThreshold, in.MaxEventsPerTransaction, in.EventRetention.Milliseconds(), in.State, nowMS, nowMS, expires)
 	case err != nil:
 		return Deployment{}, err
 	default:
@@ -98,12 +96,15 @@ func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) 
 		if oldHash != in.ConfigHash {
 			revisionBump = 1
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE deployments SET info_name=?,source_dir=?,artifact_id=?,config_hash=?,config_revision=config_revision+?,failure_threshold=?,max_events_per_transaction=?,event_retention_ms=?,active_generation=0,state=?,state_version=?,state_revision=state_revision+1,status='active',expires_at=?,archived_at=NULL,updated_at=? WHERE id=?`, in.InfoName, in.SourceDir, artifact.ID, in.ConfigHash, revisionBump, in.FailureThreshold, in.MaxEventsPerTransaction, in.EventRetention.Milliseconds(), in.State, in.StateVersion, expires, nowMS, id)
+		_, err = tx.ExecContext(ctx, `UPDATE deployments SET info_name=?,source_dir=?,artifact_id=?,config_hash=?,config_revision=config_revision+?,failure_threshold=?,max_events_per_transaction=?,event_retention_ms=?,active_generation=0,state=?,state_revision=state_revision+1,status='active',expires_at=?,archived_at=NULL,updated_at=? WHERE id=?`, in.InfoName, in.SourceDir, artifact.ID, in.ConfigHash, revisionBump, in.FailureThreshold, in.MaxEventsPerTransaction, in.EventRetention.Milliseconds(), in.State, expires, nowMS, id)
 	}
 	if err != nil {
 		return Deployment{}, fmt.Errorf("deploy: %w", err)
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=? WHERE deployment_id=? AND status='active'`, nowMS, id); err != nil {
+	if err = ensureDeploymentHealth(ctx, tx, id, 0, "starting", nowMS); err != nil {
+		return Deployment{}, fmt.Errorf("initialize deployment health: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=?,stopped_at=COALESCE(stopped_at,?),stop_reason=CASE WHEN stop_reason='' THEN 'deployment replaced' ELSE stop_reason END WHERE deployment_id=? AND status='active'`, nowMS, nowMS, id); err != nil {
 		return Deployment{}, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE destination_bindings SET retired_at=? WHERE deployment_id=? AND retired_at IS NULL`, nowMS, id); err != nil {
@@ -126,7 +127,7 @@ func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) 
 }
 
 func (s *Store) ListDeployments(ctx context.Context) ([]Deployment, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,active_generation,state,state_version,state_revision,created_at,updated_at,expires_at,archived_at FROM deployments ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,active_generation,state,state_revision,created_at,updated_at,expires_at,archived_at FROM deployments ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +139,7 @@ func (s *Store) ListDeployments(ctx context.Context) ([]Deployment, error) {
 		var created, updated int64
 		var retentionMS int64
 		var expires, archived sql.NullInt64
-		if err = rows.Scan(&d.ID, &d.Name, &d.InfoName, &d.SourceDir, &d.Status, &d.ArtifactID, &d.ConfigRevision, &d.ConfigHash, &d.FailureThreshold, &d.MaxEventsPerTransaction, &retentionMS, &d.ActiveGeneration, &state, &d.StateVersion, &d.StateRevision, &created, &updated, &expires, &archived); err != nil {
+		if err = rows.Scan(&d.ID, &d.Name, &d.InfoName, &d.SourceDir, &d.Status, &d.ArtifactID, &d.ConfigRevision, &d.ConfigHash, &d.FailureThreshold, &d.MaxEventsPerTransaction, &retentionMS, &d.ActiveGeneration, &state, &d.StateRevision, &created, &updated, &expires, &archived); err != nil {
 			return nil, err
 		}
 		d.State = append(json.RawMessage(nil), state...)
@@ -159,11 +160,14 @@ func (s *Store) DeactivateDueDeployments(ctx context.Context, now time.Time) (in
 	}
 	defer tx.Rollback()
 	nowMS := toMs(now)
-	if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=? WHERE status='active' AND deployment_id IN (SELECT id FROM deployments WHERE status='active' AND expires_at IS NOT NULL AND expires_at<=?)`, nowMS, nowMS); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=?,stopped_at=COALESCE(stopped_at,?),stop_reason=CASE WHEN stop_reason='' THEN 'deployment expired' ELSE stop_reason END WHERE status='active' AND deployment_id IN (SELECT id FROM deployments WHERE status='active' AND expires_at IS NOT NULL AND expires_at<=?)`, nowMS, nowMS, nowMS); err != nil {
 		return 0, err
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE deployments SET status='inactive',active_generation=0,updated_at=? WHERE status='active' AND expires_at IS NOT NULL AND expires_at<=?`, nowMS, nowMS)
 	if err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE deployment_health SET generation=0,status='stopped',updated_at=? WHERE deployment_id IN (SELECT id FROM deployments WHERE status='inactive' AND expires_at IS NOT NULL AND expires_at<=?)`, nowMS, nowMS); err != nil {
 		return 0, err
 	}
 	count, err := res.RowsAffected()
@@ -182,8 +186,8 @@ func (s *Store) GetDeployment(ctx context.Context, selector string) (Deployment,
 	var created, updated int64
 	var retentionMS int64
 	var expires, archived sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,active_generation,state,state_version,state_revision,created_at,updated_at,expires_at,archived_at
-		FROM deployments WHERE id=? OR name=? ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END LIMIT 1`, selector, selector, selector).Scan(&d.ID, &d.Name, &d.InfoName, &d.SourceDir, &d.Status, &d.ArtifactID, &d.ConfigRevision, &d.ConfigHash, &d.FailureThreshold, &d.MaxEventsPerTransaction, &retentionMS, &d.ActiveGeneration, &state, &d.StateVersion, &d.StateRevision, &created, &updated, &expires, &archived)
+	err := s.db.QueryRowContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,active_generation,state,state_revision,created_at,updated_at,expires_at,archived_at
+		FROM deployments WHERE id=? OR name=? ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END LIMIT 1`, selector, selector, selector).Scan(&d.ID, &d.Name, &d.InfoName, &d.SourceDir, &d.Status, &d.ArtifactID, &d.ConfigRevision, &d.ConfigHash, &d.FailureThreshold, &d.MaxEventsPerTransaction, &retentionMS, &d.ActiveGeneration, &state, &d.StateRevision, &created, &updated, &expires, &archived)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, fmt.Errorf("deployment %q: %w", selector, ErrNotFound)
 	}
@@ -223,9 +227,16 @@ func (s *Store) setDeploymentStatus(ctx context.Context, id, from, to string, ex
 		return ErrInvalidStatus
 	}
 	if from == "active" {
-		if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=? WHERE deployment_id=? AND status='active'`, now, id); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=?,stopped_at=COALESCE(stopped_at,?),stop_reason=CASE WHEN stop_reason='' THEN ? ELSE stop_reason END WHERE deployment_id=? AND status='active'`, now, now, "deployment "+to, id); err != nil {
 			return err
 		}
+	}
+	healthStatus := "starting"
+	if to != "active" {
+		healthStatus = "stopped"
+	}
+	if err = ensureDeploymentHealth(ctx, tx, id, 0, healthStatus, now); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -251,7 +262,7 @@ func (s *Store) ArchiveDeployment(ctx context.Context, id string) error {
 	if rows != 1 {
 		return ErrInvalidStatus
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=? WHERE deployment_id=? AND status='active'`, now, id)
+	_, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=?,stopped_at=COALESCE(stopped_at,?),stop_reason=CASE WHEN stop_reason='' THEN 'deployment archived' ELSE stop_reason END WHERE deployment_id=? AND status='active'`, now, now, id)
 	if err != nil {
 		return err
 	}
@@ -284,17 +295,26 @@ func (s *Store) PurgeDeploymentSafe(ctx context.Context, id string, force bool) 
 }
 
 // ReplaceState performs an operator CAS and immediately fences the active worker.
-func (s *Store) ReplaceState(ctx context.Context, id string, base int64, state json.RawMessage, version int) (int64, error) {
-	if !json.Valid(state) || version < 1 {
-		return 0, errors.New("state must be valid JSON with a positive version")
+func (s *Store) ReplaceState(ctx context.Context, id string, base int64, state json.RawMessage) (int64, error) {
+	if !json.Valid(state) {
+		return 0, errors.New("state must be valid JSON")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+	var status string
+	if err = tx.QueryRowContext(ctx, `SELECT status FROM deployments WHERE id=?`, id).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	} else if err != nil {
+		return 0, err
+	}
+	if status == "archived" {
+		return 0, ErrInvalidStatus
+	}
 	now := toMs(time.Now().UTC())
-	res, err := tx.ExecContext(ctx, `UPDATE deployments SET state=?,state_version=?,state_revision=state_revision+1,active_generation=0,updated_at=? WHERE id=? AND state_revision=?`, state, version, now, id, base)
+	res, err := tx.ExecContext(ctx, `UPDATE deployments SET state=?,state_revision=state_revision+1,active_generation=0,updated_at=? WHERE id=? AND state_revision=?`, state, now, id, base)
 	if err != nil {
 		return 0, err
 	}
@@ -302,8 +322,15 @@ func (s *Store) ReplaceState(ctx context.Context, id string, base int64, state j
 	if rows != 1 {
 		return 0, ErrStateConflict
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=? WHERE deployment_id=? AND status='active'`, now, id)
+	_, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=?,stopped_at=COALESCE(stopped_at,?),stop_reason=CASE WHEN stop_reason='' THEN 'state replaced' ELSE stop_reason END WHERE deployment_id=? AND status='active'`, now, now, id)
 	if err != nil {
+		return 0, err
+	}
+	healthStatus := "stopped"
+	if status == "active" {
+		healthStatus = "starting"
+	}
+	if err = ensureDeploymentHealth(ctx, tx, id, 0, healthStatus, now); err != nil {
 		return 0, err
 	}
 	if err = tx.Commit(); err != nil {

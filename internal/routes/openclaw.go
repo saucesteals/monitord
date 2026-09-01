@@ -249,12 +249,17 @@ func sendOpenClaw(ctx context.Context, cfg openClawConfig, token string, prompt 
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send openclaw hook %s: %w", RedactURL(cfg.URL), err)
+		return fmt.Errorf("send openclaw hook %s: %w", RedactURL(cfg.URL), transportError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("openclaw hook %s returned HTTP %d%s", RedactURL(cfg.URL), resp.StatusCode, responseSuffix(resp.Body))
+		return &deliveryHTTPError{
+			service:    "openclaw",
+			StatusCode: resp.StatusCode,
+			detail:     responseSuffix(resp.Body),
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 
 	return nil

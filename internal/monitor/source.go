@@ -84,8 +84,6 @@ type State struct {
 	Initialized bool ` + "`json:\"initialized\"`" + `
 }
 
-func (State) StateVersion() int { return 1 }
-
 func main() {
 	monitord.Run(monitord.Define(
 		monitord.Info{Name: "MONITOR_NAME", Description: "HTTP status monitor"},

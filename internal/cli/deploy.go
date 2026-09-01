@@ -18,6 +18,7 @@ import (
 
 func (c *CLI) newDeployCmd() *cobra.Command {
 	var name string
+	var resetState bool
 	cmd := &cobra.Command{
 		Use:   "deploy [PATH]",
 		Short: "Build and deploy a monitor",
@@ -27,14 +28,15 @@ func (c *CLI) newDeployCmd() *cobra.Command {
 			if len(args) == 1 {
 				target = args[0]
 			}
-			return c.deploy(cmd.Context(), cmd.OutOrStdout(), target, name)
+			return c.deploy(cmd.Context(), cmd.OutOrStdout(), target, name, resetState)
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "deployment name (defaults to source directory)")
+	cmd.Flags().BoolVar(&resetState, "reset-state", false, "use the new monitor's default state")
 	return cmd
 }
 
-func (c *CLI) deploy(ctx context.Context, out io.Writer, target, overrideName string) error {
+func (c *CLI) deploy(ctx context.Context, out io.Writer, target, overrideName string, resetState bool) error {
 	store, paths, err := c.store()
 	if err != nil {
 		return err
@@ -60,14 +62,16 @@ func (c *CLI) deploy(ctx context.Context, out io.Writer, target, overrideName st
 	if existingErr == nil && existing.Status == "archived" {
 		return errors.New("archived deployments cannot be redeployed; purge it or choose another name")
 	}
+	if resetState && errors.Is(existingErr, storage.ErrNotFound) {
+		return errors.New("--reset-state requires an existing deployment")
+	}
 	req := monitor.Request{
 		Dir:    dir,
 		Name:   monitorName,
 		Config: monitorConfig,
 	}
-	if existingErr == nil {
+	if existingErr == nil && !resetState {
 		req.Current = existing.State
-		req.CurrentVersion = existing.StateVersion
 	}
 	for _, delivery := range monitorConfig.Deliveries {
 		if delivery.Discord != nil {
@@ -114,7 +118,7 @@ func (c *CLI) deploy(ctx context.Context, out io.Writer, target, overrideName st
 	deployed, err := store.Deploy(ctx, storage.DeployInput{
 		Name: monitorName.String(), InfoName: built.Description.Info.Name,
 		SourceDir: dir, Artifact: built.Artifact, ConfigHash: configHash,
-		State: built.State, StateVersion: built.Description.StateVersion,
+		State:                   built.State,
 		FailureThreshold:        monitorConfig.Policy.Health.FailureThreshold,
 		MaxEventsPerTransaction: monitorConfig.Policy.Events.MaxPerTransaction,
 		EventRetention:          monitorConfig.Policy.Events.Retention,
@@ -126,12 +130,11 @@ func (c *CLI) deploy(ctx context.Context, out io.Writer, target, overrideName st
 	}
 	fmt.Fprintf(out, "deployed %s (%s)\n", deployed.Name, deployed.ID)
 	fmt.Fprintf(out, "source   %s\nartifact %s\nplan     %s\n", dir, built.Artifact.Path, built.Description.Plan.Kind)
+	if resetState {
+		fmt.Fprintln(out, "state    reset to monitor defaults")
+	}
 	for _, delivery := range monitorConfig.Deliveries {
 		fmt.Fprintf(out, "delivery %s\n", truncate(delivery.Describe(), 80))
 	}
-	if req.CurrentVersion != 0 && req.CurrentVersion != built.Description.StateVersion {
-		fmt.Fprintf(out, "state migrated v%d -> v%d\n", req.CurrentVersion, built.Description.StateVersion)
-	}
-
 	return nil
 }

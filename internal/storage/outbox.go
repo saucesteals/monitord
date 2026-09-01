@@ -9,9 +9,9 @@ import (
 )
 
 type OutboxHistory struct {
-	OutboxID, EventID, DestinationID, Status, LastError string
-	CreatedAt                                           time.Time
-	AttemptCount                                        int
+	OutboxID, Kind, EventID, DestinationID, Status, LastError string
+	CreatedAt                                                 time.Time
+	AttemptCount                                              int
 }
 
 func (s *Store) ListOutboxHistory(ctx context.Context, id string, limit int, failed bool) ([]OutboxHistory, error) {
@@ -22,7 +22,7 @@ func (s *Store) ListOutboxHistory(ctx context.Context, id string, limit int, fai
 	if failed {
 		filter = " AND d.status='dead'"
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT e.outbox_id,e.event_id,d.destination_id,d.status,d.last_error,e.created_at,d.attempt_count FROM outbox_events e JOIN outbox_deliveries d ON d.outbox_id=e.outbox_id WHERE e.deployment_id=?`+filter+` ORDER BY e.created_at DESC LIMIT ?`, id, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT e.outbox_id,e.kind,e.event_id,d.destination_id,d.status,d.last_error,e.created_at,d.attempt_count FROM outbox_events e JOIN outbox_deliveries d ON d.outbox_id=e.outbox_id WHERE e.deployment_id=?`+filter+` ORDER BY e.created_at DESC LIMIT ?`, id, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -31,7 +31,7 @@ func (s *Store) ListOutboxHistory(ctx context.Context, id string, limit int, fai
 	for rows.Next() {
 		var v OutboxHistory
 		var created int64
-		if err = rows.Scan(&v.OutboxID, &v.EventID, &v.DestinationID, &v.Status, &v.LastError, &created, &v.AttemptCount); err != nil {
+		if err = rows.Scan(&v.OutboxID, &v.Kind, &v.EventID, &v.DestinationID, &v.Status, &v.LastError, &created, &v.AttemptCount); err != nil {
 			return nil, err
 		}
 		v.CreatedAt = fromMs(created)
@@ -43,7 +43,7 @@ func (s *Store) ListOutboxHistory(ctx context.Context, id string, limit int, fai
 type ClaimedDelivery struct {
 	OutboxID, DeploymentID, DeploymentName, DestinationID string
 	DestinationRevision                                   int64
-	EventPayload, DestinationConfig                       json.RawMessage
+	MessagePayload, DestinationConfig                     json.RawMessage
 	AttemptCount                                          int
 	LeaseOwner                                            string
 	LeaseExpiresAt, CreatedAt                             time.Time
@@ -98,7 +98,7 @@ func (s *Store) ClaimOutbox(ctx context.Context, owner string, now time.Time, le
 		var d ClaimedDelivery
 		var created int64
 		if err = rows.Scan(&d.OutboxID, &d.DeploymentID, &d.DeploymentName,
-			&d.DestinationID, &d.DestinationRevision, &d.EventPayload,
+			&d.DestinationID, &d.DestinationRevision, &d.MessagePayload,
 			&d.DestinationConfig, &d.AttemptCount, &created); err != nil {
 			return nil, err
 		}
@@ -122,10 +122,27 @@ func (s *Store) ClaimOutbox(ctx context.Context, owner string, now time.Time, le
 func (s *Store) MarkDelivered(ctx context.Context, outboxID, destinationID, owner string, now time.Time) error {
 	return s.finishDelivery(ctx, outboxID, destinationID, owner, `status='delivered',delivered_at=?,lease_owner=NULL,lease_expires_at=NULL,last_error=''`, toMs(now))
 }
+
+// DeferDelivery releases a lease without counting an attempt. It is used when
+// a destination's local rate limit says the delivery is not due yet.
+func (s *Store) DeferDelivery(ctx context.Context, outboxID, destinationID, owner string, next time.Time) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE outbox_deliveries SET status='pending',next_attempt_at=?,lease_owner=NULL,lease_expires_at=NULL WHERE outbox_id=? AND destination_id=? AND status='sending' AND lease_owner=?`, toMs(next), outboxID, destinationID, owner)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows != 1 {
+		return ErrLeaseLost
+	}
+
+	return nil
+}
+
 func (s *Store) MarkDeliveryFailed(ctx context.Context, outboxID, destinationID, owner, message string, now, next time.Time, maxAttempts int) error {
 	if maxAttempts < 1 {
 		return errors.New("max attempts must be positive")
 	}
+	message = boundedText(message, maxStoredErrorBytes)
 	var attempts int
 	err := s.db.QueryRowContext(ctx, `SELECT attempt_count FROM outbox_deliveries WHERE outbox_id=? AND destination_id=? AND status='sending' AND lease_owner=?`, outboxID, destinationID, owner).Scan(&attempts)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -138,6 +155,29 @@ func (s *Store) MarkDeliveryFailed(ctx context.Context, outboxID, destinationID,
 		return s.finishDelivery(ctx, outboxID, destinationID, owner, `status='dead',attempt_count=attempt_count+1,dead_at=?,lease_owner=NULL,lease_expires_at=NULL,last_error=?`, toMs(now), message)
 	}
 	return s.finishDelivery(ctx, outboxID, destinationID, owner, `status='pending',attempt_count=attempt_count+1,next_attempt_at=?,lease_owner=NULL,lease_expires_at=NULL,last_error=?`, toMs(next), message)
+}
+
+// PruneTerminalOutbox removes expired events only after every associated
+// delivery has reached a terminal state. Pending and leased work is retained
+// regardless of age.
+func (s *Store) PruneTerminalOutbox(ctx context.Context, now time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM outbox_events AS e
+		WHERE e.created_at < (
+			SELECT ? - p.event_retention_ms
+			FROM deployments AS p
+			WHERE p.id=e.deployment_id
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM outbox_deliveries AS d
+			WHERE d.outbox_id=e.outbox_id
+			AND d.status IN ('pending','sending')
+		)`, toMs(now))
+	if err != nil {
+		return 0, err
+	}
+
+	return result.RowsAffected()
 }
 func (s *Store) finishDelivery(ctx context.Context, outboxID, destinationID, owner, set string, args ...any) error {
 	args = append(args, outboxID, destinationID, owner)

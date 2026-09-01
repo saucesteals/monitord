@@ -37,10 +37,8 @@ type Request struct {
 	Config Config
 
 	// Current is the monitor's existing state, if it was deployed before. The
-	// new binary validates and migrates it before the deploy is accepted.
+	// new binary validates it before the deploy is accepted.
 	Current json.RawMessage
-	// CurrentVersion is the schema version Current was written with.
-	CurrentVersion int
 }
 
 // BuildResult is an immutable artifact plus deployment-local canonical state.
@@ -78,7 +76,7 @@ func Build(ctx context.Context, paths config.Paths, req Request) (BuildResult, e
 	if err = build(ctx, dir, binaryPath); err != nil {
 		return BuildResult{}, err
 	}
-	description, err := describe(ctx, binaryPath, dir, monitord.DescribeInput{State: req.Current, Version: req.CurrentVersion})
+	description, err := describe(ctx, binaryPath, dir, monitord.DescribeInput{State: req.Current})
 	if err != nil {
 		return BuildResult{}, err
 	}

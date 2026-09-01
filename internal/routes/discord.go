@@ -197,19 +197,23 @@ type discordPayload struct {
 	AllowedMentions allowedMentions `json:"allowed_mentions"`
 }
 
-// HTTPError classifies a Discord response for durable delivery retries.
-type HTTPError struct {
+// deliveryHTTPError classifies a destination response for durable retries.
+type deliveryHTTPError struct {
 	StatusCode int
+	service    string
+	detail     string
 	retryAfter time.Duration
 }
 
-func (e *HTTPError) Error() string { return fmt.Sprintf("discord returned HTTP %d", e.StatusCode) }
-func (e *HTTPError) Permanent() bool {
+func (e *deliveryHTTPError) Error() string {
+	return fmt.Sprintf("%s returned HTTP %d%s", e.service, e.StatusCode, e.detail)
+}
+func (e *deliveryHTTPError) Permanent() bool {
 	return e.StatusCode >= 400 && e.StatusCode < 500 &&
 		e.StatusCode != http.StatusRequestTimeout && e.StatusCode != http.StatusConflict &&
 		e.StatusCode != http.StatusTooEarly && e.StatusCode != http.StatusTooManyRequests
 }
-func (e *HTTPError) RetryAfter() time.Duration { return e.retryAfter }
+func (e *deliveryHTTPError) RetryAfter() time.Duration { return e.retryAfter }
 
 // Discord's documented limits.
 const (
@@ -257,15 +261,23 @@ func sendDiscord(ctx context.Context, endpoint string, authorization string, msg
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send discord notification: %w", err)
+		return fmt.Errorf("send discord notification via %s: %w", RedactURL(endpoint), transportError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &HTTPError{StatusCode: resp.StatusCode, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+		return &deliveryHTTPError{service: "discord", StatusCode: resp.StatusCode, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 
 	return nil
+}
+
+func transportError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
 }
 
 func parseRetryAfter(value string) time.Duration {

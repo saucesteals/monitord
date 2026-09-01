@@ -97,15 +97,15 @@ func (c *CLI) stateSet(ctx context.Context, in io.Reader, out io.Writer, selecto
 
 	// Hold the edit to the monitor's own struct. Storing unvalidated JSON would
 	// fail every subsequent callback, with nothing able to overwrite it.
-	canonical, err := monitor.ValidateState(ctx, m.ArtifactPath, filepath.Dir(m.ArtifactPath), raw, m.StateVersion)
+	canonical, err := monitor.ValidateState(ctx, m.ArtifactPath, filepath.Dir(m.ArtifactPath), raw)
 	if err != nil {
 		return fmt.Errorf("state from %s rejected by %s: %w", source, m.Name, err)
 	}
-	if _, err := store.ReplaceState(ctx, m.ID, m.StateRevision, canonical, m.StateVersion); err != nil {
+	if _, err := store.ReplaceState(ctx, m.ID, m.StateRevision, canonical); err != nil {
 		return err
 	}
 
-	fmt.Fprintf(out, "state updated for %s (version %d, %d bytes)\n", m.Name, m.StateVersion, len(canonical))
+	fmt.Fprintf(out, "state updated for %s (%d bytes)\n", m.Name, len(canonical))
 
 	return nil
 }
@@ -135,15 +135,15 @@ func (c *CLI) stateClear(ctx context.Context, out io.Writer, selector string) er
 
 	// Empty input makes the monitor report its own defaults, so a cleared
 	// monitor starts from the same state a fresh deploy would.
-	defaults, err := monitor.ValidateState(ctx, m.ArtifactPath, filepath.Dir(m.ArtifactPath), nil, m.StateVersion)
+	defaults, err := monitor.ValidateState(ctx, m.ArtifactPath, filepath.Dir(m.ArtifactPath), nil)
 	if err != nil {
 		return err
 	}
-	if _, err := store.ReplaceState(ctx, m.ID, m.StateRevision, defaults, m.StateVersion); err != nil {
+	if _, err := store.ReplaceState(ctx, m.ID, m.StateRevision, defaults); err != nil {
 		return err
 	}
 
-	fmt.Fprintf(out, "state cleared for %s (version %d, %d bytes)\n", m.Name, m.StateVersion, len(defaults))
+	fmt.Fprintf(out, "state cleared for %s (%d bytes)\n", m.Name, len(defaults))
 
 	return nil
 }

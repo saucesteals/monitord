@@ -18,8 +18,6 @@ type TargetState struct {
 	Reachable bool `json:"reachable"`
 }
 
-func (State) StateVersion() int { return 1 }
-
 func main() {
 	monitord.Run(monitord.Define(
 		monitord.Info{

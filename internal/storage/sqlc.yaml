@@ -1,7 +1,7 @@
 version: "2"
 sql:
   - engine: "sqlite"
-    schema: "migrations"
+    schema: "schema.sql"
     queries: "queries"
     gen:
       go:
@@ -10,3 +10,4 @@ sql:
         emit_interface: true
         emit_empty_slices: true
         emit_exact_table_names: false
+        omit_unused_structs: true

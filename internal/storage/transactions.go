@@ -9,7 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/saucesteals/monitord/internal/routes"
 )
 
 var (
@@ -32,7 +35,7 @@ type OutboxDelivery struct {
 type OutboxEvent struct {
 	OutboxID   string
 	EventID    string
-	Payload    json.RawMessage
+	Message    routes.Message
 	Deliveries []OutboxDelivery
 }
 
@@ -131,14 +134,15 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 		hash := sha256.Sum256(checkpoint.Value)
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO checkpoints (
-				deployment_id, source, value, value_hash, updated_generation, updated_seq
-			) VALUES (?, ?, ?, ?, ?, ?)
+				deployment_id, source, value, value_hash, updated_generation, updated_seq, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(deployment_id, source) DO UPDATE SET
 				value = excluded.value,
 				value_hash = excluded.value_hash,
 				updated_generation = excluded.updated_generation,
-				updated_seq = excluded.updated_seq`, frame.DeploymentID, checkpoint.Source,
-			checkpoint.Value, hash[:], frame.Generation, frame.Sequence); err != nil {
+				updated_seq = excluded.updated_seq,
+				updated_at = excluded.updated_at`, frame.DeploymentID, checkpoint.Source,
+			checkpoint.Value, hash[:], frame.Generation, frame.Sequence, toMs(now)); err != nil {
 			return TransactionACK{}, fmt.Errorf("write checkpoint %q: %w", checkpoint.Source, err)
 		}
 	}
@@ -236,19 +240,30 @@ func lookupTransaction(ctx context.Context, tx *sql.Tx, frame TransactionFrame) 
 }
 
 func insertOutboxEvent(ctx context.Context, tx *sql.Tx, frame TransactionFrame, event OutboxEvent, now time.Time) error {
-	payloadHash := sha256.Sum256(event.Payload)
+	// The payload is already destination-neutral. Stamp it once when the
+	// transaction commits so every retry and route renders the same occurrence.
+	identityPayload, err := json.Marshal(event.Message)
+	if err != nil {
+		return fmt.Errorf("encode event message identity %q: %w", event.EventID, err)
+	}
+	identityHash := sha256.Sum256(identityPayload)
+	event.Message.Time = now
+	payload, err := json.Marshal(event.Message)
+	if err != nil {
+		return fmt.Errorf("encode event message %q: %w", event.EventID, err)
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO outbox_events (
-			outbox_id, deployment_id, generation, transaction_seq,
+			outbox_id, deployment_id, kind, generation, transaction_seq,
 			event_id, payload, payload_hash, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, event.OutboxID, frame.DeploymentID,
-		frame.Generation, frame.Sequence, event.EventID, event.Payload, payloadHash[:], toMs(now)); err != nil {
+		) VALUES (?, ?, 'monitor', ?, ?, ?, ?, ?, ?)`, event.OutboxID, frame.DeploymentID,
+		frame.Generation, frame.Sequence, event.EventID, payload, identityHash[:], toMs(now)); err != nil {
 		// Event IDs identify immutable source occurrences across transactions.
 		// An inclusive replay with identical content coalesces; reusing the ID
 		// for different content is a fatal application conflict.
 		var storedHash []byte
-		lookupErr := tx.QueryRowContext(ctx, `SELECT payload_hash FROM outbox_events WHERE deployment_id=? AND event_id=?`, frame.DeploymentID, event.EventID).Scan(&storedHash)
-		if lookupErr == nil && bytes.Equal(storedHash, payloadHash[:]) {
+		lookupErr := tx.QueryRowContext(ctx, `SELECT payload_hash FROM outbox_events WHERE deployment_id=? AND kind='monitor' AND event_id=?`, frame.DeploymentID, event.EventID).Scan(&storedHash)
+		if lookupErr == nil && bytes.Equal(storedHash, identityHash[:]) {
 			return nil
 		}
 		if lookupErr == nil {
@@ -291,7 +306,7 @@ func validateFrame(frame TransactionFrame) error {
 	eventIDs := make(map[string]struct{}, len(frame.Events))
 	outboxIDs := make(map[string]struct{}, len(frame.Events))
 	for _, event := range frame.Events {
-		if event.OutboxID == "" || event.EventID == "" || !json.Valid(event.Payload) {
+		if event.OutboxID == "" || event.EventID == "" || strings.TrimSpace(event.Message.Title) == "" {
 			return errors.New("transaction frame contains an invalid event")
 		}
 		if _, exists := eventIDs[event.EventID]; exists {

@@ -7,15 +7,16 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"sync"
 	"time"
 
-	monitord "github.com/saucesteals/monitord"
 	"github.com/saucesteals/monitord/internal/routes"
 	"github.com/saucesteals/monitord/internal/storage"
+	"golang.org/x/time/rate"
 )
 
 const (
-	outboxLease       = 30 * time.Second
+	outboxLease       = deliveryAttemptTimeout + 5*time.Second
 	outboxBatch       = 32
 	outboxBaseBackoff = 2 * time.Second
 	outboxMaxBackoff  = 15 * time.Minute
@@ -35,25 +36,17 @@ func (s daemonDeliverySender) Send(ctx context.Context, delivery storage.Claimed
 	if err := json.Unmarshal(delivery.DestinationConfig, &binding); err != nil {
 		return permanentDeliveryError{fmt.Errorf("decode destination binding: %w", err)}
 	}
-	var event monitord.Event
-	if err := json.Unmarshal(delivery.EventPayload, &event); err != nil {
-		return permanentDeliveryError{fmt.Errorf("decode event: %w", err)}
+	var message routes.Message
+	if err := json.Unmarshal(delivery.MessagePayload, &message); err != nil {
+		return permanentDeliveryError{fmt.Errorf("decode message: %w", err)}
 	}
-	return s.daemon.deliverRoute(ctx, binding, eventMessage(delivery.DeploymentName, delivery.CreatedAt, event))
+	return s.daemon.deliverRoute(ctx, binding, message)
 }
 
 type permanentDeliveryError struct{ error }
 
 func (permanentDeliveryError) Permanent() bool           { return true }
 func (permanentDeliveryError) RetryAfter() time.Duration { return 0 }
-
-func eventMessage(deployment string, createdAt time.Time, event monitord.Event) routes.Message {
-	return routes.Message{
-		Title: event.Title, Message: event.Body, URL: event.URL,
-		Level: eventLevel(event.Severity), Fields: dataFields(event.Data),
-		Footer: deployment, Time: createdAt,
-	}
-}
 
 type deliveryError interface {
 	error
@@ -63,19 +56,31 @@ type deliveryError interface {
 
 type outboxStore interface {
 	ClaimOutbox(context.Context, string, time.Time, time.Duration, int) ([]storage.ClaimedDelivery, error)
+	DeferDelivery(context.Context, string, string, string, time.Time) error
 	MarkDelivered(context.Context, string, string, string, time.Time) error
 	MarkDeliveryFailed(context.Context, string, string, string, string, time.Time, time.Time, int) error
 }
 
 type outboxWorker struct {
-	store  outboxStore
-	sender DeliverySender
-	owner  string
-	now    func() time.Time
+	store    outboxStore
+	sender   DeliverySender
+	owner    string
+	now      func() time.Time
+	limitsMu sync.Mutex
+	limits   map[destinationLimitKey]*rate.Limiter
 }
 
 func newOutboxWorker(store outboxStore, sender DeliverySender, owner string) *outboxWorker {
-	return &outboxWorker{store: store, sender: sender, owner: owner, now: func() time.Time { return time.Now().UTC() }}
+	return &outboxWorker{
+		store: store, sender: sender, owner: owner,
+		now:    func() time.Time { return time.Now().UTC() },
+		limits: make(map[destinationLimitKey]*rate.Limiter),
+	}
+}
+
+type destinationLimitKey struct {
+	deploymentID, destinationID string
+	revision                    int64
 }
 
 func (w *outboxWorker) process(ctx context.Context) (int, error) {
@@ -98,19 +103,29 @@ func (w *outboxWorker) process(ctx context.Context) (int, error) {
 }
 
 func (w *outboxWorker) sendOne(ctx context.Context, delivery storage.ClaimedDelivery) error {
-	attemptCtx, cancel := context.WithTimeout(ctx, deliveryAttemptTimeout)
-	result := make(chan error, 1)
-	go func() { result <- w.sender.Send(attemptCtx, delivery) }()
 	var err error
-	select {
-	case err = <-result:
-	case <-attemptCtx.Done():
-		err = attemptCtx.Err()
+	throttleDelay, err := w.reserveDestination(delivery)
+	if err == nil && throttleDelay > 0 {
+		settleCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return w.store.DeferDelivery(settleCtx, delivery.OutboxID, delivery.DestinationID, delivery.LeaseOwner, w.now().Add(throttleDelay))
 	}
-	cancel()
-	now := w.now()
 	if err == nil {
-		return w.store.MarkDelivered(ctx, delivery.OutboxID, delivery.DestinationID, delivery.LeaseOwner, now)
+		attemptCtx, cancel := context.WithTimeout(ctx, deliveryAttemptTimeout)
+		result := make(chan error, 1)
+		go func() { result <- w.sender.Send(attemptCtx, delivery) }()
+		select {
+		case err = <-result:
+		case <-attemptCtx.Done():
+			err = attemptCtx.Err()
+		}
+		cancel()
+	}
+	now := w.now()
+	settleCtx, settleCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer settleCancel()
+	if err == nil {
+		return w.store.MarkDelivered(settleCtx, delivery.OutboxID, delivery.DestinationID, delivery.LeaseOwner, now)
 	}
 	maxAttempts := math.MaxInt
 	delay := retryDelay(delivery.AttemptCount)
@@ -123,10 +138,46 @@ func (w *outboxWorker) sendOne(ctx context.Context, delivery storage.ClaimedDeli
 			delay = min(after, outboxMaxBackoff)
 		}
 	}
-	if markErr := w.store.MarkDeliveryFailed(ctx, delivery.OutboxID, delivery.DestinationID, delivery.LeaseOwner, err.Error(), now, now.Add(delay), maxAttempts); markErr != nil {
-		return errors.Join(fmt.Errorf("send %s/%s: %w", delivery.OutboxID, delivery.DestinationID, err), markErr)
+	if markErr := w.store.MarkDeliveryFailed(settleCtx, delivery.OutboxID, delivery.DestinationID, delivery.LeaseOwner, err.Error(), now, now.Add(delay), maxAttempts); markErr != nil {
+		return fmt.Errorf("record failed delivery %s/%s: %w", delivery.OutboxID, delivery.DestinationID, markErr)
 	}
-	return nil
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return fmt.Errorf("delivery %s/%s failed", delivery.OutboxID, delivery.DestinationID)
+}
+
+func (w *outboxWorker) reserveDestination(delivery storage.ClaimedDelivery) (time.Duration, error) {
+	var binding routes.Delivery
+	if err := json.Unmarshal(delivery.DestinationConfig, &binding); err != nil {
+		return 0, permanentDeliveryError{fmt.Errorf("decode destination binding: %w", err)}
+	}
+	if err := binding.RateLimit.Validate(); err != nil {
+		return 0, permanentDeliveryError{fmt.Errorf("invalid destination rate limit: %w", err)}
+	}
+	if !binding.RateLimit.Enabled() {
+		return 0, nil
+	}
+
+	key := destinationLimitKey{delivery.DeploymentID, delivery.DestinationID, delivery.DestinationRevision}
+	w.limitsMu.Lock()
+	limiter := w.limits[key]
+	if limiter == nil {
+		limiter = rate.NewLimiter(rate.Limit(binding.RateLimit.PerSecond), binding.RateLimit.Burst)
+		w.limits[key] = limiter
+	}
+	w.limitsMu.Unlock()
+	now := w.now()
+	reservation := limiter.ReserveN(now, 1)
+	if !reservation.OK() {
+		return 0, permanentDeliveryError{errors.New("destination rate limit cannot reserve one delivery")}
+	}
+	delay := reservation.DelayFrom(now)
+	if delay <= 0 {
+		return 0, nil
+	}
+	reservation.CancelAt(now)
+	return delay, nil
 }
 
 func retryDelay(attempt int) time.Duration {

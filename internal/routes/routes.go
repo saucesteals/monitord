@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -15,9 +16,17 @@ import (
 
 // Delivery is one monitor-owned notification destination.
 type Delivery struct {
-	Discord *Discord        `json:"discord,omitempty"`
-	Route   model.RouteName `json:"route,omitempty"`
-	Options Options         `json:"options,omitempty"`
+	Discord   *Discord        `json:"discord,omitempty"`
+	Route     model.RouteName `json:"route,omitempty"`
+	Options   Options         `json:"options,omitempty"`
+	RateLimit RateLimit       `json:"rate_limit"`
+}
+
+// RateLimit bounds delivery attempts to one destination. Both fields must be
+// set together; a zero value disables throttling.
+type RateLimit struct {
+	PerSecond float64 `json:"per_second"`
+	Burst     int     `json:"burst"`
 }
 
 // Options is persisted configuration owned by an agent route driver.
@@ -35,6 +44,9 @@ type Discord struct {
 
 // Validate reports whether d has exactly one usable Discord destination.
 func (d Delivery) Validate() error {
+	if err := d.RateLimit.Validate(); err != nil {
+		return fmt.Errorf("rate limit: %w", err)
+	}
 	if d.Discord != nil {
 		if d.Route != "" {
 			return errors.New("discord delivery cannot also name an agent route")
@@ -48,6 +60,27 @@ func (d Delivery) Validate() error {
 
 	return d.Route.Validate()
 }
+
+// Validate reports whether the rate limit is disabled or fully configured.
+func (l RateLimit) Validate() error {
+	if math.IsNaN(l.PerSecond) || math.IsInf(l.PerSecond, 0) {
+		return errors.New("per_second must be finite")
+	}
+	if l.PerSecond == 0 && l.Burst == 0 {
+		return nil
+	}
+	if l.PerSecond <= 0 {
+		return errors.New("per_second must be positive")
+	}
+	if l.Burst <= 0 {
+		return errors.New("burst must be positive")
+	}
+
+	return nil
+}
+
+// Enabled reports whether delivery throttling is configured.
+func (l RateLimit) Enabled() bool { return l.PerSecond > 0 }
 
 // Validate reports whether d has exactly one usable Discord destination.
 func (d Discord) Validate() error {
@@ -88,19 +121,23 @@ func (d Discord) Validate() error {
 
 // Describe returns non-secret destination details for CLI output.
 func (d Delivery) Describe() string {
+	description := ""
 	if d.Discord == nil {
-		return d.Route.String()
+		description = d.Route.String()
+	} else if d.Discord.WebhookURL != "" {
+		description = "discord webhook " + RedactURL(d.Discord.WebhookURL)
+	} else {
+		target := d.Discord.ChannelID
+		if d.Discord.ThreadID != "" {
+			target = d.Discord.ThreadID
+		}
+		description = fmt.Sprintf("discord account=%s channel=%s", d.Discord.Account, target)
 	}
-	if d.Discord.WebhookURL != "" {
-		return "discord webhook " + RedactURL(d.Discord.WebhookURL)
+	if d.RateLimit.Enabled() {
+		description += fmt.Sprintf(" rate=%.4g/s burst=%d", d.RateLimit.PerSecond, d.RateLimit.Burst)
 	}
 
-	target := d.Discord.ChannelID
-	if d.Discord.ThreadID != "" {
-		target = d.Discord.ThreadID
-	}
-
-	return fmt.Sprintf("discord account=%s channel=%s", d.Discord.Account, target)
+	return description
 }
 
 // DeliverDiscord sends msg to a direct Discord destination.
@@ -175,39 +212,39 @@ const (
 
 // Field is one labelled value shown in a notification.
 type Field struct {
-	Name   string
-	Value  string
-	Inline bool
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline,omitempty"`
 }
 
 // Author is the attribution line above a message title.
 type Author struct {
-	Name    string
-	URL     string
-	IconURL string
+	Name    string `json:"name"`
+	URL     string `json:"url,omitempty"`
+	IconURL string `json:"icon_url,omitempty"`
 }
 
 // Message is a destination-neutral monitor notification.
 type Message struct {
-	Title string
+	Title string `json:"title"`
 	// Message is a compact notification preview. Direct Discord deliveries put
 	// it in top-level content ahead of any configured mention.
-	Message    string
-	Summary    string
-	Details    string
-	URL        string
-	Image      string
-	Thumbnail  string
-	Author     Author
-	Level      Level
-	Color      int
-	Fields     []Field
-	Footer     string
-	FooterIcon string
+	Message    string  `json:"message,omitempty"`
+	Summary    string  `json:"summary,omitempty"`
+	Details    string  `json:"details,omitempty"`
+	URL        string  `json:"url,omitempty"`
+	Image      string  `json:"image,omitempty"`
+	Thumbnail  string  `json:"thumbnail,omitempty"`
+	Author     Author  `json:"author,omitempty"`
+	Level      Level   `json:"level,omitempty"`
+	Color      int     `json:"color,omitempty"`
+	Fields     []Field `json:"fields,omitempty"`
+	Footer     string  `json:"footer,omitempty"`
+	FooterIcon string  `json:"footer_icon,omitempty"`
 	// MuteMentions prevents health failures and recoveries from paging people.
-	MuteMentions bool
+	MuteMentions bool `json:"mute_mentions,omitempty"`
 	// Time is the notification timestamp. Zero means now at render time.
-	Time time.Time
+	Time time.Time `json:"time"`
 }
 
 // Driver owns validation and delivery for an agent route backend.

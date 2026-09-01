@@ -9,6 +9,7 @@ import (
 const (
 	monitorStartTimeout = 10 * time.Second
 	monitorStopTimeout  = 5 * time.Second
+	stopReportGrace     = time.Second
 )
 
 // Environment contains the worker-scoped dependencies available to a monitor.

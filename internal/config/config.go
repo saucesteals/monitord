@@ -48,8 +48,7 @@ func (p Paths) ModulePath() string {
 
 // Config is the on-disk daemon configuration.
 //
-// Proxies deliberately do not live here. They are a resource monitord stores
-// and owns, so importing more never means editing config or restarting.
+// Proxy pools are exact monitor secrets, not global daemon configuration.
 type Config struct {
 	Paths
 }

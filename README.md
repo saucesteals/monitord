@@ -33,8 +33,6 @@ import (
 
 type State struct { InStock bool `json:"in_stock"` }
 
-func (State) StateVersion() int { return 1 }
-
 func main() {
 	monitord.Run(monitord.Define(
 		monitord.Info{Name: "restock", Description: "Watches one product"},
@@ -86,6 +84,23 @@ The worker retains the exact unacknowledged transaction bytes. If an ACK is lost
 
 Events enter a durable per-destination outbox in the same SQLite commit. Delivery is at least once: a destination may receive a duplicate if it accepted a request immediately before the daemon lost the success marker. Retries, partial destination success, leases, and dead letters are independent of worker lifetime.
 
+Delivery throughput is configured beside each destination in `monitor.yaml`. The
+limit applies to attempts for that binding, including retries:
+
+```yaml
+deliveries:
+  - discord:
+      account: jarvis
+      channel_id: "123456789012345678"
+    rate_limit:
+      per_second: 1
+      burst: 5
+```
+
+Omitting `rate_limit` leaves the destination unthrottled. Terminal outbox data
+is removed after the deployment's `events.retention` window; pending and leased
+deliveries are never pruned because of age.
+
 ## Exact secrets
 
 Plans request exact group/key references:
@@ -118,6 +133,7 @@ The catalog also exposes managed confirmed `quicknode.Events[S]` and a raw JSON-
 monitord new restock
 monitord test restock
 monitord deploy restock --name shop-restock
+monitord deploy restock --name shop-restock --reset-state # incompatible schema change
 monitord list
 monitord inspect shop-restock
 monitord state get shop-restock
@@ -132,4 +148,4 @@ Deploying an existing name preserves its immutable deployment ID and state while
 
 Built binaries live in a global content-addressed cache. A failed deployment may leave a reusable cache entry on disk, but never creates a visible artifact or deployment row in SQLite.
 
-State schema version and concurrency revision are separate. Implement `StateVersion() int` and `MigrateState(from int, raw json.RawMessage) error` when changing the stored shape; deploy validates and migrates before activation.
+State is strictly decoded into the monitor's Go type. Use `state get/set/clear` for ordinary edits. For an incompatible Go schema change, redeploy with `--reset-state` so the new monitor supplies its defaults. State edits fence stale workers automatically.

@@ -15,9 +15,12 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 var ErrStateConflict = errors.New("state revision conflict")
+
+const maxStoredErrorBytes = 16 << 10
 
 type Store struct {
 	db *sql.DB
@@ -45,7 +48,7 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("pragma %q: %w", pragma, err)
 		}
 	}
-	if err = runMigrations(conn); err != nil {
+	if err = initializeSchema(conn); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -116,6 +119,16 @@ func toRoute(r db.Route) (Route, error) {
 }
 func toMs(t time.Time) int64    { return t.UTC().UnixMilli() }
 func fromMs(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
+func boundedText(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	value = value[:limit]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
 func encodeOptions(o routes.Options) (string, error) {
 	if o == nil {
 		o = routes.Options{}

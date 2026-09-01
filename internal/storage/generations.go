@@ -24,6 +24,27 @@ type ActiveGeneration struct {
 	WorkerToken  []byte
 }
 
+// RecoverGenerations fences workers left behind by a previous daemon process.
+// The daemon lock guarantees no healthy peer can own these generations.
+func (s *Store) RecoverGenerations(ctx context.Context, at time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := toMs(at)
+	if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=COALESCE(retired_at,?),stopped_at=COALESCE(stopped_at,?),stop_reason=CASE WHEN stop_reason='' THEN 'daemon restarted' ELSE stop_reason END WHERE status='active'`, now, now); err != nil {
+		return fmt.Errorf("retire orphan generations: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE deployments SET active_generation=0,updated_at=? WHERE status='active' AND active_generation>0`, now); err != nil {
+		return fmt.Errorf("fence orphan generations: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE deployment_health SET generation=0,status='starting',updated_at=? WHERE deployment_id IN (SELECT id FROM deployments WHERE status='active')`, now); err != nil {
+		return fmt.Errorf("reset recovered deployment health: %w", err)
+	}
+	return tx.Commit()
+}
+
 // ActivateGeneration advances the deployment fence before its worker is started.
 // The returned token is the only plaintext copy; SQLite retains only its hash.
 func (s *Store) ActivateGeneration(ctx context.Context, activation GenerationActivation) (ActiveGeneration, error) {
@@ -70,9 +91,10 @@ func (s *Store) ActivateGeneration(ctx context.Context, activation GenerationAct
 	if activeGeneration > 0 {
 		result, err := tx.ExecContext(ctx, `
 			UPDATE deployment_generations
-			SET status = 'retired', retired_at = ?
+			SET status = 'retired', retired_at = ?, stopped_at=COALESCE(stopped_at,?),
+			    stop_reason=CASE WHEN stop_reason='' THEN 'generation replaced' ELSE stop_reason END
 			WHERE deployment_id = ? AND generation = ? AND status = 'active'`,
-			toMs(now), activation.DeploymentID, activeGeneration)
+			toMs(now), toMs(now), activation.DeploymentID, activeGeneration)
 		if err != nil {
 			return ActiveGeneration{}, fmt.Errorf("retire active generation: %w", err)
 		}
@@ -105,6 +127,9 @@ func (s *Store) ActivateGeneration(ctx context.Context, activation GenerationAct
 	}
 	if err := requireOneRow(result, "advance deployment generation"); err != nil {
 		return ActiveGeneration{}, err
+	}
+	if err := ensureDeploymentHealth(ctx, tx, activation.DeploymentID, nextGeneration, "starting", toMs(now)); err != nil {
+		return ActiveGeneration{}, fmt.Errorf("initialize generation health: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {

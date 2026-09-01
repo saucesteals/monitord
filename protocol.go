@@ -16,6 +16,7 @@ const MaxEventsPerTransaction = 256
 const MaxCheckpointsPerTransaction = 128
 const MaxStateBytes = 2 << 20
 const MaxCheckpointBytes = 256 << 10
+const MaxOperationalErrorBytes = 16 << 10
 
 type ProtocolVersion struct {
 	Major int `json:"major"`
@@ -40,8 +41,8 @@ func (p DeploymentPolicy) Validate() error {
 	if p.Events.MaxPerTransaction < 1 || p.Events.MaxPerTransaction > MaxEventsPerTransaction {
 		return fmt.Errorf("events max per transaction must be between 1 and %d", MaxEventsPerTransaction)
 	}
-	if p.Events.Retention <= 0 {
-		return errors.New("events retention must be positive")
+	if p.Events.Retention < time.Millisecond {
+		return errors.New("events retention must be at least 1ms")
 	}
 	return nil
 }
@@ -95,27 +96,33 @@ type TransactionFrame struct {
 	PayloadHash       string                     `json:"payload_hash"`
 }
 type MonitorFrame struct {
-	Info         Info            `json:"info"`
-	Plan         PlanDescription `json:"plan"`
-	StateVersion int             `json:"state_version"`
-	State        json.RawMessage `json:"state"`
+	Info  Info            `json:"info"`
+	Plan  PlanDescription `json:"plan"`
+	State json.RawMessage `json:"state"`
 }
 type DescribeInput struct {
-	State   json.RawMessage `json:"state,omitempty"`
-	Version int             `json:"version,omitempty"`
+	State json.RawMessage `json:"state,omitempty"`
 }
 type ReadyFrame struct {
 	Generation uint64 `json:"generation"`
 }
+type RunFrame struct {
+	Generation uint64        `json:"generation"`
+	Status     string        `json:"status"`
+	Duration   time.Duration `json:"duration"`
+	Error      string        `json:"error,omitempty"`
+}
 type StoppedFrame struct {
-	Generation uint64 `json:"generation"`
-	Clean      bool   `json:"clean"`
-	Error      string `json:"error,omitempty"`
+	Generation         uint64 `json:"generation"`
+	Clean              bool   `json:"clean"`
+	Error              string `json:"error,omitempty"`
+	RunFailureReported bool   `json:"run_failure_reported,omitempty"`
 }
 type WorkerFrame struct {
 	Type        string            `json:"type"`
 	Monitor     *MonitorFrame     `json:"monitor,omitempty"`
 	Ready       *ReadyFrame       `json:"ready,omitempty"`
+	Run         *RunFrame         `json:"run,omitempty"`
 	Transaction *TransactionFrame `json:"transaction,omitempty"`
 	Stopped     *StoppedFrame     `json:"stopped,omitempty"`
 }
@@ -212,10 +219,11 @@ func (i DaemonFrame) Validate() error {
 		if i.Stop == nil {
 			return errors.New("stop payload missing")
 		}
-		if i.Stop.Deadline != "" {
-			if _, err := time.Parse(time.RFC3339Nano, i.Stop.Deadline); err != nil {
-				return errors.New("stop deadline is invalid")
-			}
+		if i.Stop.Deadline == "" {
+			return errors.New("stop deadline is required")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, i.Stop.Deadline); err != nil {
+			return errors.New("stop deadline is invalid")
 		}
 	default:
 		return fmt.Errorf("unsupported inbound frame type %q", i.Type)
@@ -224,7 +232,7 @@ func (i DaemonFrame) Validate() error {
 }
 func (o WorkerFrame) Validate() error {
 	n := 0
-	for _, p := range []any{o.Monitor, o.Ready, o.Transaction, o.Stopped} {
+	for _, p := range []any{o.Monitor, o.Ready, o.Run, o.Transaction, o.Stopped} {
 		if !isNil(p) {
 			n++
 		}
@@ -243,9 +251,6 @@ func (o WorkerFrame) Validate() error {
 		if err := o.Monitor.Plan.Validate(); err != nil {
 			return err
 		}
-		if o.Monitor.StateVersion < 1 {
-			return errors.New("monitor state version must be positive")
-		}
 		if len(o.Monitor.State) > 0 && (len(o.Monitor.State) > MaxStateBytes || !json.Valid(o.Monitor.State)) {
 			return errors.New("monitor state is invalid or too large")
 		}
@@ -255,6 +260,16 @@ func (o WorkerFrame) Validate() error {
 		}
 		if o.Ready.Generation == 0 {
 			return errors.New("ready generation is required")
+		}
+	case "run":
+		if o.Run == nil {
+			return errors.New("run payload missing")
+		}
+		if o.Run.Generation == 0 || o.Run.Duration < 0 || (o.Run.Status != "success" && o.Run.Status != "failure") {
+			return errors.New("invalid run outcome")
+		}
+		if (o.Run.Status == "failure") != (o.Run.Error != "") || len(o.Run.Error) > MaxOperationalErrorBytes {
+			return errors.New("run error does not match status or exceeds limit")
 		}
 	case "transaction":
 		if o.Transaction == nil {
@@ -289,6 +304,15 @@ func (o WorkerFrame) Validate() error {
 		}
 		if o.Stopped.Generation == 0 {
 			return errors.New("stopped generation is required")
+		}
+		if o.Stopped.Clean && (o.Stopped.Error != "" || o.Stopped.RunFailureReported) {
+			return errors.New("clean stop cannot contain an error")
+		}
+		if o.Stopped.RunFailureReported && o.Stopped.Error == "" {
+			return errors.New("reported run failure requires a stop error")
+		}
+		if len(o.Stopped.Error) > MaxOperationalErrorBytes {
+			return errors.New("stopped error exceeds limit")
 		}
 	default:
 		return fmt.Errorf("unsupported outbound frame type %q", o.Type)
@@ -340,6 +364,8 @@ func isNil(v any) bool {
 	case *MonitorFrame:
 		return x == nil
 	case *ReadyFrame:
+		return x == nil
+	case *RunFrame:
 		return x == nil
 	case *TransactionFrame:
 		return x == nil

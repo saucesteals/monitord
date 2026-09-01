@@ -46,7 +46,8 @@ type fileEvents struct {
 }
 
 type fileDelivery struct {
-	Discord *fileDiscord `yaml:"discord"`
+	Discord   *fileDiscord  `yaml:"discord"`
+	RateLimit fileRateLimit `yaml:"rate_limit"`
 }
 
 type fileDiscord struct {
@@ -58,8 +59,18 @@ type fileDiscord struct {
 }
 
 type fileRoute struct {
-	Route   string         `yaml:"route"`
-	Options map[string]any `yaml:"options"`
+	Route     string         `yaml:"route"`
+	Options   map[string]any `yaml:"options"`
+	RateLimit fileRateLimit  `yaml:"rate_limit"`
+}
+
+type fileRateLimit struct {
+	PerSecond float64 `yaml:"per_second"`
+	Burst     int     `yaml:"burst"`
+}
+
+func (limit fileRateLimit) rateLimit() routes.RateLimit {
+	return routes.RateLimit{PerSecond: limit.PerSecond, Burst: limit.Burst}
 }
 
 // LoadConfig reads and validates one monitor's authored configuration.
@@ -143,7 +154,7 @@ func (raw fileConfig) validate() (Config, error) {
 			ThreadID:   strings.TrimSpace(item.Discord.ThreadID),
 			WebhookURL: strings.TrimSpace(item.Discord.WebhookURL),
 			Mentions:   strings.TrimSpace(item.Discord.Mentions),
-		}}
+		}, RateLimit: item.RateLimit.rateLimit()}
 		if err := delivery.Validate(); err != nil {
 			return Config{}, fmt.Errorf("deliveries[%d]: %w", index, err)
 		}
@@ -159,7 +170,13 @@ func (raw fileConfig) validate() (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("route %s: %w", name, err)
 		}
-		deliveries = append(deliveries, routes.Delivery{Route: name, Options: options})
+		delivery := routes.Delivery{
+			Route: name, Options: options, RateLimit: item.RateLimit.rateLimit(),
+		}
+		if err := delivery.Validate(); err != nil {
+			return Config{}, fmt.Errorf("routes[%d]: %w", index, err)
+		}
+		deliveries = append(deliveries, delivery)
 	}
 
 	return Config{

@@ -154,7 +154,7 @@ func newSession[S any](state json.RawMessage, secrets map[string]string, maxEven
 	if maxEvents < 1 || maxEvents > MaxEventsPerTransaction {
 		return nil, fmt.Errorf("max events per transaction must be between 1 and %d", MaxEventsPerTransaction)
 	}
-	v, err := decodeState[S](state, 0)
+	v, err := decodeState[S](state)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +198,7 @@ func (s *Session[S]) State() S {
 	s.mu.RLock()
 	raw := append(json.RawMessage(nil), s.state...)
 	s.mu.RUnlock()
-	v, err := decodeState[S](raw, 0)
+	v, err := decodeState[S](raw)
 	if err != nil {
 		panic(fmt.Sprintf("monitord: canonical state became invalid: %v", err))
 	}
@@ -215,7 +215,7 @@ func (s *Session[S]) Commit(ctx context.Context, fn func(*Tx[S]) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	base := append(json.RawMessage(nil), s.state...)
-	state, err := decodeState[S](base, 0)
+	state, err := decodeState[S](base)
 	if err != nil {
 		return err
 	}
@@ -242,7 +242,7 @@ func (s *Session[S]) Commit(ctx context.Context, fn func(*Tx[S]) error) error {
 	if err != nil {
 		return err
 	}
-	decoded, err := decodeState[S](acked, 0)
+	decoded, err := decodeState[S](acked)
 	if err != nil {
 		return fmt.Errorf("invalid acknowledged state: %w", err)
 	}

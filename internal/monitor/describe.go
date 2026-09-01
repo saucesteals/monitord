@@ -26,10 +26,9 @@ const (
 // held to the monitor's own struct instead of being accepted as bare JSON and
 // failing on every later callback. Passing empty state returns the monitor's
 // defaults.
-func ValidateState(ctx context.Context, binaryPath string, dir string, state json.RawMessage, version int) (json.RawMessage, error) {
+func ValidateState(ctx context.Context, binaryPath string, dir string, state json.RawMessage) (json.RawMessage, error) {
 	described, err := describe(ctx, binaryPath, dir, monitord.DescribeInput{
-		State:   state,
-		Version: version,
+		State: state,
 	})
 	if err != nil {
 		return nil, err
@@ -44,7 +43,7 @@ func Describe(ctx context.Context, binaryPath string, dir string) (monitord.Moni
 }
 
 // describe runs the monitor's introspection entrypoint, piping stored state in
-// so the monitor's own types validate and migrate it.
+// so the monitor's own types validate it.
 func describe(ctx context.Context, binaryPath string, dir string, input monitord.DescribeInput) (monitord.MonitorFrame, error) {
 	ctx, cancel := context.WithTimeout(ctx, describeTimeout)
 	defer cancel()
@@ -75,7 +74,7 @@ func describe(ctx context.Context, binaryPath string, dir string, input monitord
 	if err := described.Info.Validate(); err != nil {
 		return monitord.MonitorFrame{}, fmt.Errorf("invalid monitor description: %w", err)
 	}
-	if described.StateVersion < 1 || !json.Valid(described.State) {
+	if !json.Valid(described.State) {
 		return monitord.MonitorFrame{}, fmt.Errorf("invalid monitor description state")
 	}
 

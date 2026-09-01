@@ -20,6 +20,8 @@ import (
 
 	monitord "github.com/saucesteals/monitord"
 	"github.com/saucesteals/monitord/internal/monitor"
+	"github.com/saucesteals/monitord/internal/routes"
+	"github.com/saucesteals/monitord/internal/secrets"
 	"github.com/saucesteals/monitord/internal/storage"
 )
 
@@ -33,15 +35,25 @@ type worker struct {
 	pgid              int
 	logger            *slog.Logger
 	writeMu           sync.Mutex
+	lifecycleMu       sync.Mutex
 	done              chan error
 	secretFingerprint string
+	planKind          string
+	requestedStop     string
+	redactor          secrets.Redactor
 }
 type readResult struct {
 	v   monitord.WorkerFrame
 	err error
 }
+type workerStoppedError struct {
+	message         string
+	failureReported bool
+}
 
-func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDeployment, generation storage.ActiveGeneration, secrets map[string]map[string]string) (*worker, error) {
+func (e *workerStoppedError) Error() string { return e.message }
+
+func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDeployment, generation storage.ActiveGeneration, secretMap map[string]map[string]string, redactor secrets.Redactor) (*worker, error) {
 	cmd := exec.Command(dep.ArtifactPath, monitord.FlagWorker)
 	setMonitorProcessGroup(cmd)
 	cmd.Env = monitor.Env()
@@ -62,19 +74,19 @@ func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDe
 	if err = cmd.Start(); err != nil {
 		return nil, err
 	}
-	w := &worker{deployment: dep, generation: generation, cmd: cmd, in: in, out: bufio.NewReaderSize(out, 64<<10), readCh: make(chan readResult, 1), logger: logger, done: make(chan error, 1)}
+	w := &worker{deployment: dep, generation: generation, cmd: cmd, in: in, out: bufio.NewReaderSize(out, 64<<10), readCh: make(chan readResult, 1), logger: logger, done: make(chan error, 1), redactor: redactor}
 	w.pgid, _ = monitorProcessGroup(cmd)
 	go func() {
 		digest := sha256.New()
 		captured, _ := io.Copy(digest, io.LimitReader(stderr, 64<<10))
 		discarded, _ := io.Copy(io.Discard, stderr)
 		if captured+discarded > 0 {
-			logger.Warn("worker wrote stderr; content suppressed", "deployment", dep.Name, "bytes", captured+discarded, "captured_bytes", captured, "sha256", hex.EncodeToString(digest.Sum(nil)))
+			logger.Warn("worker wrote stderr; content suppressed", "deployment", dep.Name, "generation", generation.Generation, "bytes", captured+discarded, "captured_bytes", captured, "sha256", hex.EncodeToString(digest.Sum(nil)))
 		}
 	}()
 	go func() { w.done <- cmd.Wait() }()
 	go w.readLoop()
-	hello := monitord.Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: dep.ID, DeploymentName: dep.Name, Generation: uint64(generation.Generation), WorkerToken: hex.EncodeToString(generation.WorkerToken), ArtifactHash: dep.ArtifactHash, ConfigHash: dep.ConfigHash, StateRevision: dep.StateRevision, State: dep.State, Checkpoints: dep.Checkpoints, Secrets: secrets, Policy: monitord.DeploymentPolicy{Health: monitord.HealthPolicy{FailureThreshold: dep.FailureThreshold}, Events: monitord.EventPolicy{MaxPerTransaction: dep.MaxEventsPerTransaction, Retention: dep.EventRetention}}}
+	hello := monitord.Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: dep.ID, DeploymentName: dep.Name, Generation: uint64(generation.Generation), WorkerToken: hex.EncodeToString(generation.WorkerToken), ArtifactHash: dep.ArtifactHash, ConfigHash: dep.ConfigHash, StateRevision: dep.StateRevision, State: dep.State, Checkpoints: dep.Checkpoints, Secrets: secretMap, Policy: monitord.DeploymentPolicy{Health: monitord.HealthPolicy{FailureThreshold: dep.FailureThreshold}, Events: monitord.EventPolicy{MaxPerTransaction: dep.MaxEventsPerTransaction, Retention: dep.EventRetention}}}
 	if err = w.send(ctx, monitord.DaemonFrame{Type: "hello", Hello: &hello}); err != nil {
 		w.kill()
 		return nil, err
@@ -93,20 +105,19 @@ func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDe
 		w.kill()
 		return nil, fmt.Errorf("decode persisted describe: %w", err)
 	}
+	w.planKind = persisted.Plan.Kind
 	want, marshalErr := json.Marshal(struct {
-		Info         monitord.Info
-		Plan         monitord.PlanDescription
-		StateVersion int
-	}{persisted.Info, persisted.Plan, persisted.StateVersion})
+		Info monitord.Info
+		Plan monitord.PlanDescription
+	}{persisted.Info, persisted.Plan})
 	if marshalErr != nil {
 		w.kill()
 		return nil, marshalErr
 	}
 	got, _ := json.Marshal(struct {
-		Info         monitord.Info
-		Plan         monitord.PlanDescription
-		StateVersion int
-	}{msg.Monitor.Info, msg.Monitor.Plan, msg.Monitor.StateVersion})
+		Info monitord.Info
+		Plan monitord.PlanDescription
+	}{msg.Monitor.Info, msg.Monitor.Plan})
 	if !bytes.Equal(want, got) {
 		w.kill()
 		return nil, errors.New("worker monitor frame differs from persisted artifact description")
@@ -120,6 +131,10 @@ func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDe
 		w.kill()
 		return nil, err
 	}
+	if msg.Type == "stopped" && msg.Stopped.Generation == uint64(generation.Generation) && msg.Stopped.Error != "" {
+		w.kill()
+		return nil, fmt.Errorf("worker start: %s", msg.Stopped.Error)
+	}
 	if msg.Type != "ready" || msg.Ready.Generation != uint64(generation.Generation) {
 		w.kill()
 		return nil, errors.New("worker ready generation mismatch")
@@ -128,22 +143,56 @@ func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDe
 }
 
 func (w *worker) serve(ctx context.Context, store *storage.Store) error {
+	var stable <-chan time.Time
+	var stableTimer *time.Timer
+	if w.planKind == "continuous" {
+		stableTimer = time.NewTimer(workerStableAfter)
+		stable = stableTimer.C
+		defer stableTimer.Stop()
+	}
 	for {
-		msg, err := w.read(ctx)
-		if err != nil {
-			return err
+		var msg monitord.WorkerFrame
+		select {
+		case result := <-w.readCh:
+			if result.err != nil {
+				return result.err
+			}
+			msg = result.v
+		case <-stable:
+			stable = nil
+			transition, err := store.MarkGenerationStable(ctx, w.deployment.ID, w.generation.Generation, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			logHealthTransition(w.logger, w.deployment.Name, w.generation.Generation, transition)
+			continue
+		case <-ctx.Done():
+			return ctx.Err()
 		}
+		var err error
 		switch msg.Type {
 		case "transaction":
 			if err = w.transaction(ctx, store, *msg.Transaction); err != nil {
 				return err
 			}
+		case "run":
+			if msg.Run.Generation != uint64(w.generation.Generation) {
+				return storage.ErrGenerationFenced
+			}
+			transition, healthErr := store.RecordRun(ctx, storage.RunOutcome{DeploymentID: w.deployment.ID, Generation: w.generation.Generation, Status: storage.RunStatus(msg.Run.Status), Duration: msg.Run.Duration, Error: w.redact(msg.Run.Error), FinishedAt: time.Now().UTC()})
+			if healthErr != nil {
+				return healthErr
+			}
+			logHealthTransition(w.logger, w.deployment.Name, w.generation.Generation, transition)
 		case "stopped":
+			if msg.Stopped.Generation != uint64(w.generation.Generation) {
+				return storage.ErrGenerationFenced
+			}
 			if msg.Stopped.Error != "" {
-				return errors.New(msg.Stopped.Error)
+				return &workerStoppedError{message: msg.Stopped.Error, failureReported: msg.Stopped.RunFailureReported}
 			}
 			if !msg.Stopped.Clean {
-				return errors.New("worker stopped unsuccessfully")
+				return &workerStoppedError{message: "worker stopped unsuccessfully", failureReported: msg.Stopped.RunFailureReported}
 			}
 			return nil
 		default:
@@ -151,6 +200,17 @@ func (w *worker) serve(ctx context.Context, store *storage.Store) error {
 		}
 	}
 }
+
+func logHealthTransition(logger *slog.Logger, deployment string, generation int64, transition storage.HealthTransition) {
+	switch transition {
+	case storage.HealthBecameUnhealthy:
+		logger.Warn("deployment unhealthy", "deployment", deployment, "generation", generation)
+	case storage.HealthRecovered:
+		logger.Info("deployment recovered", "deployment", deployment, "generation", generation)
+	}
+}
+
+func (w *worker) redact(message string) string { return w.redactor.Redact(message) }
 
 func (w *worker) transaction(ctx context.Context, store *storage.Store, wire monitord.TransactionFrame) error {
 	if wire.DeploymentID != w.deployment.ID || wire.Generation != uint64(w.generation.Generation) || wire.WorkerToken != hex.EncodeToString(w.generation.WorkerToken) {
@@ -177,16 +237,17 @@ func (w *worker) transaction(ctx context.Context, store *storage.Store, wire mon
 	}
 	events := make([]storage.OutboxEvent, 0, len(wire.Events))
 	for i, event := range wire.Events {
-		payload, err := json.Marshal(event)
-		if err != nil {
-			return err
+		message := routes.Message{
+			Title: event.Title, Message: event.Body, URL: event.URL,
+			Level: eventLevel(event.Severity), Fields: dataFields(event.Data),
+			Footer: w.deployment.Name,
 		}
 		deliveries := make([]storage.OutboxDelivery, 0, len(bindings))
 		for _, b := range bindings {
 			deliveries = append(deliveries, storage.OutboxDelivery{DestinationID: b.ID, DestinationRevision: b.Revision})
 		}
 		sum := sha256.Sum256([]byte(w.deployment.ID + "\x00" + strconv.FormatUint(wire.Generation, 10) + "\x00" + strconv.FormatUint(wire.Sequence, 10) + "\x00" + strconv.Itoa(i)))
-		events = append(events, storage.OutboxEvent{OutboxID: hex.EncodeToString(sum[:]), EventID: event.ID, Payload: payload, Deliveries: deliveries})
+		events = append(events, storage.OutboxEvent{OutboxID: hex.EncodeToString(sum[:]), EventID: event.ID, Message: message, Deliveries: deliveries})
 	}
 	hash, _ := hex.DecodeString(wire.PayloadHash)
 	var fixed [sha256.Size]byte
@@ -271,6 +332,9 @@ func (w *worker) readLoop() {
 	}
 }
 func (w *worker) stop(ctx context.Context, reason string) error {
+	w.lifecycleMu.Lock()
+	w.requestedStop = reason
+	w.lifecycleMu.Unlock()
 	deadline, _ := ctx.Deadline()
 	_ = w.send(ctx, monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: reason, Deadline: deadline.UTC().Format(time.RFC3339Nano)}})
 	select {
@@ -280,6 +344,11 @@ func (w *worker) stop(ctx context.Context, reason string) error {
 		w.kill()
 		return ctx.Err()
 	}
+}
+func (w *worker) stopReason() string {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+	return w.requestedStop
 }
 func (w *worker) kill() {
 	_ = w.in.Close()

@@ -25,7 +25,7 @@ func dispatchMonitor[S any](m Monitor[S]) error {
 		if err := json.NewDecoder(os.Stdin).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("decode describe input: %w", err)
 		}
-		state, err := decodeState[S](input.State, input.Version)
+		state, err := decodeState[S](input.State)
 		if err != nil {
 			return err
 		}
@@ -33,7 +33,7 @@ func dispatchMonitor[S any](m Monitor[S]) error {
 		if err != nil {
 			return err
 		}
-		return json.NewEncoder(os.Stdout).Encode(MonitorFrame{Info: m.Info(), Plan: d, StateVersion: stateVersion[S](), State: raw})
+		return json.NewEncoder(os.Stdout).Encode(MonitorFrame{Info: m.Info(), Plan: d, State: raw})
 	case FlagWorker:
 		return serveWorker(m, d, os.Stdin, os.Stdout)
 	default:
@@ -51,7 +51,7 @@ func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io
 		return fmt.Errorf("expected hello, got %q", helloMsg.Type)
 	}
 	hello := *helloMsg.Hello
-	if err = w.send(WorkerFrame{Type: "monitor", Monitor: &MonitorFrame{Info: m.Info(), Plan: desc, StateVersion: stateVersion[S](), State: json.RawMessage("null")}}); err != nil {
+	if err = w.send(WorkerFrame{Type: "monitor", Monitor: &MonitorFrame{Info: m.Info(), Plan: desc, State: json.RawMessage("null")}}); err != nil {
 		return err
 	}
 	start, _, err := w.readInbound()
@@ -66,7 +66,7 @@ func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io
 	if !bytes.Equal(want, got) {
 		return errors.New("start plan differs from described plan")
 	}
-	coord := &workerCoordinator{wire: w, hello: hello, revision: hello.StateRevision, acks: make(chan TransactionAck, 1), stop: make(chan Stop, 1), fatal: make(chan error, 1)}
+	coord := &workerCoordinator{wire: w, hello: hello, revision: hello.StateRevision, ackReady: make(chan struct{}, 1), stop: make(chan Stop, 1), commitStop: make(chan Stop, 1), fatalDone: make(chan struct{})}
 	if err := validateHandshakeSecrets(desc, hello.Secrets); err != nil {
 		return err
 	}
@@ -87,7 +87,11 @@ func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io
 	err = startMonitor(startCtx, m, Environment{secrets: session.Secrets()})
 	cancelStart()
 	if err != nil {
-		return err
+		return w.send(WorkerFrame{Type: "stopped", Stopped: &StoppedFrame{
+			Generation: hello.Generation,
+			Clean:      false,
+			Error:      boundedOperationalError(err, "monitor start failed"),
+		}})
 	}
 	lifecycleStarted := true
 	var stopDeadline time.Time
@@ -96,7 +100,11 @@ func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io
 			return nil
 		}
 		lifecycleStarted = false
-		stopCtx, cancelStop := lifecycleContext(monitorStopTimeout, stopDeadline)
+		deadline := stopDeadline
+		if !deadline.IsZero() {
+			deadline = deadline.Add(-stopReportGrace)
+		}
+		stopCtx, cancelStop := lifecycleContext(monitorStopTimeout, deadline)
 		defer cancelStop()
 		return stopMonitor(stopCtx, m)
 	}
@@ -112,7 +120,12 @@ func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- runPlan(ctx, session, m.Plan(), start.Start.Once) }()
+	go func() {
+		done <- runPlan(ctx, session, m.Plan(), start.Start.Once, func(run RunFrame) error {
+			run.Generation = hello.Generation
+			return w.send(WorkerFrame{Type: "run", Run: &run})
+		})
+	}()
 	select {
 	case runErr := <-done:
 		cancel()
@@ -124,29 +137,31 @@ func serveWorker[S any](m Monitor[S], desc PlanDescription, in io.Reader, out io
 		} else {
 			stopErr = stopLifecycle()
 		}
-		resultErr := errors.Join(runErr, stopErr)
-		stopped := &StoppedFrame{Generation: hello.Generation, Clean: resultErr == nil}
-		if resultErr != nil {
-			stopped.Error = resultErr.Error()
-		}
-		return w.send(WorkerFrame{Type: "stopped", Stopped: stopped})
+		return sendStopped(w, hello.Generation, runErr, stopErr)
 	case request := <-coord.stop:
 		if request.Deadline != "" {
 			stopDeadline, _ = time.Parse(time.RFC3339Nano, request.Deadline)
 		}
 		cancel()
-		<-done
+		runErr := <-done
 		stopErr := stopLifecycle()
-		stopped := &StoppedFrame{Generation: hello.Generation, Clean: stopErr == nil}
-		if stopErr != nil {
-			stopped.Error = stopErr.Error()
-		}
-		return w.send(WorkerFrame{Type: "stopped", Stopped: stopped})
-	case fatalErr := <-coord.fatal:
+		return sendStopped(w, hello.Generation, runErr, stopErr)
+	case <-coord.fatalDone:
 		cancel()
-		<-done
-		return fatalErr
+		// The daemon connection is gone or invalid. Exit the process instead of
+		// racing lifecycle cleanup against a callback that may not cooperate.
+		lifecycleStarted = false
+		return coord.fatalError()
 	}
+}
+
+func sendStopped(w *wire, generation uint64, runErr, stopErr error) error {
+	resultErr := errors.Join(runErr, stopErr)
+	stopped := &StoppedFrame{Generation: generation, Clean: resultErr == nil, RunFailureReported: runFailureWasReported(runErr)}
+	if resultErr != nil {
+		stopped.Error = boundedOperationalError(resultErr, "monitor stopped unsuccessfully")
+	}
+	return w.send(WorkerFrame{Type: "stopped", Stopped: stopped})
 }
 
 func validateHandshakeSecrets(desc PlanDescription, supplied map[string]map[string]string) error {

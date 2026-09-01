@@ -244,12 +244,42 @@ func Fingerprint(key []byte, values []Value) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func Redact(message string, values []Value) string {
-	parts := make([]string, 0, len(values)*2)
+// Redactor removes resolved values from text crossing an operational boundary
+// such as logs, health state, or generation history.
+type Redactor struct {
+	replacer *strings.Replacer
+}
+
+func NewRedactor(values []Value) Redactor {
+	unique := make(map[string]struct{}, len(values))
 	for _, value := range values {
 		if value.Value != "" {
-			parts = append(parts, value.Value, "[REDACTED]")
+			unique[value.Value] = struct{}{}
 		}
 	}
-	return strings.NewReplacer(parts...).Replace(message)
+	ordered := make([]string, 0, len(unique))
+	for value := range unique {
+		ordered = append(ordered, value)
+	}
+	// Prefer the complete value when one secret is a prefix of another.
+	sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+	parts := make([]string, 0, len(ordered)*2)
+	for _, value := range ordered {
+		parts = append(parts, value, "[REDACTED]")
+	}
+	if len(parts) == 0 {
+		return Redactor{}
+	}
+	return Redactor{replacer: strings.NewReplacer(parts...)}
+}
+
+func (r Redactor) Redact(message string) string {
+	if r.replacer == nil {
+		return message
+	}
+	return r.replacer.Replace(message)
+}
+
+func Redact(message string, values []Value) string {
+	return NewRedactor(values).Redact(message)
 }

@@ -47,7 +47,7 @@ func (c *CLI) listEvents(ctx context.Context, out io.Writer, selector string, li
 		return nil
 	}
 	for _, row := range rows {
-		fmt.Fprintf(out, "%-10s %-20s %-18s %s/%s\n", row.Status, row.CreatedAt.Local().Format("Jan 02 15:04:05"), row.EventID, row.OutboxID, row.DestinationID)
+		fmt.Fprintf(out, "%-10s %-20s %-18s %s/%s\n", row.Status, row.CreatedAt.Local().Format("Jan 02 15:04:05"), row.Kind+"/"+row.EventID, row.OutboxID, row.DestinationID)
 		if row.LastError != "" {
 			fmt.Fprintf(out, "  error: %s\n", truncate(row.LastError, 100))
 		}

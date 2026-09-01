@@ -105,6 +105,7 @@ func (c *CLI) test(parent context.Context, out, errOut io.Writer, target string,
 		}
 		workerSecrets[value.Ref.Group][value.Ref.Key] = value.Value
 	}
+	redactor := secretresolver.NewRedactor(resolved)
 
 	if useStored {
 		store, _, err := c.store()
@@ -116,20 +117,20 @@ func (c *CLI) test(parent context.Context, out, errOut io.Writer, target string,
 		if err != nil {
 			return fmt.Errorf("--stored-state: %w", err)
 		}
-		if before, err = monitor.ValidateState(ctx, binaryPath, dir, m.State, m.StateVersion); err != nil {
+		if before, err = monitor.ValidateState(ctx, binaryPath, dir, m.State); err != nil {
 			return err
 		}
 	}
 
-	fmt.Fprintf(out, "monitor  %s (%s, state v%d)\n", name, described.Info.Name, described.StateVersion)
-	fmt.Fprintf(out, "state in %s\n\n", compactJSON(before))
+	fmt.Fprintf(out, "monitor  %s (%s)\n", name, described.Info.Name)
+	fmt.Fprintf(out, "state in %s\n\n", redactor.Redact(compactJSON(before)))
 
-	after, status, err := runLocal(ctx, out, errOut, binaryPath, dir, name, before, described.Plan, workerSecrets, monitorConfig)
+	after, status, err := runLocal(ctx, out, errOut, binaryPath, dir, name, before, described.Plan, workerSecrets, monitorConfig, redactor)
 	if err != nil {
 		return err
 	}
 
-	fmt.Fprintf(out, "\nstate out %s\n", compactJSON(after))
+	fmt.Fprintf(out, "\nstate out %s\n", redactor.Redact(compactJSON(after)))
 	if string(before) != string(after) && len(after) > 0 {
 		fmt.Fprintln(out, "state would be saved (differs from input)")
 	}
@@ -151,6 +152,7 @@ func runLocal(
 	plan monitord.PlanDescription,
 	secrets map[string]map[string]string,
 	config monitor.Config,
+	redactor secretresolver.Redactor,
 ) (json.RawMessage, string, error) {
 	cmd := exec.CommandContext(ctx, binaryPath, monitord.FlagWorker)
 	cmd.Dir = dir
@@ -217,7 +219,7 @@ func runLocal(
 				return nil, "", fmt.Errorf("worker transaction hash mismatch")
 			}
 			for _, event := range msg.Transaction.Events {
-				fmt.Fprintf(out, "[event/%s] %s: %s\n          id=%s\n          would deliver to %d destination(s)\n", event.Severity, event.Title, event.Body, event.ID, len(config.Deliveries))
+				fmt.Fprintf(out, "[event/%s] %s: %s\n          id=%s\n          would deliver to %d destination(s)\n", event.Severity, redactor.Redact(event.Title), redactor.Redact(event.Body), redactor.Redact(event.ID), len(config.Deliveries))
 			}
 			current = append(current[:0], msg.Transaction.NextState...)
 			revision++
@@ -225,13 +227,13 @@ func runLocal(
 				return nil, "", err
 			}
 			if plan.Kind == "continuous" && started {
-				_ = send(monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: "local test complete"}})
+				_ = send(monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: "local test complete", Deadline: time.Now().Add(5 * time.Second).UTC().Format(time.RFC3339Nano)}})
 				started = false
 			}
 		case "stopped":
 			if msg.Stopped.Error != "" {
 				status = "failure"
-				fmt.Fprintf(out, "[callback] failed: %s\n", msg.Stopped.Error)
+				fmt.Fprintf(out, "[callback] failed: %s\n", redactor.Redact(msg.Stopped.Error))
 			}
 			_ = stdin.Close()
 			_ = cmd.Wait()
