@@ -48,7 +48,7 @@ func ValidateRef(ref Ref) error {
 }
 
 func safeComponent(s string) bool {
-	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, `/\\\x00`) {
+	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, "/\\\x00") {
 		return false
 	}
 	for _, r := range s {
