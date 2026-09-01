@@ -104,11 +104,15 @@ func (w Wallet) run(ctx context.Context, s *monitord.Session[WalletState]) error
 	if w.ExpectedChainID != "" && w.ExpectedChainID != c.ChainID() {
 		return fmt.Errorf("quicknode: expected chain %s, endpoint is %s", w.ExpectedChainID, c.ChainID())
 	}
+	checkpoint := s.State().Checkpoint
+	if checkpoint.ChainID != "" && checkpoint.ChainID != c.ChainID() {
+		return fmt.Errorf("quicknode: checkpoint chain %s differs from endpoint %s", checkpoint.ChainID, c.ChainID())
+	}
 	depth, err := confirmationDepth(c.ChainID(), w.Confirmations)
 	if err != nil {
 		return err
 	}
-	next := s.State().Checkpoint.NextBlock
+	next := checkpoint.NextBlock
 	var journal walletJournal
 	_, err = s.Checkpoint(walletJournalSource, &journal)
 	if err != nil {
