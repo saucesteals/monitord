@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="infra/banner.png" alt="monitord" width="100%">
-
 # monitord
 
 **Stateful monitors. Durable delivery. One small daemon.**
