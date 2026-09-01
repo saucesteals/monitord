@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 )
 
@@ -77,4 +79,60 @@ func (s *Store) ListRuntimeDeployments(ctx context.Context) ([]RuntimeDeployment
 		}
 	}
 	return out, checkpointRows.Err()
+}
+
+// ClearCheckpoints removes all durable source progress for an inactive
+// deployment. It also reasserts the generation fence so recovery remains safe
+// if the stored lifecycle metadata was inconsistent.
+func (s *Store) ClearCheckpoints(ctx context.Context, deploymentID string) (int64, error) {
+	if deploymentID == "" {
+		return 0, errors.New("checkpoint clear requires a deployment")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin checkpoint clear: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := toMs(time.Now().UTC())
+	result, err := tx.ExecContext(ctx, `UPDATE deployments SET active_generation=0,updated_at=? WHERE id=? AND status='inactive'`, now, deploymentID)
+	if err != nil {
+		return 0, fmt.Errorf("fence deployment for checkpoint clear: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("inspect checkpoint clear deployment: %w", err)
+	}
+	if rows != 1 {
+		var exists int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM deployments WHERE id=?`, deploymentID).Scan(&exists); err != nil {
+			return 0, fmt.Errorf("inspect checkpoint clear deployment: %w", err)
+		}
+		if exists == 0 {
+			return 0, ErrNotFound
+		}
+		return 0, ErrInvalidStatus
+	}
+
+	if _, err = tx.ExecContext(ctx, `UPDATE deployment_generations SET status='retired',retired_at=COALESCE(retired_at,?),stopped_at=COALESCE(stopped_at,?),stop_reason=CASE WHEN stop_reason='' THEN 'checkpoints cleared' ELSE stop_reason END WHERE deployment_id=? AND status='active'`, now, now, deploymentID); err != nil {
+		return 0, fmt.Errorf("retire generation for checkpoint clear: %w", err)
+	}
+	if err = ensureDeploymentHealth(ctx, tx, deploymentID, 0, "stopped", now); err != nil {
+		return 0, fmt.Errorf("reconcile health for checkpoint clear: %w", err)
+	}
+
+	result, err = tx.ExecContext(ctx, `DELETE FROM checkpoints WHERE deployment_id=?`, deploymentID)
+	if err != nil {
+		return 0, fmt.Errorf("clear checkpoints: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("inspect cleared checkpoints: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit checkpoint clear: %w", err)
+	}
+
+	return count, nil
 }

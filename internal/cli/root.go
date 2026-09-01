@@ -49,6 +49,7 @@ func New() *cobra.Command {
 		c.newListCmd(),
 		c.newInspectCmd(),
 		c.newStateCmd(),
+		c.newCheckpointsCmd(),
 		c.newPauseCmd(),
 		c.newResumeCmd(),
 		c.newSkillCmd(),

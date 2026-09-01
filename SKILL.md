@@ -86,8 +86,8 @@ monitord deploy <name> [--name <deployment>]
 monitord inspect <deployment>
 ```
 
-`test` runs one callback without persisting state or sending notifications. Use `--stored-state` when behavior depends on deployed state. Redeploy preserves deployment identity and state; use `--reset-state` only for an intentional incompatible state reset.
+`test` runs one polling callback or a continuous monitor for `--duration` without persisting state or sending notifications. Use `--stored-state` when behavior depends on deployed state. Redeploy preserves deployment identity and state; use `--reset-state` only for an intentional incompatible state reset.
 
-Before handing off a change, build the affected monitor, run `monitord test` when its external dependencies are available, and inspect the deployed generation after rollout. Do not edit the SQLite database directly. Use `state get/set/clear`, lifecycle commands, and `events retry` for operator changes.
+Before handing off a change, build the affected monitor, run `monitord test` when its external dependencies are available, and inspect the deployed generation after rollout. Do not edit the SQLite database directly. Use `state get/set/clear`, lifecycle commands, `checkpoints clear NAME --all` after pausing for source-cursor recovery, and `events retry` for operator changes.
 
 When working in the monitord checkout, `docs/monitors.md` and `docs/operations.md` provide the full configuration and operational reference. The skill remains usable when installed by itself through `monitord skill`.

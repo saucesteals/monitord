@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	monitord "github.com/saucesteals/monitord"
@@ -22,17 +23,18 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// test builds a monitor and runs one callback locally without deploying it.
+// test builds a monitor and runs it locally without deploying it.
 //
 // Nothing is written to the schedule and no notification is sent; state changes
-// are shown as a diff instead of being saved. This is the authoring loop.
+// are shown as a diff instead of being saved. Polling plans run once, while
+// continuous plans run for the requested duration. This is the authoring loop.
 func (c *CLI) newTestCmd() *cobra.Command {
 	var useStored bool
 	var duration time.Duration
 
 	cmd := &cobra.Command{
 		Use:   "test NAME",
-		Short: "Build and run one monitor callback locally",
+		Short: "Build and run a monitor locally",
 		Args:  exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return c.test(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), args[0], useStored, duration)
@@ -61,9 +63,6 @@ func (c *CLI) test(parent context.Context, out, errOut io.Writer, target string,
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(parent, duration)
-	defer cancel()
-
 	// Build to a temp dir so a test never disturbs deployed artifacts.
 	buildDir, err := os.MkdirTemp("", "monitord-test-")
 	if err != nil {
@@ -71,13 +70,13 @@ func (c *CLI) test(parent context.Context, out, errOut io.Writer, target string,
 	}
 	defer func() { _ = os.RemoveAll(buildDir) }()
 
-	if err := config.Tidy(ctx, paths); err != nil {
+	if err := config.Tidy(parent, paths); err != nil {
 		return err
 	}
 
 	binaryPath := filepath.Join(buildDir, "monitor")
 	fmt.Fprintf(out, "building %s\n", dir)
-	build := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, ".")
+	build := exec.CommandContext(parent, "go", "build", "-o", binaryPath, ".")
 	build.Dir = dir
 	build.Env = append(os.Environ(), "GOWORK=off")
 	build.Stderr = errOut
@@ -85,7 +84,7 @@ func (c *CLI) test(parent context.Context, out, errOut io.Writer, target string,
 		return fmt.Errorf("build failed: %w", err)
 	}
 
-	described, err := monitor.Describe(ctx, binaryPath, dir)
+	described, err := monitor.Describe(parent, binaryPath, dir)
 	if err != nil {
 		return err
 	}
@@ -112,12 +111,12 @@ func (c *CLI) test(parent context.Context, out, errOut io.Writer, target string,
 		if err != nil {
 			return err
 		}
-		m, err := store.GetDeployment(ctx, name.String())
+		m, err := store.GetDeployment(parent, name.String())
 		_ = store.Close()
 		if err != nil {
 			return fmt.Errorf("--stored-state: %w", err)
 		}
-		if before, err = monitor.ValidateState(ctx, binaryPath, dir, m.State); err != nil {
+		if before, err = monitor.ValidateState(parent, binaryPath, dir, m.State); err != nil {
 			return err
 		}
 	}
@@ -125,7 +124,9 @@ func (c *CLI) test(parent context.Context, out, errOut io.Writer, target string,
 	fmt.Fprintf(out, "monitor  %s (%s)\n", name, described.Info.Name)
 	fmt.Fprintf(out, "state in %s\n\n", redactor.Redact(compactJSON(before)))
 
-	after, status, err := runLocal(ctx, out, errOut, binaryPath, dir, name, before, described.Plan, workerSecrets, monitorConfig, redactor)
+	runCtx, cancel := context.WithTimeout(parent, duration)
+	defer cancel()
+	after, status, err := runLocal(runCtx, out, errOut, binaryPath, dir, name, before, described.Plan, workerSecrets, monitorConfig, redactor)
 	if err != nil {
 		return err
 	}
@@ -141,7 +142,8 @@ func (c *CLI) test(parent context.Context, out, errOut io.Writer, target string,
 	return nil
 }
 
-// runLocal drives a worker through one local callback and streams its output.
+// runLocal drives a worker through one polling callback or a bounded continuous
+// run and streams its output.
 func runLocal(
 	ctx context.Context,
 	out, errOut io.Writer,
@@ -154,7 +156,7 @@ func runLocal(
 	config monitor.Config,
 	redactor secretresolver.Redactor,
 ) (json.RawMessage, string, error) {
-	cmd := exec.CommandContext(ctx, binaryPath, monitord.FlagWorker)
+	cmd := exec.Command(binaryPath, monitord.FlagWorker)
 	cmd.Dir = dir
 	cmd.Env = monitor.Env()
 	cmd.Stderr = errOut
@@ -170,17 +172,64 @@ func runLocal(
 	if err := cmd.Start(); err != nil {
 		return nil, "", fmt.Errorf("start monitor: %w", err)
 	}
-	defer func() { _ = cmd.Process.Kill() }()
+	var killOnce sync.Once
+	kill := func() { killOnce.Do(func() { _ = cmd.Process.Kill() }) }
+	defer kill()
+	finished := make(chan struct{})
+	defer close(finished)
 
+	var sendMu sync.Mutex
 	send := func(msg monitord.DaemonFrame) error {
 		payload, err := json.Marshal(msg)
 		if err != nil {
 			return err
 		}
+		sendMu.Lock()
+		defer sendMu.Unlock()
 		_, err = stdin.Write(append(payload, '\n'))
 
 		return err
 	}
+	var protocolMu sync.Mutex
+	protocolStarted := false
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-finished:
+			return
+		}
+		select {
+		case <-finished:
+			return
+		default:
+		}
+
+		protocolMu.Lock()
+		started := protocolStarted
+		protocolMu.Unlock()
+		if !started {
+			kill()
+			return
+		}
+
+		reason := "local test canceled"
+		if ctx.Err() == context.DeadlineExceeded {
+			reason = "local test duration elapsed"
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		if err := send(monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: reason, Deadline: deadline.UTC().Format(time.RFC3339Nano)}}); err != nil {
+			kill()
+			return
+		}
+
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		select {
+		case <-finished:
+		case <-timer.C:
+			kill()
+		}
+	}()
 
 	if err := send(monitord.DaemonFrame{
 		Type:  "hello",
@@ -192,7 +241,7 @@ func runLocal(
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	current, revision, started, status := append(json.RawMessage(nil), state...), int64(0), false, "success"
+	current, revision, status := append(json.RawMessage(nil), state...), int64(0), "success"
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -208,10 +257,15 @@ func runLocal(
 
 		switch msg.Type {
 		case "monitor":
-			if err := send(monitord.DaemonFrame{Type: "start", Start: &monitord.Start{Plan: plan, Once: plan.Kind == "every"}}); err != nil {
+			protocolMu.Lock()
+			err := send(monitord.DaemonFrame{Type: "start", Start: &monitord.Start{Plan: plan, Once: plan.Kind == "every"}})
+			if err == nil {
+				protocolStarted = true
+			}
+			protocolMu.Unlock()
+			if err != nil {
 				return nil, "", err
 			}
-			started = true
 		case "ready":
 			fmt.Fprintln(out, "ready")
 		case "transaction":
@@ -225,10 +279,6 @@ func runLocal(
 			revision++
 			if err := send(monitord.DaemonFrame{Type: "ack", Ack: &monitord.TransactionAck{DeploymentID: msg.Transaction.DeploymentID, Generation: msg.Transaction.Generation, Sequence: msg.Transaction.Sequence, PayloadHash: msg.Transaction.PayloadHash, ResultRevision: revision, Status: "accepted"}}); err != nil {
 				return nil, "", err
-			}
-			if plan.Kind == "continuous" && started {
-				_ = send(monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: "local test complete", Deadline: time.Now().Add(5 * time.Second).UTC().Format(time.RFC3339Nano)}})
-				started = false
 			}
 		case "stopped":
 			if msg.Stopped.Error != "" {

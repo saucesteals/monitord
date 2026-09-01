@@ -2,14 +2,17 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
-	"os"
 	"time"
 
 	http "github.com/saucesteals/fhttp"
 	"github.com/saucesteals/monitord"
 )
+
+//go:embed targets.json
+var targetsJSON []byte
 
 type Target struct {
 	Name string `json:"name"`
@@ -24,7 +27,7 @@ type observation struct {
 }
 
 func checkTargets(ctx context.Context, session *monitord.Session[State]) error {
-	targets, err := loadTargets("targets.json")
+	targets, err := loadTargets(targetsJSON)
 	if err != nil {
 		return fmt.Errorf("load targets: %w", err)
 	}
@@ -40,18 +43,13 @@ func checkTargets(ctx context.Context, session *monitord.Session[State]) error {
 	return nil
 }
 
-func loadTargets(path string) ([]Target, error) {
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
+func loadTargets(contents []byte) ([]Target, error) {
 	var targets []Target
 	if err := json.Unmarshal(contents, &targets); err != nil {
 		return nil, err
 	}
 	if len(targets) == 0 {
-		return nil, fmt.Errorf("%s lists no targets", path)
+		return nil, fmt.Errorf("targets.json lists no targets")
 	}
 	return targets, nil
 }

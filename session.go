@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 )
 
@@ -56,6 +57,12 @@ func normalizeSecretRefs(in []SecretRef) ([]SecretRef, error) {
 	for _, r := range m {
 		out = append(out, r)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Group != out[j].Group {
+			return out[i].Group < out[j].Group
+		}
+		return out[i].Key < out[j].Key
+	})
 	return out, nil
 }
 

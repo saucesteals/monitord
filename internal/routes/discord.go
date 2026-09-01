@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // color returns the embed accent for a level.
@@ -225,6 +226,7 @@ const (
 	maxFields      = 25
 	maxAuthor      = 256
 	maxFooter      = 2048
+	maxEmbed       = 6000
 )
 
 // SendDiscord sends a monitor notification to a Discord webhook.
@@ -364,22 +366,22 @@ func buildEmbed(msg Message) embed {
 	if stamp.IsZero() {
 		stamp = time.Now()
 	}
+	budget := maxEmbed
 	out := embed{
-		Title:       truncate(title, maxTitle),
-		Description: truncate(description, maxDescription),
+		Title:       takeEmbedText(title, maxTitle, &budget),
+		Description: takeEmbedText(description, maxDescription, &budget),
 		URL:         safeURL(msg.URL),
 		Color:       color,
 		Timestamp:   stamp.UTC().Format(time.RFC3339),
-	}
-	if msg.Footer != "" {
-		out.Footer = &embedFooter{Text: truncate(msg.Footer, maxFooter), IconURL: safeURL(msg.FooterIcon)}
 	}
 	if msg.Author.Name != "" || msg.Author.URL != "" || msg.Author.IconURL != "" {
 		name := strings.TrimSpace(msg.Author.Name)
 		if name == "" {
 			name = "(unnamed)"
 		}
-		out.Author = &embedAuthor{Name: truncate(name, maxAuthor), URL: safeURL(msg.Author.URL), IconURL: safeURL(msg.Author.IconURL)}
+		if name = takeEmbedText(name, maxAuthor, &budget); name != "" {
+			out.Author = &embedAuthor{Name: name, URL: safeURL(msg.Author.URL), IconURL: safeURL(msg.Author.IconURL)}
+		}
 	}
 	if u := safeURL(msg.Image); u != "" {
 		out.Image = &embedImage{URL: u}
@@ -389,7 +391,9 @@ func buildEmbed(msg Message) embed {
 	}
 
 	for _, field := range msg.Fields {
-		if len(out.Fields) == maxFields {
+		// Discord requires both parts of a field. Keep one character of the
+		// aggregate budget for the value before consuming the name.
+		if len(out.Fields) == maxFields || budget < 2 {
 			break
 		}
 		name := strings.TrimSpace(field.Name)
@@ -400,14 +404,30 @@ func buildEmbed(msg Message) embed {
 		if value == "" {
 			value = "(empty)"
 		}
+		name = takeEmbedText(name, min(maxFieldName, budget-1), &budget)
+		value = takeEmbedText(value, maxFieldValue, &budget)
 		out.Fields = append(out.Fields, embedField{
-			Name:   truncate(name, maxFieldName),
-			Value:  truncate(value, maxFieldValue),
+			Name:   name,
+			Value:  value,
 			Inline: field.Inline,
 		})
 	}
+	if msg.Footer != "" {
+		if footer := takeEmbedText(msg.Footer, maxFooter, &budget); footer != "" {
+			out.Footer = &embedFooter{Text: footer, IconURL: safeURL(msg.FooterIcon)}
+		}
+	}
 
 	return out
+}
+
+// takeEmbedText applies both a field limit and Discord's aggregate embed
+// character limit. The aggregate counts title, description, author, footer,
+// and every field name and value together.
+func takeEmbedText(value string, limit int, budget *int) string {
+	value = truncate(value, min(limit, *budget))
+	*budget -= utf8.RuneCountInString(value)
+	return value
 }
 
 // safeURL returns raw when it is an absolute http(s) URL, and "" otherwise.
@@ -477,11 +497,25 @@ func allowFor(mentions []Mention) allowedMentions {
 }
 
 func truncate(value string, limit int) string {
-	if len(value) <= limit {
+	if limit <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(value) <= limit {
 		return value
 	}
+	if limit == 1 {
+		return "…"
+	}
 
-	return value[:limit-1] + "…"
+	kept := 0
+	for index := range value {
+		if kept == limit-1 {
+			return value[:index] + "…"
+		}
+		kept++
+	}
+
+	return value
 }
 
 func isSnowflake(value string) bool {

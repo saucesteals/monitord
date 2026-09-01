@@ -79,6 +79,8 @@ type Checkpoint struct {
 	ChainID         ChainID       `json:"chain_id"`
 	NextBlock       uint64        `json:"next_block"`
 	CanonicalParent Hash          `json:"canonical_parent"`
+	CurrentBlock    Hash          `json:"current_block,omitempty"`
+	TransferOffset  uint64        `json:"transfer_offset,omitempty"`
 	Address         Address       `json:"address"`
 	Events          TransferKinds `json:"events"`
 }

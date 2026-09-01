@@ -98,6 +98,18 @@ monitord state clear inventory
 
 Keep state transformations explicit and reviewable: export JSON, transform it deliberately, and feed it back through the CLI.
 
+## Checkpoint recovery
+
+When a durable source cursor cannot make progress and replay must restart, pause the deployment before clearing all of its checkpoints:
+
+```bash
+monitord pause inventory
+monitord checkpoints clear inventory --all
+monitord resume inventory --persistent
+```
+
+The explicit `--all` flag is required. Clearing checkpoints preserves the deployment identity, typed state, committed transactions, events, and queued deliveries. It removes only durable source progress and keeps the deployment inactive; resuming starts a fresh fenced worker generation. Depending on the source, the next run may snapshot the current edge or replay history, so confirm the monitor's source policy before recovery.
+
 ## Health and generations
 
 `monitord list` gives the deployment state, health, consecutive failures, and expiration. `monitord inspect NAME` adds generation readiness, last run timing, redacted operational errors, exact secret availability, checkpoints, latest transaction, destinations, and outbox counts.

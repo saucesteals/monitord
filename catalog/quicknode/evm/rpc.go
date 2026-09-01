@@ -30,6 +30,7 @@ type rpcTransaction struct {
 }
 type rpcReceipt struct {
 	Status          string   `json:"status"`
+	BlockHash       Hash     `json:"blockHash"`
 	ContractAddress *Address `json:"contractAddress"`
 }
 type rpcLog struct {
@@ -75,6 +76,12 @@ func (c *Client) blockByNumber(ctx context.Context, n uint64, full bool) (rpcBlo
 }
 func (c *Client) logs(ctx context.Context, f Logs, from, to uint64) ([]Log, error) {
 	arg := map[string]any{"fromBlock": fmt.Sprintf("0x%x", from), "toBlock": fmt.Sprintf("0x%x", to)}
+	return c.logsWithArg(ctx, f, arg)
+}
+func (c *Client) logsByBlockHash(ctx context.Context, f Logs, hash Hash) ([]Log, error) {
+	return c.logsWithArg(ctx, f, map[string]any{"blockHash": hash})
+}
+func (c *Client) logsWithArg(ctx context.Context, f Logs, arg map[string]any) ([]Log, error) {
 	if len(f.Addresses) > 0 {
 		arg["address"] = f.Addresses
 	}
@@ -108,6 +115,9 @@ func (c *Client) transactionReceipt(ctx context.Context, hash Hash) (rpcReceipt,
 		if _, err := ParseAddress(string(*receipt.ContractAddress)); err != nil {
 			return rpcReceipt{}, err
 		}
+	}
+	if _, err := ParseHash(string(receipt.BlockHash)); err != nil {
+		return rpcReceipt{}, err
 	}
 	return receipt, nil
 }

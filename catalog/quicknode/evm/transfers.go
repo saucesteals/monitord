@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 
 	"github.com/saucesteals/monitord"
@@ -47,6 +48,9 @@ func (w Wallet) blockTransfers(ctx context.Context, c *Client, wallet Address, k
 				if err != nil {
 					return nil, err
 				}
+				if receipt.BlockHash != b.Hash {
+					return nil, errors.New("quicknode evm: transaction receipt block differs from requested block")
+				}
 				if receipt.Status == "0x0" {
 					continue
 				}
@@ -62,11 +66,20 @@ func (w Wallet) blockTransfers(ctx context.Context, c *Client, wallet Address, k
 		}
 	}
 	if kinds&TokenTransfers != 0 {
-		logs, err := c.logs(ctx, Logs{Topics: [][]Hash{{transferTopic, transferSingleTopic, transferBatchTopic}}}, blockNumber, blockNumber)
+		logs, err := c.logsByBlockHash(ctx, Logs{Topics: [][]Hash{{transferTopic, transferSingleTopic, transferBatchTopic}}}, b.Hash)
 		if err != nil {
 			return nil, err
 		}
+		sort.Slice(logs, func(i, j int) bool {
+			if logs[i].TxIndex != logs[j].TxIndex {
+				return logs[i].TxIndex < logs[j].TxIndex
+			}
+			return logs[i].LogIndex < logs[j].LogIndex
+		})
 		for _, l := range logs {
+			if l.BlockHash != b.Hash || l.BlockNumber != blockNumber {
+				return nil, errors.New("quicknode evm: transfer log block differs from requested block")
+			}
 			transfers, err := decodeTransferLog(c.ChainID(), l, wallet)
 			if err != nil {
 				return nil, err

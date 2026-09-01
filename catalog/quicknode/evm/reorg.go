@@ -2,47 +2,41 @@ package evm
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/saucesteals/monitord"
 )
 
-func rewindJournalIndex(j walletJournal, block uint64) int {
-	for i, b := range j.Blocks {
-		if b.Number >= block {
-			return i
-		}
-	}
-	return len(j.Blocks)
-}
-func reconcileJournal(ctx context.Context, c *Client, j walletJournal, next uint64) (uint64, []Transfer, error) {
+// reconcileJournal returns the first journal entry that is no longer canonical.
+func reconcileJournal(ctx context.Context, c *Client, j walletJournal) (uint64, int, error) {
 	for i := len(j.Blocks) - 1; i >= 0; i-- {
 		canonical, err := c.blockByNumber(ctx, j.Blocks[i].Number, false)
 		if err != nil {
-			return 0, nil, err
+			return 0, 0, err
 		}
 		if canonical.Hash == j.Blocks[i].Hash {
-			orphaned := []Transfer{}
-			for _, b := range j.Blocks[i+1:] {
-				orphaned = append(orphaned, b.Transfers...)
-			}
-			return j.Blocks[i].Number + 1, orphaned, nil
+			return j.Blocks[i].Number + 1, i + 1, nil
 		}
 	}
-	orphaned := []Transfer{}
-	for _, b := range j.Blocks {
-		orphaned = append(orphaned, b.Transfers...)
+	if len(j.Blocks) == 0 {
+		return 0, 0, errors.New("quicknode evm: cannot reconcile an empty wallet journal")
 	}
-	rewind := uint64(0)
-	if len(j.Blocks) > 0 {
-		rewind = j.Blocks[0].Number
+	if len(j.Blocks) == walletJournalLimit {
+		return 0, 0, errors.New("quicknode evm: chain reorganization exceeds the retained wallet journal; pause the deployment and clear all checkpoints")
 	}
-	return rewind, orphaned, nil
+	return j.Blocks[0].Number, 0, nil
 }
-func (w Wallet) correctionEvent(t Transfer) monitord.Event {
-	original := w.mapEvent(t)
+func correctionEvent(chain ChainID, block walletJournalBlock) monitord.Event {
 	return monitord.Event{
-		ID: "correction:" + t.ID(), Title: "Chain reorganization correction",
-		Body: "A previously reported wallet transfer is no longer canonical",
-		Data: map[string]string{"original_event_id": t.ID(), "original_title": original.Title},
+		ID:    fmt.Sprintf("evm:%s:correction:block:%s:%d", chain, block.Hash, block.Emitted),
+		Title: "Chain reorganization correction",
+		Body:  "Previously reported wallet events from an orphaned block are no longer canonical",
+		Data: map[string]string{
+			"chain":         string(chain),
+			"block_number":  fmt.Sprint(block.Number),
+			"block_hash":    string(block.Hash),
+			"emitted_count": fmt.Sprint(block.Emitted),
+		},
 	}
 }

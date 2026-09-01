@@ -6,6 +6,8 @@ A monitor is a Go `main` package containing one `monitord.Monitor[S]` and a `mon
 
 Keep `main`, metadata, plan, and the state contract in `monitor.go`. A simple monitor may need only that file. Split network adapters, parsers, or domain models when those boundaries make the package easier to understand; file count is not a design goal.
 
+Deployments contain the compiled monitor, not loose files from its source directory. Embed static runtime assets with Go's `//go:embed` directive, as the [HTTP watch example](../examples/http-watch) does for `targets.json`. Keep operator-editable configuration in typed state or secrets instead of a sidecar file.
+
 `monitord.Define` is the concise form:
 
 ```go
@@ -43,7 +45,7 @@ return session.Commit(ctx, func(tx *monitord.Tx[State]) error {
 })
 ```
 
-State and checkpoint values are strictly decoded. Unknown fields, trailing JSON values, and incompatible Go types fail loudly. Change compatible structs normally; for an intentional incompatible reset, deploy with `--reset-state`, or prepare exact JSON and use `state set`.
+State and checkpoint values are strictly decoded. Unknown fields, trailing JSON values, and incompatible Go types fail loudly. Change compatible state structs normally; for an intentional incompatible state reset, deploy with `--reset-state`, or prepare exact JSON and use `state set`. To discard incompatible source progress, pause the deployment and run `monitord checkpoints clear NAME --all`; review the source's initialization policy first because its next run may snapshot the current edge rather than replay history.
 
 ## Commit rules
 
@@ -174,7 +176,7 @@ func main() {
 }
 ```
 
-`evm.Events` and `evm.Wallet` declare `quicknode/ethereum-mainnet-http-url` when neither `HTTPURL` nor `HTTPSecret` is set. That default also pins chain ID `0x1`. Other EVM networks should pass an exact chain-named `HTTPSecret` plus `ExpectedChainID` and `Confirmations`; `HTTPURL` remains useful when configuration already resolved the exact value. A fresh deployment starts at the current confirmed edge unless `BackfillFrom` is set. Wallet addresses are public configuration and must be supplied explicitly. Wallet covers standard ERC-20, ERC-721, ERC-1155, and successful non-zero top-level native transfers, including contract creation. Native backfill requires EIP-658 receipt status and therefore does not cover pre-Byzantium Ethereum blocks. Wallet does not infer internal calls, trace-derived transfers, arbitrary balance changes, pending transactions, or non-standard token events.
+`evm.Events` and `evm.Wallet` declare `quicknode/ethereum-mainnet-http-url` when neither `HTTPURL` nor `HTTPSecret` is set. That default also pins chain ID `0x1`. Other EVM networks should pass an exact chain-named `HTTPSecret` plus `ExpectedChainID` and `Confirmations`; `HTTPURL` remains useful when configuration already resolved the exact value. A fresh deployment starts at the current confirmed edge unless `BackfillFrom` is set. Wallet addresses are public configuration and must be supplied explicitly. Wallet covers standard ERC-20, ERC-721, ERC-1155, and successful non-zero top-level native transfers, including contract creation. Native backfill requires EIP-658 receipt status and therefore does not cover pre-Byzantium Ethereum blocks. Wallet retains the last 256 canonical block references and emitted-event counts. A reorganization emits one correction event for each orphaned block that produced wallet events; the correction identifies the block and count rather than reconstructing individual orphaned transfers. A deeper reorganization fails closed and requires pausing the deployment, clearing all checkpoints, and resuming it. Wallet does not infer internal calls, trace-derived transfers, arbitrary balance changes, pending transactions, or non-standard token events.
 
 `solana.AddressEvents` processes finalized transactions involving one address. It checkpoints the last committed signature, catches up through HTTP after startup and periodically thereafter, and uses `logsSubscribe` only to reduce latency. WSS setup or reconnect failure falls back to HTTP polling until the worker restarts. A fresh deployment snapshots the newest finalized signature unless `BackfillAfter` is set. `MatchLogs` may reject notifications that are conclusively irrelevant, avoiding a transaction read on the live path; transactions missing a WebSocket hint are always fetched and handled during HTTP replay. `Handle` receives the context and Solana client outside the commit closure, performs any enrichment, and returns a deterministic `AddressEventUpdate`. That update and the source checkpoint then commit atomically. A missing or excessively old cursor fails closed by default; monitors that prefer availability over complete replay can set `ResumeFromLatestOnGap` to checkpoint the current finalized edge after the bounded replay attempt. The managed source defaults to `quicknode/solana-mainnet-http-url` and optionally `quicknode/solana-mainnet-websocket-url`; `HTTPSecret` and `WSSSecret` select other exact chain/network keys.
 
@@ -283,4 +285,4 @@ monitord deploy inventory
 monitord inspect inventory
 ```
 
-Local tests do not persist state, checkpoints, or deliveries. They print state changes and emitted events. After deployment, use `inspect` to confirm the generation is ready, required secrets are available, and the first callback succeeds.
+Local tests do not persist state, checkpoints, or deliveries. They print state changes and emitted events. Polling monitors run one callback; continuous monitors run until `--duration` and then receive the normal graceful shutdown lifecycle. After deployment, use `inspect` to confirm the generation is ready, required secrets are available, and the first callback succeeds.

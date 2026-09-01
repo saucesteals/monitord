@@ -28,7 +28,7 @@ func initializeSchema(db *sql.DB) error {
 		return fmt.Errorf("inspect unversioned database: %w", err)
 	}
 	if tables != 0 {
-		return errors.New("database has an incompatible unversioned schema; create a clean V5 root")
+		return errors.New("database has an incompatible unversioned schema; create a clean monitord root")
 	}
 
 	tx, err := db.Begin()
