@@ -211,12 +211,12 @@ notification already contains the complete transaction, so the live path does
 not wait for `getTransaction`. `MatchLogs` narrows that pushed transaction by
 program log before `Handle` runs. The default live commitment is `confirmed`.
 
-Finalized `getSignaturesForAddress` history remains the durable source. It
-repairs startup and reconnect gaps, fetches full transactions only when the live
-record was unavailable, and checkpoints the last finalized signature. A fresh
-deployment snapshots the newest finalized signature unless `BackfillAfter` is
-set. A missing or excessively old cursor fails closed unless the monitor opts
-into `ResumeFromLatestOnGap`. Both `quicknode/solana-mainnet-http-url` and
+Finalized QuickNode `getTransactionsForAddress` history remains the durable
+source. It returns complete address-filtered transactions in ascending pages,
+so startup and reconnect recovery move forward from the saved slot and
+transaction index without one `getTransaction` call per signature. A fresh
+deployment snapshots the newest finalized address transaction; `BackfillFrom`
+may instead name an inclusive slot. Both `quicknode/solana-mainnet-http-url` and
 `quicknode/solana-mainnet-websocket-url` are required by default; exact
 `HTTPSecret` and `WSSSecret` refs select another cluster.
 

@@ -99,9 +99,9 @@ at a time. `Confirmations` controls replay finality, not notification latency.
 `solana.AddressEvents` uses QuickNode `transactionSubscribe` with the monitored
 account applied at the provider. The live notification contains the full
 transaction; `MatchLogs` narrows it locally before the handler runs. Finalized
-HTTP signature history repairs gaps and checkpoints progress. History gaps fail
-closed unless the monitor explicitly chooses availability with
-`ResumeFromLatestOnGap`.
+QuickNode `getTransactionsForAddress` history repairs gaps with complete,
+ascending pages from the saved slot and transaction index. It does not perform a
+serial signature lookup followed by one transaction request per record.
 
 Keep the live handler deterministic and short. Use stable event IDs and content
 so inclusive replay coalesces in the durable outbox. Do not put third-party

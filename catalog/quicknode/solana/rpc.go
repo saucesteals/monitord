@@ -58,6 +58,49 @@ type SignatureInfo struct {
 	ConfirmationStatus *Commitment     `json:"confirmationStatus"`
 }
 
+type AddressTransaction struct {
+	Slot             Slot            `json:"slot"`
+	TransactionIndex uint64          `json:"transactionIndex"`
+	Err              json.RawMessage `json:"err"`
+	Memo             *string         `json:"memo"`
+	BlockTime        *int64          `json:"blockTime"`
+	Transaction      json.RawMessage `json:"transaction"`
+	Meta             json.RawMessage `json:"meta"`
+	Version          json.RawMessage `json:"version"`
+}
+
+func (t AddressTransaction) Signature() (Signature, error) {
+	var transaction struct {
+		Signatures []Signature `json:"signatures"`
+	}
+	if err := json.Unmarshal(t.Transaction, &transaction); err != nil || len(transaction.Signatures) == 0 {
+		return "", errors.New("solana address transaction omitted its signature")
+	}
+	return transaction.Signatures[0], nil
+}
+
+func (t AddressTransaction) Payload() (json.RawMessage, error) {
+	return json.Marshal(struct {
+		BlockTime   *int64          `json:"blockTime"`
+		Transaction json.RawMessage `json:"transaction"`
+		Meta        json.RawMessage `json:"meta"`
+		Version     json.RawMessage `json:"version"`
+	}{t.BlockTime, t.Transaction, t.Meta, t.Version})
+}
+
+type AddressTransactionsOptions struct {
+	Commitment      Commitment
+	FromSlot        Slot
+	PaginationToken string
+	Limit           int
+	Ascending       bool
+}
+
+type AddressTransactionsPage struct {
+	Data            []AddressTransaction `json:"data"`
+	PaginationToken string               `json:"paginationToken"`
+}
+
 type DataSlice struct {
 	Offset uint64 `json:"offset"`
 	Length uint64 `json:"length"`
@@ -176,6 +219,47 @@ func (c *Client) GetSignaturesForAddress(ctx context.Context, address PublicKey,
 	var result []SignatureInfo
 	err = c.call(ctx, "getSignaturesForAddress", []any{address, config}, &result)
 	return result, err
+}
+
+// GetTransactionsForAddress uses QuickNode's indexed address history. Unlike
+// the standard signature method, each record already includes the transaction.
+func (c *Client) GetTransactionsForAddress(ctx context.Context, address PublicKey, opts AddressTransactionsOptions) (AddressTransactionsPage, error) {
+	if err := address.Validate(); err != nil {
+		return AddressTransactionsPage{}, err
+	}
+	commitment, err := c.selectCommitment(opts.Commitment)
+	if err != nil {
+		return AddressTransactionsPage{}, err
+	}
+	if commitment == Processed {
+		return AddressTransactionsPage{}, errors.New("solana address history does not support processed commitment")
+	}
+	limit := opts.Limit
+	if limit == 0 {
+		limit = 100
+	}
+	if limit < 1 || limit > 1000 {
+		return AddressTransactionsPage{}, errors.New("solana address transaction limit must be between 1 and 1000")
+	}
+	config := map[string]any{
+		"commitment":                     commitment,
+		"encoding":                       "json",
+		"limit":                          limit,
+		"maxSupportedTransactionVersion": 0,
+		"transactionDetails":             "full",
+	}
+	if opts.Ascending {
+		config["sortOrder"] = "asc"
+	}
+	if opts.FromSlot != 0 {
+		config["filters"] = map[string]any{"slot": map[string]any{"gte": opts.FromSlot}}
+	}
+	if opts.PaginationToken != "" {
+		config["paginationToken"] = opts.PaginationToken
+	}
+	var page AddressTransactionsPage
+	err = c.call(ctx, "getTransactionsForAddress", []any{address, config}, &page)
+	return page, err
 }
 
 func (c *Client) GetAccountInfo(ctx context.Context, address PublicKey, opts AccountOptions) (AccountInfo, error) {
