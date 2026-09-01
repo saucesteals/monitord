@@ -41,6 +41,7 @@ type addressEventsCursor struct {
 // HTTP history is authoritative; WSS notifications only reduce polling latency.
 type AddressEvents[S any] struct {
 	Name                string
+	Description         string
 	Address             PublicKey
 	ExpectedGenesisHash GenesisHash
 	HTTPURL             string
@@ -50,7 +51,8 @@ type AddressEvents[S any] struct {
 	BackfillAfter       Signature
 	PollInterval        time.Duration
 	MaxBackfillPages    int
-	Handle              func(*monitord.Tx[S], AddressEvent) error
+	MatchLogs           func(LogsValue) bool
+	Handle              func(context.Context, *Client, *monitord.Tx[S], AddressEvent) error
 }
 
 var _ monitord.Monitor[struct{}] = AddressEvents[struct{}]{}
@@ -60,7 +62,11 @@ func (e AddressEvents[S]) Info() monitord.Info {
 	if name == "" {
 		name = "quicknode-solana-address-events"
 	}
-	return monitord.Info{Name: name, Description: "Finalized Solana transactions involving one address"}
+	description := e.Description
+	if description == "" {
+		description = "Finalized Solana transactions involving one address"
+	}
+	return monitord.Info{Name: name, Description: description}
 }
 
 func (e AddressEvents[S]) Plan() monitord.Plan[S] {
@@ -144,18 +150,21 @@ func (e AddressEvents[S]) run(ctx context.Context, session *monitord.Session[S])
 	}
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+	logMatches := map[Signature]bool{}
 	for {
-		if err := e.catchUp(ctx, session, client, &cursor); err != nil {
+		if err := e.catchUp(ctx, session, client, &cursor, logMatches); err != nil {
 			return err
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-		case _, ok := <-notifications:
+		case notification, ok := <-notifications:
 			if !ok {
 				notifications = nil
+				continue
 			}
+			e.rememberLogMatch(logMatches, cursor, notification)
 		case err, ok := <-subscriptionErrors:
 			if !ok {
 				subscriptionErrors = nil
@@ -167,6 +176,13 @@ func (e AddressEvents[S]) run(ctx context.Context, session *monitord.Session[S])
 			}
 		}
 	}
+}
+
+func (e AddressEvents[S]) rememberLogMatch(matches map[Signature]bool, cursor addressEventsCursor, notification LogsNotification) {
+	if e.MatchLogs == nil || notification.Context.Slot <= cursor.Slot {
+		return
+	}
+	matches[notification.Value.Signature] = e.MatchLogs(notification.Value)
 }
 
 func (e AddressEvents[S]) httpSecret() (monitord.SecretRef, bool) {
@@ -214,7 +230,7 @@ func (e AddressEvents[S]) loadCursor(ctx context.Context, session *monitord.Sess
 	return cursor, nil
 }
 
-func (e AddressEvents[S]) catchUp(ctx context.Context, session *monitord.Session[S], client *Client, cursor *addressEventsCursor) error {
+func (e AddressEvents[S]) catchUp(ctx context.Context, session *monitord.Session[S], client *Client, cursor *addressEventsCursor, logMatches map[Signature]bool) error {
 	const pageSize = 1000
 	maxPages := e.MaxBackfillPages
 	if maxPages <= 0 {
@@ -264,20 +280,25 @@ func (e AddressEvents[S]) catchUp(ctx context.Context, session *monitord.Session
 	}
 	for i := len(pending) - 1; i >= 0; i-- {
 		info := pending[i]
-		payload, err := client.GetTransaction(ctx, info.Signature, TransactionOptions{Commitment: Finalized})
-		if err != nil {
-			return err
-		}
-		if bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
-			return fmt.Errorf("quicknode solana: finalized transaction %s is temporarily unavailable", info.Signature)
-		}
-		event := AddressEvent{
-			Signature:   info.Signature,
-			Slot:        info.Slot,
-			Err:         append(json.RawMessage(nil), info.Err...),
-			Memo:        info.Memo,
-			BlockTime:   info.BlockTime,
-			Transaction: append(json.RawMessage(nil), payload...),
+		matched, hinted := logMatches[info.Signature]
+		delete(logMatches, info.Signature)
+		var event AddressEvent
+		if !hinted || matched {
+			payload, err := client.GetTransaction(ctx, info.Signature, TransactionOptions{Commitment: Finalized})
+			if err != nil {
+				return err
+			}
+			if bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
+				return fmt.Errorf("quicknode solana: finalized transaction %s is temporarily unavailable", info.Signature)
+			}
+			event = AddressEvent{
+				Signature:   info.Signature,
+				Slot:        info.Slot,
+				Err:         append(json.RawMessage(nil), info.Err...),
+				Memo:        info.Memo,
+				BlockTime:   info.BlockTime,
+				Transaction: append(json.RawMessage(nil), payload...),
+			}
 		}
 		next := addressEventsCursor{
 			GenesisHash: client.GenesisHash(),
@@ -286,8 +307,10 @@ func (e AddressEvents[S]) catchUp(ctx context.Context, session *monitord.Session
 			Slot:        info.Slot,
 		}
 		if err := session.Commit(ctx, func(tx *monitord.Tx[S]) error {
-			if err := e.Handle(tx, event); err != nil {
-				return err
+			if !hinted || matched {
+				if err := e.Handle(ctx, client, tx, event); err != nil {
+					return err
+				}
 			}
 			return tx.Checkpoint(addressEventsCursorSource, next)
 		}); err != nil {
