@@ -323,6 +323,9 @@ func (b Blocks[S]) advance(ctx context.Context, session *monitord.Session[S], cl
 		}
 		blocks, err := client.blocksByNumber(ctx, progress.NextBlock, to, concurrency)
 		if err != nil {
+			if errors.Is(err, ErrBlockUnavailable) {
+				return nil
+			}
 			return err
 		}
 		if len(blocks) == 0 {
@@ -342,6 +345,9 @@ func (b Blocks[S]) advance(ctx context.Context, session *monitord.Session[S], cl
 			state := session.State()
 			update, err := b.Handle(ctx, client, state, block.Clone())
 			if err != nil {
+				if errors.Is(err, ErrReceiptUnavailable) {
+					return nil
+				}
 				return err
 			}
 			next := progress.clone()

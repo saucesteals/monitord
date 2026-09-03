@@ -252,7 +252,9 @@ periodic HTTP wake repairs gaps even if WebSocket reconnects lose notifications.
 Paired HTTP and WSS endpoints are handshaken independently and must report the
 same chain ID. Freshly announced blocks and receipts receive bounded retries
 when the HTTP endpoint temporarily returns `null`; an announced head replaced
-before HTTP observes it is ignored without advancing the cursor.
+before HTTP observes it is ignored without advancing the cursor. If propagation
+still lags after the bounded retry window, progress remains stationary and the
+next head or periodic wake retries without restarting the worker.
 Recent blocks are journaled until the configured confirmation depth; a fork is
 delivered in reverse order with
 `Block.Removed` (the removed record contains its block identity/header, while
