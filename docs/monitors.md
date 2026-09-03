@@ -249,6 +249,10 @@ func main() {
 cursor. It fetches bounded block batches concurrently, invokes the handler once
 per block in order, and checkpoints each block atomically with its update. A
 periodic HTTP wake repairs gaps even if WebSocket reconnects lose notifications.
+Paired HTTP and WSS endpoints are handshaken independently and must report the
+same chain ID. Freshly announced blocks and receipts receive bounded retries
+when the HTTP endpoint temporarily returns `null`; an announced head replaced
+before HTTP observes it is ignored without advancing the cursor.
 Recent blocks are journaled until the configured confirmation depth; a fork is
 delivered in reverse order with
 `Block.Removed` (the removed record contains its block identity/header, while

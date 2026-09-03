@@ -64,6 +64,22 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 		provider.Close()
 		return nil, fmt.Errorf("quicknode evm chain handshake: %w", err)
 	}
+	if cfg.Endpoint.HTTPURL != "" && cfg.Endpoint.WSSURL != "" {
+		var websocketRaw string
+		if err = provider.CallWebSocketRead(ctx, "eth_chainId", []any{}, &websocketRaw); err != nil {
+			provider.Close()
+			return nil, fmt.Errorf("quicknode evm websocket chain handshake: %w", err)
+		}
+		websocketChainID, parseErr := ParseChainID(websocketRaw)
+		if parseErr != nil {
+			provider.Close()
+			return nil, fmt.Errorf("quicknode evm websocket chain handshake: %w", parseErr)
+		}
+		if websocketChainID != chainID {
+			provider.Close()
+			return nil, fmt.Errorf("quicknode evm endpoint chain mismatch: HTTP is %s, WSS is %s", chainID, websocketChainID)
+		}
+	}
 	return &Client{provider: provider, chainID: chainID}, nil
 }
 

@@ -132,6 +132,19 @@ func (c *Client) CallRead(ctx context.Context, method string, params, out any) e
 	return c.callWSOnce(ctx, method, params, out)
 }
 
+// CallWebSocketRead performs one read-only JSON-RPC call against the configured
+// WebSocket endpoint even when HTTP is also available. Chain clients use it to
+// verify that paired HTTP and WSS URLs address the same network.
+func (c *Client) CallWebSocketRead(ctx context.Context, method string, params, out any) error {
+	if method == "" {
+		return errors.New("quicknode: JSON-RPC method is required")
+	}
+	if out == nil {
+		return errors.New("quicknode: JSON-RPC result target is required")
+	}
+	return c.callWSOnce(ctx, method, params, out)
+}
+
 func (c *Client) callWSOnce(ctx context.Context, method string, params, out any) error {
 	if c.wssURL == nil {
 		return errors.New("quicknode: WSS endpoint is required")

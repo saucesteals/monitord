@@ -124,7 +124,7 @@ func (b Blocks[S]) run(ctx context.Context, session *monitord.Session[S]) error 
 	if err != nil {
 		return err
 	}
-	if err = b.advance(ctx, session, client, &progress, head, confirmations, maxRecent, false); err != nil {
+	if err = b.advance(ctx, session, client, &progress, head, confirmations, maxRecent, nil); err != nil {
 		return err
 	}
 
@@ -147,8 +147,7 @@ func (b Blocks[S]) run(ctx context.Context, session *monitord.Session[S]) error 
 			if err != nil {
 				return err
 			}
-			extends := announcement.Number == progress.NextBlock && announcement.ParentHash == progress.CanonicalParent
-			if err = b.advance(ctx, session, client, &progress, announcement.Number, confirmations, maxRecent, extends); err != nil {
+			if err = b.advance(ctx, session, client, &progress, announcement.Number, confirmations, maxRecent, &announcement); err != nil {
 				return err
 			}
 		case err, ok := <-subscription.Err():
@@ -161,7 +160,7 @@ func (b Blocks[S]) run(ctx context.Context, session *monitord.Session[S]) error 
 			if err != nil {
 				return err
 			}
-			if err = b.advance(ctx, session, client, &progress, head, confirmations, maxRecent, false); err != nil {
+			if err = b.advance(ctx, session, client, &progress, head, confirmations, maxRecent, nil); err != nil {
 				return err
 			}
 		}
@@ -281,6 +280,7 @@ func validateBlockProgress(progress blockProgress, chain ChainID, maxRecent int)
 
 type headAnnouncement struct {
 	Number     uint64
+	Hash       Hash
 	ParentHash Hash
 }
 
@@ -295,10 +295,11 @@ func decodeHead(head Head) (headAnnouncement, error) {
 	if _, err = ParseHash(string(head.ParentHash)); err != nil {
 		return headAnnouncement{}, err
 	}
-	return headAnnouncement{Number: number, ParentHash: head.ParentHash}, nil
+	return headAnnouncement{Number: number, Hash: head.Hash, ParentHash: head.ParentHash}, nil
 }
 
-func (b Blocks[S]) advance(ctx context.Context, session *monitord.Session[S], client *Client, progress *blockProgress, target, confirmations uint64, maxRecent int, knownExtension bool) error {
+func (b Blocks[S]) advance(ctx context.Context, session *monitord.Session[S], client *Client, progress *blockProgress, target, confirmations uint64, maxRecent int, announcement *headAnnouncement) error {
+	knownExtension := announcement != nil && announcement.Number == progress.NextBlock && announcement.ParentHash == progress.CanonicalParent
 	if !knownExtension {
 		if err := b.rollbackOrphans(ctx, session, client, progress, confirmations); err != nil {
 			return err
@@ -329,6 +330,12 @@ func (b Blocks[S]) advance(ctx context.Context, session *monitord.Session[S], cl
 		}
 		if progress.NextBlock > 0 && blocks[0].ParentHash != progress.CanonicalParent {
 			return fmt.Errorf("quicknode evm: canonical range does not extend block %d", progress.NextBlock-1)
+		}
+		if announcement != nil && to == announcement.Number && blocks[len(blocks)-1].Hash != announcement.Hash {
+			// The head was replaced before HTTP observed it. Leave the cursor in
+			// place; the next head or periodic reconciliation will apply the
+			// current canonical block instead of manufacturing a worker failure.
+			return nil
 		}
 		for i := range blocks {
 			block := blocks[i]

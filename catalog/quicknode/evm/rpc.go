@@ -17,6 +17,10 @@ import (
 // transaction whose receipt endpoint still returns null.
 var ErrReceiptUnavailable = errors.New("quicknode evm: transaction receipt is not available")
 
+// ErrBlockUnavailable reports head-to-RPC propagation lag for an announced
+// block whose HTTP endpoint still returns null.
+var ErrBlockUnavailable = errors.New("quicknode evm: block is not available")
+
 type rpcBlock struct {
 	Number       string           `json:"number"`
 	Hash         Hash             `json:"hash"`
@@ -91,8 +95,14 @@ func (c *Client) blockByNumber(ctx context.Context, n uint64) (rpcBlockHeader, e
 
 // BlockByNumber returns the canonical block at number with full transactions.
 func (c *Client) BlockByNumber(ctx context.Context, number uint64) (Block, error) {
+	return retryPropagation(ctx, ErrBlockUnavailable, func() (Block, error) {
+		return c.blockByNumberFull(ctx, number)
+	})
+}
+
+func (c *Client) blockByNumberFull(ctx context.Context, number uint64) (Block, error) {
 	var raw rpcBlock
-	if err := c.call(ctx, "eth_getBlockByNumber", []any{fmt.Sprintf("0x%x", number), true}, &raw); err != nil {
+	if err := c.callBlock(ctx, "eth_getBlockByNumber", []any{fmt.Sprintf("0x%x", number), true}, &raw); err != nil {
 		return Block{}, err
 	}
 	block, err := decodeRPCBlock(raw, c.ChainID())
@@ -110,8 +120,14 @@ func (c *Client) BlockByHash(ctx context.Context, hash Hash) (Block, error) {
 	if _, err := ParseHash(string(hash)); err != nil {
 		return Block{}, err
 	}
+	return retryPropagation(ctx, ErrBlockUnavailable, func() (Block, error) {
+		return c.blockByHashFull(ctx, hash)
+	})
+}
+
+func (c *Client) blockByHashFull(ctx context.Context, hash Hash) (Block, error) {
 	var raw rpcBlock
-	if err := c.call(ctx, "eth_getBlockByHash", []any{hash, true}, &raw); err != nil {
+	if err := c.callBlock(ctx, "eth_getBlockByHash", []any{hash, true}, &raw); err != nil {
 		return Block{}, err
 	}
 	block, err := decodeRPCBlock(raw, c.ChainID())
@@ -122,6 +138,20 @@ func (c *Client) BlockByHash(ctx context.Context, hash Hash) (Block, error) {
 		return Block{}, errors.New("quicknode: block hash does not match request")
 	}
 	return block, nil
+}
+
+func (c *Client) callBlock(ctx context.Context, method string, params []any, out *rpcBlock) error {
+	var payload json.RawMessage
+	if err := c.call(ctx, method, params, &payload); err != nil {
+		return err
+	}
+	if len(payload) == 0 || bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
+		return ErrBlockUnavailable
+	}
+	if err := json.Unmarshal(payload, out); err != nil {
+		return errors.New("quicknode: invalid block response")
+	}
+	return nil
 }
 
 func (c *Client) blocksByNumber(ctx context.Context, from, to uint64, concurrency int) ([]Block, error) {
@@ -188,25 +218,9 @@ func (c *Client) ReceiptFor(ctx context.Context, tx Transaction) (Receipt, error
 	if tx.ChainID != c.ChainID() {
 		return Receipt{}, errors.New("quicknode: transaction belongs to another chain")
 	}
-	var receipt Receipt
-	var err error
-	for attempt := 0; attempt < 5; attempt++ {
-		receipt, err = c.TransactionReceipt(ctx, tx.Hash)
-		if !errors.Is(err, ErrReceiptUnavailable) {
-			break
-		}
-		if attempt == 4 {
-			break
-		}
-		delay := min(50*time.Millisecond<<attempt, 500*time.Millisecond)
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return Receipt{}, ctx.Err()
-		case <-timer.C:
-		}
-	}
+	receipt, err := retryPropagation(ctx, ErrReceiptUnavailable, func() (Receipt, error) {
+		return c.TransactionReceipt(ctx, tx.Hash)
+	})
 	if err != nil {
 		return Receipt{}, err
 	}
@@ -214,6 +228,26 @@ func (c *Client) ReceiptFor(ctx context.Context, tx Transaction) (Receipt, error
 		return Receipt{}, errors.New("quicknode: receipt does not match transaction block")
 	}
 	return receipt, nil
+}
+
+func retryPropagation[T any](ctx context.Context, unavailable error, fetch func() (T, error)) (T, error) {
+	var value T
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		value, err = fetch()
+		if !errors.Is(err, unavailable) || attempt == 4 {
+			return value, err
+		}
+		delay := min(50*time.Millisecond<<attempt, 500*time.Millisecond)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return value, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return value, err
 }
 
 // AccountAt reads balance, nonce, and code from the exact canonical block hash.
