@@ -1,14 +1,21 @@
 package evm
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 )
+
+// ErrReceiptUnavailable reports head-to-RPC propagation lag for a mined
+// transaction whose receipt endpoint still returns null.
+var ErrReceiptUnavailable = errors.New("quicknode evm: transaction receipt is not available")
 
 type rpcBlock struct {
 	Number       string           `json:"number"`
@@ -154,9 +161,16 @@ func (c *Client) TransactionReceipt(ctx context.Context, hash Hash) (Receipt, er
 	if _, err := ParseHash(string(hash)); err != nil {
 		return Receipt{}, err
 	}
-	var raw rpcReceipt
-	if err := c.call(ctx, "eth_getTransactionReceipt", []any{hash}, &raw); err != nil {
+	var payload json.RawMessage
+	if err := c.call(ctx, "eth_getTransactionReceipt", []any{hash}, &payload); err != nil {
 		return Receipt{}, err
+	}
+	if len(payload) == 0 || bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
+		return Receipt{}, ErrReceiptUnavailable
+	}
+	var raw rpcReceipt
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return Receipt{}, errors.New("quicknode: invalid transaction receipt")
 	}
 	receipt, err := decodeRPCReceipt(raw, c.ChainID())
 	if err != nil {
@@ -174,7 +188,25 @@ func (c *Client) ReceiptFor(ctx context.Context, tx Transaction) (Receipt, error
 	if tx.ChainID != c.ChainID() {
 		return Receipt{}, errors.New("quicknode: transaction belongs to another chain")
 	}
-	receipt, err := c.TransactionReceipt(ctx, tx.Hash)
+	var receipt Receipt
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		receipt, err = c.TransactionReceipt(ctx, tx.Hash)
+		if !errors.Is(err, ErrReceiptUnavailable) {
+			break
+		}
+		if attempt == 4 {
+			break
+		}
+		delay := min(50*time.Millisecond<<attempt, 500*time.Millisecond)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return Receipt{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
 	if err != nil {
 		return Receipt{}, err
 	}

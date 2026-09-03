@@ -125,7 +125,6 @@ type Block struct {
 	Timestamp    uint64        `json:"timestamp"`
 	Transactions []Transaction `json:"transactions,omitempty"`
 	Removed      bool          `json:"removed,omitempty"`
-	Confirmed    bool          `json:"confirmed,omitempty"`
 }
 
 func (b Block) ID() string {

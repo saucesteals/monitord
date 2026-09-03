@@ -12,16 +12,10 @@ import (
 
 const (
 	defaultBlockReconcilePeriod  = 2 * time.Second
-	defaultMaxLiveBlocks         = 256
+	defaultMaxRecentBlocks       = 256
 	defaultBlockReplayBatch      = 32
 	defaultBlockFetchConcurrency = 8
 )
-
-type blockCursor struct {
-	ChainID         ChainID `json:"chain_id"`
-	NextBlock       uint64  `json:"next_block"`
-	CanonicalParent Hash    `json:"canonical_parent,omitempty"`
-}
 
 type blockReference struct {
 	Number     uint64 `json:"number"`
@@ -33,26 +27,28 @@ func (r blockReference) block(chain ChainID) Block {
 	return Block{ChainID: chain, Number: r.Number, Hash: r.Hash, ParentHash: r.ParentHash}
 }
 
-type blockLive struct {
-	ChainID   ChainID          `json:"chain_id"`
-	NextBlock uint64           `json:"next_block"`
-	Blocks    []blockReference `json:"blocks,omitempty"`
+type blockProgress struct {
+	ChainID         ChainID          `json:"chain_id"`
+	NextBlock       uint64           `json:"next_block"`
+	CanonicalParent Hash             `json:"canonical_parent,omitempty"`
+	Recent          []blockReference `json:"recent,omitempty"`
 }
 
-func (l blockLive) clone() blockLive {
-	l.Blocks = append([]blockReference(nil), l.Blocks...)
-	return l
+func (p blockProgress) clone() blockProgress {
+	p.Recent = append([]blockReference(nil), p.Recent...)
+	return p
 }
 
 type BlockUpdate[S any] func(*monitord.Tx[S]) error
 
-// Blocks delivers canonical EVM blocks immediately after a WebSocket head and
-// independently replays canonical HTTP history. Live and replay observations
-// are inclusive: Handle must be deterministic and deduplicate by Block.ID or
-// transaction identity. Removed live blocks are delivered in reverse order.
+// Blocks advances one canonical EVM block sequence. WebSocket heads wake the
+// source immediately; HTTP block reads provide ordered content and reconnect
+// recovery. Each block is applied once. Recent orphaned blocks are removed in
+// reverse order before their canonical replacements are applied.
 //
-// Confirmations bounds the live reorganization journal and controls the HTTP
-// replay target. It does not delay live delivery.
+// Handle receives a detached durable state snapshot for selecting relevant
+// transactions and performing network reads before returning a short atomic
+// update. The update must recheck predicates against tx.State.
 type Blocks[S any] struct {
 	Name              string
 	ExpectedChainID   ChainID
@@ -61,8 +57,8 @@ type Blocks[S any] struct {
 	ReconcileInterval time.Duration
 	ReplayBatch       uint64
 	FetchConcurrency  int
-	MaxLiveBlocks     int
-	Handle            func(context.Context, *Client, Block) (BlockUpdate[S], error)
+	MaxRecentBlocks   int
+	Handle            func(context.Context, *Client, S, Block) (BlockUpdate[S], error)
 	HTTPURL           string
 	WSSURL            string
 	HTTPSecret        monitord.SecretRef
@@ -76,7 +72,7 @@ func (b Blocks[S]) Info() monitord.Info {
 	if name == "" {
 		name = "quicknode-blocks"
 	}
-	return monitord.Info{Name: name, Description: "Live canonical EVM blocks with durable HTTP recovery"}
+	return monitord.Info{Name: name, Description: "Ordered canonical EVM blocks with immediate WebSocket wakeups"}
 }
 
 func (b Blocks[S]) Plan() monitord.Plan[S] {
@@ -112,38 +108,26 @@ func (b Blocks[S]) run(ctx context.Context, session *monitord.Session[S]) error 
 	if expected != "" && client.ChainID() != expected {
 		return fmt.Errorf("quicknode evm: expected chain %s, endpoint is %s", expected, client.ChainID())
 	}
-	confirmations, err := confirmationDepth(client.ChainID(), b.Confirmations)
+	confirmations, maxRecent, err := b.validate(client.ChainID())
 	if err != nil {
 		return err
 	}
-	maxLive := b.MaxLiveBlocks
-	if maxLive == 0 {
-		maxLive = defaultMaxLiveBlocks
-	}
-	if maxLive < int(confirmations)+2 {
-		return errors.New("quicknode evm: MaxLiveBlocks must exceed confirmations by at least two")
-	}
-	if b.ReplayBatch > 10_000 {
-		return errors.New("quicknode evm: ReplayBatch cannot exceed 10000")
-	}
-	if b.FetchConcurrency < 0 {
-		return errors.New("quicknode evm: FetchConcurrency cannot be negative")
-	}
 
-	// Subscribe before taking any snapshots so queued heads close the startup gap.
+	// Open the subscription before the snapshot, then process the snapshot block
+	// itself. Transactions published during startup cannot fall behind finality.
 	subscription, err := client.SubscribeHeads(ctx)
 	if err != nil {
 		return err
 	}
 	defer subscription.Close()
-	cursor, err := b.loadCursor(ctx, session, client, confirmations)
+	progress, head, err := b.loadProgress(ctx, session, client, maxRecent)
 	if err != nil {
 		return err
 	}
-	live, err := b.loadLive(ctx, session, client, maxLive)
-	if err != nil {
+	if err = b.advance(ctx, session, client, &progress, head, confirmations, maxRecent, false); err != nil {
 		return err
 	}
+
 	interval := b.ReconcileInterval
 	if interval <= 0 {
 		interval = defaultBlockReconcilePeriod
@@ -152,27 +136,6 @@ func (b Blocks[S]) run(ctx context.Context, session *monitord.Session[S]) error 
 	defer ticker.Stop()
 
 	for {
-		for range 64 {
-			select {
-			case head, ok := <-subscription.C():
-				if !ok {
-					return errors.New("quicknode evm: head subscription closed")
-				}
-				if err := b.syncLive(ctx, session, client, &live, head, confirmations, maxLive); err != nil {
-					return err
-				}
-			default:
-				goto reconcile
-			}
-		}
-	reconcile:
-		caughtUp, err := b.reconcile(ctx, session, client, confirmations, &cursor)
-		if err != nil {
-			return err
-		}
-		if !caughtUp {
-			continue
-		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -180,7 +143,12 @@ func (b Blocks[S]) run(ctx context.Context, session *monitord.Session[S]) error 
 			if !ok {
 				return errors.New("quicknode evm: head subscription closed")
 			}
-			if err := b.syncLive(ctx, session, client, &live, head, confirmations, maxLive); err != nil {
+			announcement, err := decodeHead(head)
+			if err != nil {
+				return err
+			}
+			extends := announcement.Number == progress.NextBlock && announcement.ParentHash == progress.CanonicalParent
+			if err = b.advance(ctx, session, client, &progress, announcement.Number, confirmations, maxRecent, extends); err != nil {
 				return err
 			}
 		case err, ok := <-subscription.Err():
@@ -189,8 +157,36 @@ func (b Blocks[S]) run(ctx context.Context, session *monitord.Session[S]) error 
 			}
 			return errors.New("quicknode evm: head subscription stopped")
 		case <-ticker.C:
+			head, err := client.blockNumber(ctx)
+			if err != nil {
+				return err
+			}
+			if err = b.advance(ctx, session, client, &progress, head, confirmations, maxRecent, false); err != nil {
+				return err
+			}
 		}
 	}
+}
+
+func (b Blocks[S]) validate(chain ChainID) (uint64, int, error) {
+	confirmations, err := confirmationDepth(chain, b.Confirmations)
+	if err != nil {
+		return 0, 0, err
+	}
+	maxRecent := b.MaxRecentBlocks
+	if maxRecent == 0 {
+		maxRecent = defaultMaxRecentBlocks
+	}
+	if maxRecent < 2 || confirmations > uint64(maxRecent-2) {
+		return 0, 0, errors.New("quicknode evm: MaxRecentBlocks must exceed confirmations by at least two")
+	}
+	if b.ReplayBatch > 10_000 {
+		return 0, 0, errors.New("quicknode evm: ReplayBatch cannot exceed 10000")
+	}
+	if b.FetchConcurrency < 0 || b.FetchConcurrency > 256 {
+		return 0, 0, errors.New("quicknode evm: FetchConcurrency must be between 0 and 256")
+	}
+	return confirmations, maxRecent, nil
 }
 
 func (b Blocks[S]) endpoints(session *monitord.Session[S]) (string, string, bool, error) {
@@ -216,238 +212,209 @@ func (b Blocks[S]) endpoints(session *monitord.Session[S]) (string, string, bool
 	return httpURL, wssURL, b.HTTPURL == "" && b.WSSURL == "" && defaultHTTP && defaultWSS, nil
 }
 
-func (b Blocks[S]) loadCursor(ctx context.Context, session *monitord.Session[S], client *Client, confirmations uint64) (blockCursor, error) {
-	var cursor blockCursor
-	found, err := session.Checkpoint(b.cursorSource(), &cursor)
-	if err != nil {
-		return cursor, err
-	}
-	if found {
-		if cursor.ChainID != client.ChainID() {
-			return cursor, errors.New("quicknode evm: saved block cursor belongs to another chain")
-		}
-		return cursor, nil
-	}
-	cursor.ChainID = client.ChainID()
-	if b.BackfillFrom != nil {
-		cursor.NextBlock = *b.BackfillFrom
-	} else {
-		head, err := client.blockNumber(ctx)
-		if err != nil {
-			return cursor, err
-		}
-		if head >= confirmations {
-			cursor.NextBlock = head - confirmations + 1
-		}
-	}
-	return cursor, b.commit(ctx, session, &cursor, nil, nil)
-}
-
-func (b Blocks[S]) loadLive(ctx context.Context, session *monitord.Session[S], client *Client, maxLive int) (blockLive, error) {
-	var live blockLive
-	found, err := session.Checkpoint(b.liveSource(), &live)
-	if err != nil {
-		return live, err
-	}
-	if found {
-		if live.ChainID != client.ChainID() {
-			return live, errors.New("quicknode evm: saved live blocks belong to another chain")
-		}
-		if len(live.Blocks) > maxLive {
-			return live, errors.New("quicknode evm: live block journal exceeds its bound")
-		}
-		return live, nil
-	}
+func (b Blocks[S]) loadProgress(ctx context.Context, session *monitord.Session[S], client *Client, maxRecent int) (blockProgress, uint64, error) {
 	head, err := client.blockNumber(ctx)
 	if err != nil {
-		return live, err
+		return blockProgress{}, 0, err
 	}
-	live = blockLive{ChainID: client.ChainID(), NextBlock: head + 1}
-	return live, b.commit(ctx, session, nil, &live, nil)
+	var progress blockProgress
+	found, err := session.Checkpoint(b.progressSource(), &progress)
+	if err != nil {
+		return progress, 0, err
+	}
+	if found {
+		if err = validateBlockProgress(progress, client.ChainID(), maxRecent); err != nil {
+			return progress, 0, err
+		}
+		return progress, head, nil
+	}
+	start := head
+	if b.BackfillFrom != nil {
+		start = *b.BackfillFrom
+		if start > head {
+			return progress, 0, errors.New("quicknode evm: BackfillFrom is above the current head")
+		}
+	}
+	progress = blockProgress{ChainID: client.ChainID(), NextBlock: start}
+	if start > 0 {
+		parent, err := client.blockByNumber(ctx, start-1)
+		if err != nil {
+			return progress, 0, err
+		}
+		progress.CanonicalParent = parent.Hash
+	}
+	return progress, head, b.commit(ctx, session, progress, nil)
 }
 
-func (b Blocks[S]) syncLive(ctx context.Context, session *monitord.Session[S], client *Client, live *blockLive, head Head, confirmations uint64, maxLive int) error {
-	headNumber, err := parseUintQuantity(head.Number)
+func validateBlockProgress(progress blockProgress, chain ChainID, maxRecent int) error {
+	if progress.ChainID != chain {
+		return errors.New("quicknode evm: saved block progress belongs to another chain")
+	}
+	if len(progress.Recent) > maxRecent {
+		return errors.New("quicknode evm: recent block journal exceeds its bound")
+	}
+	for i := range progress.Recent {
+		ref := progress.Recent[i]
+		if _, err := ParseHash(string(ref.Hash)); err != nil {
+			return err
+		}
+		if _, err := ParseHash(string(ref.ParentHash)); err != nil {
+			return err
+		}
+		if i > 0 {
+			previous := progress.Recent[i-1]
+			if ref.Number != previous.Number+1 || ref.ParentHash != previous.Hash {
+				return errors.New("quicknode evm: recent block journal is not contiguous")
+			}
+		}
+	}
+	if len(progress.Recent) > 0 {
+		last := progress.Recent[len(progress.Recent)-1]
+		if progress.NextBlock != last.Number+1 || progress.CanonicalParent != last.Hash {
+			return errors.New("quicknode evm: saved block progress does not follow its journal")
+		}
+	} else if progress.NextBlock > 0 && progress.CanonicalParent == "" {
+		return errors.New("quicknode evm: saved block progress lacks its canonical parent")
+	}
+	return nil
+}
+
+type headAnnouncement struct {
+	Number     uint64
+	ParentHash Hash
+}
+
+func decodeHead(head Head) (headAnnouncement, error) {
+	number, err := parseUintQuantity(head.Number)
 	if err != nil {
-		return err
+		return headAnnouncement{}, err
 	}
 	if _, err = ParseHash(string(head.Hash)); err != nil {
-		return err
+		return headAnnouncement{}, err
 	}
 	if _, err = ParseHash(string(head.ParentHash)); err != nil {
-		return err
+		return headAnnouncement{}, err
 	}
-	if err = b.removeOrphans(ctx, session, client, live); err != nil {
-		return err
-	}
-	if headNumber < live.NextBlock {
-		return b.trimLive(ctx, session, client, live, headNumber, confirmations)
-	}
-	for number := live.NextBlock; number <= headNumber; number++ {
-		if len(live.Blocks) == maxLive {
-			if err := b.trimLive(ctx, session, client, live, headNumber, confirmations); err != nil {
-				return err
-			}
-			if len(live.Blocks) == maxLive {
-				return errors.New("quicknode evm: live block journal is full")
-			}
-		}
-		block, err := client.BlockByNumber(ctx, number)
-		if err != nil {
-			return err
-		}
-		if len(live.Blocks) > 0 && block.ParentHash != live.Blocks[len(live.Blocks)-1].Hash {
-			return errors.New("quicknode evm: live block does not extend canonical journal")
-		}
-		block.Confirmed = false
-		update, err := b.Handle(ctx, client, block.Clone())
-		if err != nil {
-			return err
-		}
-		next := live.clone()
-		next.NextBlock = block.Number + 1
-		next.Blocks = append(next.Blocks, blockReference{Number: block.Number, Hash: block.Hash, ParentHash: block.ParentHash})
-		if err = b.commit(ctx, session, nil, &next, update); err != nil {
-			return err
-		}
-		*live = next
-	}
-	return b.trimLive(ctx, session, client, live, headNumber, confirmations)
+	return headAnnouncement{Number: number, ParentHash: head.ParentHash}, nil
 }
 
-func (b Blocks[S]) removeOrphans(ctx context.Context, session *monitord.Session[S], client *Client, live *blockLive) error {
-	for len(live.Blocks) > 0 {
-		last := live.Blocks[len(live.Blocks)-1]
-		canonical, err := client.blockByNumber(ctx, last.Number)
-		if err != nil {
+func (b Blocks[S]) advance(ctx context.Context, session *monitord.Session[S], client *Client, progress *blockProgress, target, confirmations uint64, maxRecent int, knownExtension bool) error {
+	if !knownExtension {
+		if err := b.rollbackOrphans(ctx, session, client, progress, confirmations); err != nil {
 			return err
 		}
-		if canonical.Hash == last.Hash {
-			return nil
-		}
-		removed := last.block(client.ChainID())
-		removed.Removed = true
-		update, err := b.Handle(ctx, client, removed)
-		if err != nil {
-			return err
-		}
-		next := live.clone()
-		next.Blocks = next.Blocks[:len(next.Blocks)-1]
-		next.NextBlock = last.Number
-		if err = b.commit(ctx, session, nil, &next, update); err != nil {
-			return err
-		}
-		*live = next
 	}
-	return nil
-}
-
-func (b Blocks[S]) trimLive(ctx context.Context, session *monitord.Session[S], client *Client, live *blockLive, head, confirmations uint64) error {
-	if head < confirmations || len(live.Blocks) == 0 {
+	if progress.NextBlock > target {
 		return nil
 	}
-	finalized := head - confirmations
-	cut := 0
-	for cut < len(live.Blocks) && live.Blocks[cut].Number <= finalized {
-		canonical, err := client.blockByNumber(ctx, live.Blocks[cut].Number)
-		if err != nil {
-			return err
-		}
-		if canonical.Hash != live.Blocks[cut].Hash {
-			return errors.New("quicknode evm: finalized live block changed before trimming")
-		}
-		cut++
-	}
-	if cut == 0 {
-		return nil
-	}
-	next := live.clone()
-	next.Blocks = append([]blockReference(nil), next.Blocks[cut:]...)
-	if err := b.commit(ctx, session, nil, &next, nil); err != nil {
-		return err
-	}
-	*live = next
-	return nil
-}
-
-func (b Blocks[S]) reconcile(ctx context.Context, session *monitord.Session[S], client *Client, confirmations uint64, cursor *blockCursor) (bool, error) {
-	head, err := client.blockNumber(ctx)
-	if err != nil {
-		return false, err
-	}
-	if head < confirmations {
-		return true, nil
-	}
-	target := head - confirmations
-	if cursor.NextBlock > target {
-		return true, nil
-	}
-	if cursor.NextBlock > 0 && cursor.CanonicalParent != "" {
-		parent, err := client.blockByNumber(ctx, cursor.NextBlock-1)
-		if err != nil {
-			return false, err
-		}
-		if parent.Hash != cursor.CanonicalParent {
-			return false, fmt.Errorf("quicknode evm: canonical history changed before block %d", cursor.NextBlock)
-		}
-	}
-	batch := b.ReplayBatch
-	if batch == 0 {
-		batch = defaultBlockReplayBatch
-	}
-	to := target
-	if remaining := target - cursor.NextBlock + 1; batch < remaining {
-		to = cursor.NextBlock + batch - 1
+	batchSize := b.ReplayBatch
+	if batchSize == 0 {
+		batchSize = defaultBlockReplayBatch
 	}
 	concurrency := b.FetchConcurrency
 	if concurrency == 0 {
 		concurrency = defaultBlockFetchConcurrency
 	}
-	blocks, err := client.blocksByNumber(ctx, cursor.NextBlock, to, concurrency)
-	if err != nil {
-		return false, err
-	}
-	if cursor.CanonicalParent != "" && len(blocks) > 0 && blocks[0].ParentHash != cursor.CanonicalParent {
-		return false, fmt.Errorf("quicknode evm: replay range does not extend block %d", cursor.NextBlock-1)
-	}
-	for i := range blocks {
-		block := blocks[i]
-		block.Confirmed = true
-		update, err := b.Handle(ctx, client, block.Clone())
+	for progress.NextBlock <= target {
+		to := target
+		if remaining := target - progress.NextBlock + 1; batchSize < remaining {
+			to = progress.NextBlock + batchSize - 1
+		}
+		blocks, err := client.blocksByNumber(ctx, progress.NextBlock, to, concurrency)
 		if err != nil {
-			return false, err
+			return err
 		}
-		next := blockCursor{ChainID: client.ChainID(), NextBlock: block.Number + 1, CanonicalParent: block.Hash}
-		if err = b.commit(ctx, session, &next, nil, update); err != nil {
-			return false, err
+		if len(blocks) == 0 {
+			return errors.New("quicknode evm: canonical block range is empty")
 		}
-		*cursor = next
+		if progress.NextBlock > 0 && blocks[0].ParentHash != progress.CanonicalParent {
+			return fmt.Errorf("quicknode evm: canonical range does not extend block %d", progress.NextBlock-1)
+		}
+		for i := range blocks {
+			block := blocks[i]
+			state := session.State()
+			update, err := b.Handle(ctx, client, state, block.Clone())
+			if err != nil {
+				return err
+			}
+			next := progress.clone()
+			next.NextBlock = block.Number + 1
+			next.CanonicalParent = block.Hash
+			next.Recent = append(next.Recent, blockReference{Number: block.Number, Hash: block.Hash, ParentHash: block.ParentHash})
+			next.trim(target, confirmations)
+			if len(next.Recent) > maxRecent {
+				return errors.New("quicknode evm: recent block journal is full")
+			}
+			if err = b.commit(ctx, session, next, update); err != nil {
+				return err
+			}
+			*progress = next
+		}
 	}
-	return to == target, nil
+	return nil
 }
 
-func (b Blocks[S]) commit(ctx context.Context, session *monitord.Session[S], cursor *blockCursor, live *blockLive, update BlockUpdate[S]) error {
+func (p *blockProgress) trim(head, confirmations uint64) {
+	if head < confirmations {
+		return
+	}
+	finalized := head - confirmations
+	cut := 0
+	for cut < len(p.Recent) && p.Recent[cut].Number <= finalized {
+		cut++
+	}
+	if cut > 0 {
+		p.Recent = append([]blockReference(nil), p.Recent[cut:]...)
+	}
+}
+
+func (b Blocks[S]) rollbackOrphans(ctx context.Context, session *monitord.Session[S], client *Client, progress *blockProgress, confirmations uint64) error {
+	for progress.NextBlock > 0 && progress.CanonicalParent != "" {
+		canonical, err := client.blockByNumber(ctx, progress.NextBlock-1)
+		if err != nil {
+			return err
+		}
+		if canonical.Hash == progress.CanonicalParent {
+			return nil
+		}
+		if len(progress.Recent) == 0 {
+			return fmt.Errorf("quicknode evm: canonical history changed beyond the %d-block rollback journal", confirmations)
+		}
+		last := progress.Recent[len(progress.Recent)-1]
+		if last.Number+1 != progress.NextBlock || last.Hash != progress.CanonicalParent {
+			return errors.New("quicknode evm: recent block journal cannot roll back current progress")
+		}
+		removed := last.block(client.ChainID())
+		removed.Removed = true
+		state := session.State()
+		update, err := b.Handle(ctx, client, state, removed)
+		if err != nil {
+			return err
+		}
+		next := progress.clone()
+		next.Recent = next.Recent[:len(next.Recent)-1]
+		next.NextBlock = last.Number
+		next.CanonicalParent = last.ParentHash
+		if err = b.commit(ctx, session, next, update); err != nil {
+			return err
+		}
+		*progress = next
+	}
+	return nil
+}
+
+func (b Blocks[S]) commit(ctx context.Context, session *monitord.Session[S], progress blockProgress, update BlockUpdate[S]) error {
 	return session.Commit(ctx, func(tx *monitord.Tx[S]) error {
 		if update != nil {
 			if err := update(tx); err != nil {
 				return err
 			}
 		}
-		if cursor != nil {
-			if err := tx.Checkpoint(b.cursorSource(), *cursor); err != nil {
-				return err
-			}
-		}
-		if live != nil {
-			return tx.Checkpoint(b.liveSource(), *live)
-		}
-		return nil
+		return tx.Checkpoint(b.progressSource(), progress)
 	})
 }
 
-func (b Blocks[S]) cursorSource() string { return b.checkpointPrefix() + ".cursor" }
-func (b Blocks[S]) liveSource() string   { return b.checkpointPrefix() + ".live" }
-func (b Blocks[S]) checkpointPrefix() string {
+func (b Blocks[S]) progressSource() string {
 	if b.Name == "" {
 		return "quicknode.evm.blocks"
 	}
