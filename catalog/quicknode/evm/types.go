@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 )
@@ -11,6 +12,38 @@ import (
 type ChainID string
 type Address string
 type Hash string
+type Quantity string
+
+func ParseQuantity(s string) (Quantity, error) {
+	if len(s) < 3 || !strings.HasPrefix(s, "0x") {
+		return "", errors.New("quantity must be 0x-prefixed")
+	}
+	digits := strings.ToLower(s[2:])
+	if len(digits) > 1 && digits[0] == '0' {
+		return "", errors.New("quantity has a leading zero")
+	}
+	if _, ok := new(big.Int).SetString(digits, 16); !ok {
+		return "", errors.New("quantity is not hexadecimal")
+	}
+	return Quantity("0x" + digits), nil
+}
+
+func (q Quantity) BigInt() (*big.Int, error) {
+	parsed, err := ParseQuantity(string(q))
+	if err != nil {
+		return nil, err
+	}
+	n, _ := new(big.Int).SetString(string(parsed)[2:], 16)
+	return n, nil
+}
+
+func (q Quantity) Uint64() (uint64, error) {
+	parsed, err := ParseQuantity(string(q))
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(string(parsed)[2:], 16, 64)
+}
 
 func ParseChainID(s string) (ChainID, error) {
 	v, err := canonicalQuantity(s)
@@ -56,6 +89,97 @@ func canonicalQuantity(s string) (string, error) {
 		return "", errors.New("is not a uint64 hex quantity")
 	}
 	return "0x" + digits, nil
+}
+
+type Transaction struct {
+	ChainID     ChainID  `json:"chain_id"`
+	BlockNumber uint64   `json:"block_number"`
+	BlockHash   Hash     `json:"block_hash"`
+	Hash        Hash     `json:"hash"`
+	Index       uint     `json:"index"`
+	From        Address  `json:"from"`
+	To          *Address `json:"to,omitempty"`
+	Nonce       uint64   `json:"nonce"`
+	Value       Quantity `json:"value"`
+	Input       []byte   `json:"input,omitempty"`
+}
+
+func (t Transaction) ID() string {
+	return fmt.Sprintf("evm:%s:transaction:%s:%s", t.ChainID, t.BlockHash, t.Hash)
+}
+
+func (t Transaction) Clone() Transaction {
+	t.Input = append([]byte(nil), t.Input...)
+	if t.To != nil {
+		to := *t.To
+		t.To = &to
+	}
+	return t
+}
+
+type Block struct {
+	ChainID      ChainID       `json:"chain_id"`
+	Number       uint64        `json:"number"`
+	Hash         Hash          `json:"hash"`
+	ParentHash   Hash          `json:"parent_hash"`
+	Timestamp    uint64        `json:"timestamp"`
+	Transactions []Transaction `json:"transactions,omitempty"`
+	Removed      bool          `json:"removed,omitempty"`
+	Confirmed    bool          `json:"confirmed,omitempty"`
+}
+
+func (b Block) ID() string {
+	return fmt.Sprintf("evm:%s:block:%s", b.ChainID, b.Hash)
+}
+
+func (b Block) Clone() Block {
+	transactions := b.Transactions
+	b.Transactions = make([]Transaction, len(transactions))
+	for i := range transactions {
+		b.Transactions[i] = transactions[i].Clone()
+	}
+	return b
+}
+
+type Receipt struct {
+	ChainID           ChainID  `json:"chain_id"`
+	BlockNumber       uint64   `json:"block_number"`
+	BlockHash         Hash     `json:"block_hash"`
+	TxHash            Hash     `json:"transaction_hash"`
+	TxIndex           uint     `json:"transaction_index"`
+	Success           bool     `json:"success"`
+	ContractAddress   *Address `json:"contract_address,omitempty"`
+	GasUsed           Quantity `json:"gas_used"`
+	EffectiveGasPrice Quantity `json:"effective_gas_price,omitempty"`
+	Logs              []Log    `json:"logs,omitempty"`
+}
+
+func (r Receipt) Clone() Receipt {
+	if r.ContractAddress != nil {
+		address := *r.ContractAddress
+		r.ContractAddress = &address
+	}
+	logs := r.Logs
+	r.Logs = make([]Log, len(logs))
+	for i := range logs {
+		r.Logs[i] = logs[i].Clone()
+	}
+	return r
+}
+
+type Account struct {
+	Address   Address  `json:"address"`
+	BlockHash Hash     `json:"block_hash"`
+	Balance   Quantity `json:"balance"`
+	Nonce     uint64   `json:"nonce"`
+	Code      []byte   `json:"code,omitempty"`
+}
+
+func (a Account) IsEOA() bool { return len(a.Code) == 0 }
+
+func (a Account) Clone() Account {
+	a.Code = append([]byte(nil), a.Code...)
+	return a
 }
 
 type Log struct {

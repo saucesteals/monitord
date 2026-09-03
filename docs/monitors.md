@@ -228,6 +228,43 @@ That journal makes corrections survive a disconnected WebSocket. A monitor
 that alerts immediately should remember which live logs actually emitted and
 return a correction only for those occurrences.
 
+Use `evm.Blocks` when the monitored addresses are discovered dynamically or a
+decision depends on transaction senders rather than statically filterable log
+topics:
+
+```go
+func main() {
+	monitord.Run(evm.Blocks[State]{
+		Name:            "candidate-transactions",
+		ExpectedChainID: evm.ChainID("0x1237"),
+		Confirmations:   3,
+		HTTPSecret:      robinhoodHTTP,
+		WSSSecret:       robinhoodWSS,
+		Handle:          handleBlock,
+	})
+}
+```
+
+`evm.Blocks` treats `newHeads` as a low-latency wakeup and fetches each announced
+canonical block with full transactions. Confirmed HTTP replay fetches bounded
+batches concurrently, then invokes the handler in block order and checkpoints
+each block atomically with its update. Live blocks are journaled until the
+configured confirmation depth; a fork is delivered in reverse order with
+`Block.Removed` (the removed record contains its block identity/header, while
+the monitor owns any inverse domain delta). `Confirmations` therefore bounds rollback exposure without
+delaying live delivery.
+
+The source deliberately does not fetch every transaction receipt. The handler
+selects relevant transactions from the block and calls
+`client.ReceiptFor` only for those transactions; the helper rejects receipts
+from a different fork or transaction position. `client.AccountAt` reads an
+address's balance, nonce, and code through EIP-1898 at an exact canonical block
+hash. `Transaction.Value` and
+receipt gas fields use `evm.Quantity`, which preserves arbitrary-size EVM
+integers and exposes `BigInt` and `Uint64` conversions. As with `evm.Events`,
+live and replay observations are inclusive, so state transitions must be
+idempotent by block or transaction identity.
+
 `solana.AddressEvents` uses QuickNode `transactionSubscribe` with vote and failed
 transactions excluded and the monitored address applied at the provider. Each
 notification already contains the complete transaction, so the live path does

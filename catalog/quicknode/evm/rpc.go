@@ -6,12 +6,43 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type rpcBlock struct {
+	Number       string           `json:"number"`
+	Hash         Hash             `json:"hash"`
+	ParentHash   Hash             `json:"parentHash"`
+	Timestamp    string           `json:"timestamp"`
+	Transactions []rpcTransaction `json:"transactions"`
+}
+type rpcBlockHeader struct {
 	Number     string `json:"number"`
 	Hash       Hash   `json:"hash"`
 	ParentHash Hash   `json:"parentHash"`
+}
+type rpcTransaction struct {
+	BlockNumber      string   `json:"blockNumber"`
+	BlockHash        Hash     `json:"blockHash"`
+	Hash             Hash     `json:"hash"`
+	TransactionIndex string   `json:"transactionIndex"`
+	From             Address  `json:"from"`
+	To               *Address `json:"to"`
+	Nonce            string   `json:"nonce"`
+	Value            string   `json:"value"`
+	Input            string   `json:"input"`
+}
+type rpcReceipt struct {
+	BlockNumber       string   `json:"blockNumber"`
+	BlockHash         Hash     `json:"blockHash"`
+	TransactionHash   Hash     `json:"transactionHash"`
+	TransactionIndex  string   `json:"transactionIndex"`
+	Status            string   `json:"status"`
+	ContractAddress   *Address `json:"contractAddress"`
+	GasUsed           string   `json:"gasUsed"`
+	EffectiveGasPrice string   `json:"effectiveGasPrice"`
+	Logs              []rpcLog `json:"logs"`
 }
 type rpcLog struct {
 	BlockNumber      string  `json:"blockNumber"`
@@ -32,23 +63,273 @@ func (c *Client) blockNumber(ctx context.Context) (uint64, error) {
 	}
 	return parseUintQuantity(q)
 }
-func (c *Client) blockByNumber(ctx context.Context, n uint64) (rpcBlock, error) {
-	var block rpcBlock
+func (c *Client) blockByNumber(ctx context.Context, n uint64) (rpcBlockHeader, error) {
+	var block rpcBlockHeader
 	err := c.call(ctx, "eth_getBlockByNumber", []any{fmt.Sprintf("0x%x", n), false}, &block)
 	if err == nil {
 		number, parseErr := parseUintQuantity(block.Number)
 		if parseErr != nil || number != n {
-			return rpcBlock{}, errors.New("quicknode: invalid block response")
+			return rpcBlockHeader{}, errors.New("quicknode: invalid block response")
 		}
 		if _, parseErr = ParseHash(string(block.Hash)); parseErr != nil {
-			return rpcBlock{}, parseErr
+			return rpcBlockHeader{}, parseErr
 		}
 		if _, parseErr = ParseHash(string(block.ParentHash)); parseErr != nil {
-			return rpcBlock{}, parseErr
+			return rpcBlockHeader{}, parseErr
 		}
 		return block, nil
 	}
-	return rpcBlock{}, err
+	return rpcBlockHeader{}, err
+}
+
+// BlockByNumber returns the canonical block at number with full transactions.
+func (c *Client) BlockByNumber(ctx context.Context, number uint64) (Block, error) {
+	var raw rpcBlock
+	if err := c.call(ctx, "eth_getBlockByNumber", []any{fmt.Sprintf("0x%x", number), true}, &raw); err != nil {
+		return Block{}, err
+	}
+	block, err := decodeRPCBlock(raw, c.ChainID())
+	if err != nil {
+		return Block{}, err
+	}
+	if block.Number != number {
+		return Block{}, errors.New("quicknode: block number does not match request")
+	}
+	return block, nil
+}
+
+// BlockByHash returns a block with full transactions from its immutable hash.
+func (c *Client) BlockByHash(ctx context.Context, hash Hash) (Block, error) {
+	if _, err := ParseHash(string(hash)); err != nil {
+		return Block{}, err
+	}
+	var raw rpcBlock
+	if err := c.call(ctx, "eth_getBlockByHash", []any{hash, true}, &raw); err != nil {
+		return Block{}, err
+	}
+	block, err := decodeRPCBlock(raw, c.ChainID())
+	if err != nil {
+		return Block{}, err
+	}
+	if block.Hash != hash {
+		return Block{}, errors.New("quicknode: block hash does not match request")
+	}
+	return block, nil
+}
+
+func (c *Client) blocksByNumber(ctx context.Context, from, to uint64, concurrency int) ([]Block, error) {
+	if to < from {
+		return nil, errors.New("quicknode: invalid block range")
+	}
+	if concurrency < 1 {
+		return nil, errors.New("quicknode: block fetch concurrency must be positive")
+	}
+	blocks := make([]Block, to-from+1)
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(concurrency)
+	for i := range blocks {
+		i := i
+		group.Go(func() error {
+			block, err := c.BlockByNumber(groupCtx, from+uint64(i))
+			if err == nil {
+				blocks[i] = block
+			}
+			return err
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	for i := 1; i < len(blocks); i++ {
+		if blocks[i].ParentHash != blocks[i-1].Hash {
+			return nil, errors.New("quicknode: block range is not a canonical chain")
+		}
+	}
+	return blocks, nil
+}
+
+// TransactionReceipt returns the receipt for hash and validates all embedded
+// block, transaction, address, quantity, and log fields.
+func (c *Client) TransactionReceipt(ctx context.Context, hash Hash) (Receipt, error) {
+	if _, err := ParseHash(string(hash)); err != nil {
+		return Receipt{}, err
+	}
+	var raw rpcReceipt
+	if err := c.call(ctx, "eth_getTransactionReceipt", []any{hash}, &raw); err != nil {
+		return Receipt{}, err
+	}
+	receipt, err := decodeRPCReceipt(raw, c.ChainID())
+	if err != nil {
+		return Receipt{}, err
+	}
+	if receipt.TxHash != hash {
+		return Receipt{}, errors.New("quicknode: receipt hash does not match request")
+	}
+	return receipt, nil
+}
+
+// ReceiptFor returns tx's receipt and rejects a response from another block or
+// transaction position. This is the preferred helper for fork-sensitive logic.
+func (c *Client) ReceiptFor(ctx context.Context, tx Transaction) (Receipt, error) {
+	if tx.ChainID != c.ChainID() {
+		return Receipt{}, errors.New("quicknode: transaction belongs to another chain")
+	}
+	receipt, err := c.TransactionReceipt(ctx, tx.Hash)
+	if err != nil {
+		return Receipt{}, err
+	}
+	if receipt.BlockHash != tx.BlockHash || receipt.BlockNumber != tx.BlockNumber || receipt.TxIndex != tx.Index {
+		return Receipt{}, errors.New("quicknode: receipt does not match transaction block")
+	}
+	return receipt, nil
+}
+
+// AccountAt reads balance, nonce, and code from the exact canonical block hash.
+func (c *Client) AccountAt(ctx context.Context, address Address, blockHash Hash) (Account, error) {
+	if _, err := ParseAddress(string(address)); err != nil {
+		return Account{}, err
+	}
+	if _, err := ParseHash(string(blockHash)); err != nil {
+		return Account{}, err
+	}
+	block := map[string]any{"blockHash": blockHash, "requireCanonical": true}
+	var balanceRaw, nonceRaw, codeRaw string
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error { return c.call(groupCtx, "eth_getBalance", []any{address, block}, &balanceRaw) })
+	group.Go(func() error { return c.call(groupCtx, "eth_getTransactionCount", []any{address, block}, &nonceRaw) })
+	group.Go(func() error { return c.call(groupCtx, "eth_getCode", []any{address, block}, &codeRaw) })
+	if err := group.Wait(); err != nil {
+		return Account{}, err
+	}
+	balance, err := ParseQuantity(balanceRaw)
+	if err != nil {
+		return Account{}, err
+	}
+	nonce, err := parseUintQuantity(nonceRaw)
+	if err != nil {
+		return Account{}, err
+	}
+	code, err := decodeHex(codeRaw)
+	if err != nil {
+		return Account{}, err
+	}
+	return Account{Address: address, BlockHash: blockHash, Balance: balance, Nonce: nonce, Code: code}, nil
+}
+
+func decodeRPCBlock(raw rpcBlock, chain ChainID) (Block, error) {
+	number, err := parseUintQuantity(raw.Number)
+	if err != nil {
+		return Block{}, err
+	}
+	timestamp, err := parseUintQuantity(raw.Timestamp)
+	if err != nil {
+		return Block{}, err
+	}
+	if _, err = ParseHash(string(raw.Hash)); err != nil {
+		return Block{}, err
+	}
+	if _, err = ParseHash(string(raw.ParentHash)); err != nil {
+		return Block{}, err
+	}
+	block := Block{ChainID: chain, Number: number, Hash: raw.Hash, ParentHash: raw.ParentHash, Timestamp: timestamp, Transactions: make([]Transaction, len(raw.Transactions))}
+	for i := range raw.Transactions {
+		tx, decodeErr := decodeRPCTransaction(raw.Transactions[i], chain)
+		if decodeErr != nil {
+			return Block{}, decodeErr
+		}
+		if tx.BlockNumber != number || tx.BlockHash != raw.Hash || tx.Index != uint(i) {
+			return Block{}, errors.New("quicknode: transaction does not belong to containing block")
+		}
+		block.Transactions[i] = tx
+	}
+	return block, nil
+}
+
+func decodeRPCTransaction(raw rpcTransaction, chain ChainID) (Transaction, error) {
+	blockNumber, err := parseUintQuantity(raw.BlockNumber)
+	if err != nil {
+		return Transaction{}, err
+	}
+	index, err := parseUintQuantity(raw.TransactionIndex)
+	if err != nil {
+		return Transaction{}, err
+	}
+	nonce, err := parseUintQuantity(raw.Nonce)
+	if err != nil {
+		return Transaction{}, err
+	}
+	value, err := ParseQuantity(raw.Value)
+	if err != nil {
+		return Transaction{}, err
+	}
+	input, err := decodeHex(raw.Input)
+	if err != nil {
+		return Transaction{}, err
+	}
+	if _, err = ParseHash(string(raw.BlockHash)); err != nil {
+		return Transaction{}, err
+	}
+	if _, err = ParseHash(string(raw.Hash)); err != nil {
+		return Transaction{}, err
+	}
+	if _, err = ParseAddress(string(raw.From)); err != nil {
+		return Transaction{}, err
+	}
+	if raw.To != nil {
+		if _, err = ParseAddress(string(*raw.To)); err != nil {
+			return Transaction{}, err
+		}
+	}
+	return Transaction{ChainID: chain, BlockNumber: blockNumber, BlockHash: raw.BlockHash, Hash: raw.Hash, Index: uint(index), From: raw.From, To: raw.To, Nonce: nonce, Value: value, Input: input}, nil
+}
+
+func decodeRPCReceipt(raw rpcReceipt, chain ChainID) (Receipt, error) {
+	blockNumber, err := parseUintQuantity(raw.BlockNumber)
+	if err != nil {
+		return Receipt{}, err
+	}
+	index, err := parseUintQuantity(raw.TransactionIndex)
+	if err != nil {
+		return Receipt{}, err
+	}
+	status, err := parseUintQuantity(raw.Status)
+	if err != nil || status > 1 {
+		return Receipt{}, errors.New("quicknode: invalid receipt status")
+	}
+	gasUsed, err := ParseQuantity(raw.GasUsed)
+	if err != nil {
+		return Receipt{}, err
+	}
+	var gasPrice Quantity
+	if raw.EffectiveGasPrice != "" {
+		gasPrice, err = ParseQuantity(raw.EffectiveGasPrice)
+		if err != nil {
+			return Receipt{}, err
+		}
+	}
+	if _, err = ParseHash(string(raw.BlockHash)); err != nil {
+		return Receipt{}, err
+	}
+	if _, err = ParseHash(string(raw.TransactionHash)); err != nil {
+		return Receipt{}, err
+	}
+	if raw.ContractAddress != nil {
+		if _, err = ParseAddress(string(*raw.ContractAddress)); err != nil {
+			return Receipt{}, err
+		}
+	}
+	receipt := Receipt{ChainID: chain, BlockNumber: blockNumber, BlockHash: raw.BlockHash, TxHash: raw.TransactionHash, TxIndex: uint(index), Success: status == 1, ContractAddress: raw.ContractAddress, GasUsed: gasUsed, EffectiveGasPrice: gasPrice, Logs: make([]Log, len(raw.Logs))}
+	for i := range raw.Logs {
+		log, decodeErr := decodeRPCLog(raw.Logs[i], chain)
+		if decodeErr != nil {
+			return Receipt{}, decodeErr
+		}
+		if log.BlockNumber != blockNumber || log.BlockHash != raw.BlockHash || log.TxHash != raw.TransactionHash || log.TxIndex != uint(index) {
+			return Receipt{}, errors.New("quicknode: receipt log does not belong to receipt")
+		}
+		receipt.Logs[i] = log
+	}
+	return receipt, nil
 }
 
 // IsCanonicalBlock reports whether hash is currently canonical at number.

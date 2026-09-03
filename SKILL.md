@@ -102,6 +102,16 @@ EIP-1898 for state reads and stable `log.ID()` identities for emitted events.
 Use `client.ERC20Metadata(ctx, token, log.BlockHash)` for exact-fork ERC-20
 name, symbol, decimals, and total supply; optional ERC-20 fields may be empty.
 
+Use `evm.Blocks` when relevant senders are discovered dynamically or matching
+depends on transaction envelopes rather than static log topics. WebSocket heads
+wake the live path immediately, while concurrent HTTP block replay repairs gaps
+in canonical order. The handler receives full transactions and selects the few
+that need `client.ReceiptFor`; do not fetch every receipt in a block. Use
+`client.AccountAt` with the parent block hash for exact-fork balance, nonce, and
+code reads. `Confirmations` bounds the live reorganization journal and HTTP
+replay edge without delaying live delivery. Handle inclusive live/replay
+observations idempotently and reverse state when `Block.Removed` is set.
+
 `solana.AddressEvents` uses QuickNode `transactionSubscribe` with the monitored
 account applied at the provider. The live notification contains the full
 transaction; `MatchLogs` narrows it locally before the handler runs. Finalized
