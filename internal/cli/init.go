@@ -1,0 +1,37 @@
+package cli
+
+import (
+	"fmt"
+	"io"
+
+	"github.com/saucesteals/monitord/internal/config"
+	"github.com/saucesteals/monitord/internal/storage"
+	"github.com/spf13/cobra"
+)
+
+func (c *CLI) newInitCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "init",
+		Short: "Initialize the monitord root",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return c.init(cmd.OutOrStdout())
+		},
+	}
+}
+
+func (c *CLI) init(out io.Writer) error {
+	paths, err := config.Init(c.root)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(paths.DBPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+
+	fmt.Fprintf(out, "initialized %s\n", paths.Root)
+
+	return nil
+}

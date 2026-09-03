@@ -1,481 +1,376 @@
 package monitord
 
 import (
+	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
+	"io"
 	"time"
 )
 
-// Protocol is the monitord worker wire version. The daemon refuses artifacts
-// built against a different version.
-//
-// v4 removes route names from the worker handshake. Deliveries are daemon-owned
-// monitor configuration, so existing artifacts must be redeployed.
-const Protocol = 4
+const ProtocolMajor = 5
+const MaxFrameBytes = 4 << 20
+const MaxEventsPerTransaction = 256
+const MaxCheckpointsPerTransaction = 128
+const MaxStateBytes = 2 << 20
+const MaxCheckpointBytes = 256 << 10
+const MaxOperationalErrorBytes = 16 << 10
 
-// Executable flags implementing the monitord worker contract.
-const (
-	// FlagDescribe asks a monitor to report its definition and canonical state.
-	FlagDescribe = "--monitord-describe"
-	// FlagWorker starts the long-lived worker loop.
-	FlagWorker = "--monitord-worker"
-)
-
-// ResultStatus is the outcome of a single monitor tick.
-type ResultStatus string
-
-const (
-	// StatusSuccess marks a healthy tick.
-	StatusSuccess ResultStatus = "success"
-	// StatusFailure marks a failed tick.
-	StatusFailure ResultStatus = "failure"
-)
-
-// LogLevel is the severity of a structured log line.
-type LogLevel string
-
-const (
-	// LogDebug is verbose diagnostic output.
-	LogDebug LogLevel = "debug"
-	// LogInfo is normal operational output.
-	LogInfo LogLevel = "info"
-	// LogWarn is a warning that does not fail the tick by itself.
-	LogWarn LogLevel = "warn"
-	// LogError is an error-level log line.
-	LogError LogLevel = "error"
-)
-
-// Severity is the importance of a monitor event.
-type Severity string
-
-const (
-	// SeverityInfo is an informational event.
-	SeverityInfo Severity = "info"
-	// SeverityWarn is a warning event.
-	SeverityWarn Severity = "warn"
-	// SeverityCritical is a high-importance event.
-	SeverityCritical Severity = "critical"
-)
-
-// MonitorName identifies a deployed monitor.
-type MonitorName string
-
-// Definition describes a monitor to monitord at deploy time.
-type Definition struct {
-	Name        string `json:"name,omitempty"`
-	Description string `json:"description,omitempty"`
-	// Clients is the number of HTTP clients the monitor wants. The daemon
-	// assigns one proxy per client from the monitor's network profile.
-	Clients int `json:"clients,omitempty"`
-	// Persistent disables TTL expiry for this monitor.
-	Persistent bool `json:"persistent,omitempty"`
-	// FailureThreshold is the number of consecutive failed ticks required before
-	// the daemon sends a failure alert. One preserves immediate alerting.
-	FailureThreshold int `json:"failure_threshold,omitempty"`
-	// Protocol is set by the SDK and verified by the daemon.
-	Protocol int `json:"protocol"`
-	// StateVersion is set by the SDK from the monitor's state type.
-	StateVersion int `json:"state_version"`
+type ProtocolVersion struct {
+	Major int `json:"major"`
+	Minor int `json:"minor"`
+}
+type DeploymentPolicy struct {
+	Health HealthPolicy `json:"health"`
+	Events EventPolicy  `json:"events"`
+}
+type HealthPolicy struct {
+	FailureThreshold int `json:"failure_threshold"`
+}
+type EventPolicy struct {
+	MaxPerTransaction int           `json:"max_per_transaction"`
+	Retention         time.Duration `json:"retention"`
 }
 
-// Network is the daemon-assigned network runtime for one worker.
-type Network struct {
-	// Proxies are the proxy URLs assigned to this worker, one per client.
-	// Empty means direct connections.
-	Proxies []string `json:"proxies,omitempty"`
+func (p DeploymentPolicy) Validate() error {
+	if p.Health.FailureThreshold < 1 {
+		return errors.New("health failure threshold must be positive")
+	}
+	if p.Events.MaxPerTransaction < 1 || p.Events.MaxPerTransaction > MaxEventsPerTransaction {
+		return fmt.Errorf("events max per transaction must be between 1 and %d", MaxEventsPerTransaction)
+	}
+	if p.Events.Retention < time.Millisecond {
+		return errors.New("events retention must be at least 1ms")
+	}
+	return nil
 }
 
-// Hello is the first message the daemon sends to a worker.
 type Hello struct {
-	Monitor MonitorName `json:"monitor"`
-	// Dir is the monitor's source directory and working directory, so a
-	// monitor can read config or data files that live beside its source.
-	Dir     string  `json:"dir,omitempty"`
-	Network Network `json:"network"`
+	Version        ProtocolVersion              `json:"version"`
+	DeploymentID   string                       `json:"deployment_id"`
+	DeploymentName string                       `json:"deployment_name"`
+	Generation     uint64                       `json:"generation"`
+	WorkerToken    string                       `json:"worker_token"`
+	ArtifactHash   string                       `json:"artifact_hash"`
+	ConfigHash     string                       `json:"config_hash"`
+	StateRevision  int64                        `json:"state_revision"`
+	State          json.RawMessage              `json:"state"`
+	Checkpoints    map[string]json.RawMessage   `json:"checkpoints,omitempty"`
+	Secrets        map[string]map[string]string `json:"secrets,omitempty"`
+	Policy         DeploymentPolicy             `json:"policy"`
 }
-
-// Tick asks a worker to perform one scheduled run.
-type Tick struct {
-	RunID     string          `json:"run_id"`
-	StartedAt time.Time       `json:"started_at"`
-	Deadline  time.Time       `json:"deadline,omitempty"`
-	State     json.RawMessage `json:"state,omitempty"`
-	// Revision is the daemon's state revision the tick was built from.
-	Revision int64 `json:"revision"`
+type Start struct {
+	Plan PlanDescription `json:"plan"`
+	Once bool            `json:"once,omitempty"`
 }
-
-// InboundType identifies a daemon-to-worker message.
-type InboundType string
-
-const (
-	// InboundHello carries worker runtime configuration.
-	InboundHello InboundType = "hello"
-	// InboundTick carries one scheduled run.
-	InboundTick InboundType = "tick"
-)
-
-// Inbound is one framed daemon-to-worker message.
-type Inbound struct {
-	Type  InboundType `json:"type"`
-	Hello *Hello      `json:"hello,omitempty"`
-	Tick  *Tick       `json:"tick,omitempty"`
+type Stop struct {
+	Reason   string `json:"reason,omitempty"`
+	Deadline string `json:"deadline,omitempty"`
 }
-
-// OutboundType identifies a worker-to-daemon message.
-type OutboundType string
-
-const (
-	// OutboundReady acknowledges a successful handshake.
-	OutboundReady OutboundType = "ready"
-	// OutboundLog carries an incremental structured log line.
-	OutboundLog OutboundType = "log"
-	// OutboundEvent carries a notification event to deliver immediately.
-	OutboundEvent OutboundType = "event"
-	// OutboundResult carries the final result for one tick.
-	OutboundResult OutboundType = "result"
-)
-
-// Ready acknowledges that a worker accepted its runtime configuration.
-type Ready struct {
-	Clients int `json:"clients"`
+type TransactionAck struct {
+	DeploymentID   string `json:"deployment_id"`
+	Generation     uint64 `json:"generation"`
+	Sequence       uint64 `json:"sequence"`
+	PayloadHash    string `json:"payload_hash"`
+	ResultRevision int64  `json:"result_revision"`
+	Status         string `json:"status"`
 }
-
-// Log is an incremental structured log line.
-type Log struct {
-	Level   LogLevel  `json:"level"`
-	Message string    `json:"message"`
-	Time    time.Time `json:"time"`
+type DaemonFrame struct {
+	Type  string          `json:"type"`
+	Hello *Hello          `json:"hello,omitempty"`
+	Start *Start          `json:"start,omitempty"`
+	Ack   *TransactionAck `json:"ack,omitempty"`
+	Stop  *Stop           `json:"stop,omitempty"`
 }
-
-// Field is one labelled value shown alongside a notification.
-type Field struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
-	// Inline packs the field beside its neighbours rather than on its own row.
-	Inline bool `json:"inline,omitempty"`
+type TransactionFrame struct {
+	DeploymentID      string                     `json:"deployment_id"`
+	Generation        uint64                     `json:"generation"`
+	WorkerToken       string                     `json:"worker_token"`
+	Sequence          uint64                     `json:"sequence"`
+	BaseStateRevision int64                      `json:"base_state_revision"`
+	NextState         json.RawMessage            `json:"next_state"`
+	Checkpoints       map[string]json.RawMessage `json:"checkpoints,omitempty"`
+	Events            []Event                    `json:"events,omitempty"`
+	PayloadHash       string                     `json:"payload_hash"`
 }
-
-// Author is the small attribution line rendered above an event's title.
-type Author struct {
-	Name    string `json:"name,omitempty"`
-	URL     string `json:"url,omitempty"`
-	IconURL string `json:"icon_url,omitempty"`
+type MonitorFrame struct {
+	Info  Info            `json:"info"`
+	Plan  PlanDescription `json:"plan"`
+	State json.RawMessage `json:"state"`
 }
-
-// Mentions selects who a Discord event pings. A nil event Mentions field
-// inherits the delivery's YAML mentions; a non-nil empty value sends no ping.
-type Mentions struct {
-	Users    []string `json:"users,omitempty"`
-	Roles    []string `json:"roles,omitempty"`
-	Everyone bool     `json:"everyone,omitempty"`
-	Here     bool     `json:"here,omitempty"`
-}
-
-// Validate reports whether every mention target is a Discord snowflake.
-func (m Mentions) Validate() error {
-	for _, id := range m.Users {
-		if !isSnowflake(id) {
-			return fmt.Errorf("invalid mention user %q", id)
-		}
-	}
-	for _, id := range m.Roles {
-		if !isSnowflake(id) {
-			return fmt.Errorf("invalid mention role %q", id)
-		}
-	}
-
-	return nil
-}
-
-// Event is one notification a monitor emits during a tick. It maps directly onto
-// a Discord embed and is delivered on its own the moment it is emitted,
-// independent of the tick's final result. Build it as a plain struct literal.
-type Event struct {
-	// ID is the event's stable identity. Repeats of the same ID are suppressed
-	// for the dedupe window and recorded as one alert history entry.
-	ID string `json:"id"`
-	// Mentions overrides the delivery's YAML mentions for this event. Nil
-	// inherits the delivery default; an empty value explicitly sends no ping.
-	Mentions *Mentions `json:"mentions,omitempty"`
-	// Severity is a shortcut for the accent colour. Color overrides it.
-	Severity Severity `json:"severity,omitempty"`
-	// Color is an explicit accent as 0xRRGGBB. Zero derives it from severity.
-	Color int    `json:"color,omitempty"`
-	Title string `json:"title"`
-	// Message is a compact notification preview. Direct Discord deliveries put
-	// it in the top-level message content, ahead of any configured mention.
-	Message   string `json:"message,omitempty"`
-	Summary   string `json:"summary,omitempty"`
-	Details   string `json:"details,omitempty"`
-	URL       string `json:"url,omitempty"`
-	Image     string `json:"image,omitempty"`
-	Thumbnail string `json:"thumbnail,omitempty"`
-	Author    Author `json:"author,omitempty"`
-	Footer    string `json:"footer,omitempty"`
-	// FooterIcon is a small icon shown beside the footer text.
-	FooterIcon string `json:"footer_icon,omitempty"`
-	// Fields are labelled values rendered beside the event.
-	Fields []Field   `json:"fields,omitempty"`
-	Time   time.Time `json:"time"`
-}
-
-// Result is the health verdict for one monitor tick. Notifications are emitted
-// as events during the tick; the result only reports whether the check ran and
-// whether the watched thing is healthy. The daemon pages on failure and
-// recovery from the status alone.
-type Result struct {
-	Status  ResultStatus `json:"status"`
-	Summary string       `json:"summary,omitempty"`
-	Details string       `json:"details,omitempty"`
-	// State is the monitor state after this tick, set by the SDK when the
-	// monitor saved state. Nil means unchanged.
-	State json.RawMessage `json:"state,omitempty"`
-	// Revision is the state revision this tick was based on.
-	Revision int64 `json:"revision,omitempty"`
-}
-
-// Outbound is one framed worker-to-daemon message.
-type Outbound struct {
-	RunID  string       `json:"run_id,omitempty"`
-	Type   OutboundType `json:"type"`
-	Ready  *Ready       `json:"ready,omitempty"`
-	Log    *Log         `json:"log,omitempty"`
-	Event  *Event       `json:"event,omitempty"`
-	Result *Result      `json:"result,omitempty"`
-}
-
-// Describe is what a monitor reports for FlagDescribe.
-type Describe struct {
-	Definition Definition      `json:"definition"`
-	State      json.RawMessage `json:"state"`
-}
-
-// DescribeInput is the optional stored state piped to FlagDescribe on stdin.
 type DescribeInput struct {
-	State   json.RawMessage `json:"state,omitempty"`
-	Version int             `json:"version,omitempty"`
+	State json.RawMessage `json:"state,omitempty"`
+}
+type ReadyFrame struct {
+	Generation uint64 `json:"generation"`
+}
+type RunFrame struct {
+	Generation uint64        `json:"generation"`
+	Status     string        `json:"status"`
+	Duration   time.Duration `json:"duration"`
+	Error      string        `json:"error,omitempty"`
+}
+type StoppedFrame struct {
+	Generation         uint64 `json:"generation"`
+	Clean              bool   `json:"clean"`
+	Error              string `json:"error,omitempty"`
+	RunFailureReported bool   `json:"run_failure_reported,omitempty"`
+}
+type WorkerFrame struct {
+	Type        string            `json:"type"`
+	Monitor     *MonitorFrame     `json:"monitor,omitempty"`
+	Ready       *ReadyFrame       `json:"ready,omitempty"`
+	Run         *RunFrame         `json:"run,omitempty"`
+	Transaction *TransactionFrame `json:"transaction,omitempty"`
+	Stopped     *StoppedFrame     `json:"stopped,omitempty"`
 }
 
-// Success returns a successful result.
-func Success(summary string) Result {
-	return Result{
-		Status:  StatusSuccess,
-		Summary: summary,
+func DecodeDaemonFrame(r io.Reader) (DaemonFrame, error) {
+	var v DaemonFrame
+	if err := strictDecode(r, &v); err != nil {
+		return v, err
 	}
+	return v, v.Validate()
 }
-
-// Failure returns a failed result. The daemon pages on the failure edge.
-func Failure(summary string) Result {
-	return Result{
-		Status:  StatusFailure,
-		Summary: summary,
+func DecodeWorkerFrame(r io.Reader) (WorkerFrame, error) {
+	var v WorkerFrame
+	if err := strictDecode(r, &v); err != nil {
+		return v, err
 	}
+	return v, v.Validate()
 }
-
-// Failuref returns a failed result using a formatted summary.
-func Failuref(format string, args ...any) Result {
-	return Failure(fmt.Sprintf(format, args...))
-}
-
-// Successf returns a successful result using a formatted summary.
-func Successf(format string, args ...any) Result {
-	return Success(fmt.Sprintf(format, args...))
-}
-
-// WithDefaults returns d with zero-value protocol fields filled in.
-func (d Definition) WithDefaults() Definition {
-	if d.Clients <= 0 {
-		d.Clients = 1
-	}
-	if d.Protocol == 0 {
-		d.Protocol = Protocol
-	}
-	if d.FailureThreshold == 0 {
-		d.FailureThreshold = 3
-	}
-
-	return d
-}
-
-// Validate reports whether the definition is usable by the daemon.
-func (d Definition) Validate() error {
-	if d.Clients <= 0 {
-		return fmt.Errorf("monitor clients must be positive, got %d", d.Clients)
-	}
-	if d.Protocol != Protocol {
-		return fmt.Errorf("monitor speaks protocol %d, daemon speaks %d", d.Protocol, Protocol)
-	}
-	if d.FailureThreshold <= 0 {
-		return fmt.Errorf("failure threshold must be positive, got %d", d.FailureThreshold)
-	}
-
-	return nil
-}
-
-// Validate reports whether the hello message is usable by a worker.
-func (h Hello) Validate() error {
-	if h.Monitor == "" {
-		return errors.New("hello monitor name is required")
-	}
-	return nil
-}
-
-// Validate reports whether the tick is usable by a worker.
-func (t Tick) Validate() error {
-	if t.RunID == "" {
-		return errors.New("tick run id is required")
-	}
-	if t.StartedAt.IsZero() {
-		return errors.New("tick started_at is required")
-	}
-
-	return nil
-}
-
-// Validate reports whether the inbound message is internally consistent.
-func (i Inbound) Validate() error {
-	switch i.Type {
-	case InboundHello:
-		if i.Hello == nil {
-			return errors.New("hello message missing hello payload")
-		}
-
-		return i.Hello.Validate()
-	case InboundTick:
-		if i.Tick == nil {
-			return errors.New("tick message missing tick payload")
-		}
-
-		return i.Tick.Validate()
-	default:
-		return fmt.Errorf("unsupported inbound message type %q", i.Type)
-	}
-}
-
-// Validate reports whether the outbound message is internally consistent.
-func (o Outbound) Validate() error {
-	switch o.Type {
-	case OutboundReady:
-		if o.Ready == nil {
-			return errors.New("ready message missing ready payload")
-		}
-
-		return nil
-	case OutboundLog:
-		if o.Log == nil {
-			return errors.New("log message missing log payload")
-		}
-
-		return o.Log.Validate()
-	case OutboundEvent:
-		if o.Event == nil {
-			return errors.New("event message missing event payload")
-		}
-
-		return o.Event.Validate()
-	case OutboundResult:
-		if o.Result == nil {
-			return errors.New("result message missing result payload")
-		}
-
-		return o.Result.Validate()
-	default:
-		return fmt.Errorf("unsupported outbound message type %q", o.Type)
-	}
-}
-
-// Validate reports whether the log line is usable.
-func (l Log) Validate() error {
-	if err := l.Level.Validate(); err != nil {
+func strictDecode(r io.Reader, v any) error {
+	limited := io.LimitReader(r, MaxFrameBytes+1)
+	raw, err := io.ReadAll(limited)
+	if err != nil {
 		return err
 	}
-	if l.Message == "" {
-		return errors.New("log message is required")
+	if len(raw) > MaxFrameBytes {
+		return errors.New("protocol frame exceeds maximum size")
 	}
-
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if err = d.Decode(v); err != nil {
+		return fmt.Errorf("decode protocol frame: %w", err)
+	}
+	if d.Decode(&struct{}{}) != io.EOF {
+		return errors.New("protocol frame contains trailing data")
+	}
 	return nil
 }
-
-// Validate checks only the structural wire fields. Content problems — a blank
-// title, an empty field, a malformed URL — are not rejected here: the renderer
-// substitutes a visible per-field fallback so a broken event still delivers and
-// flags itself inline rather than vanishing.
-func (i Event) Validate() error {
-	if strings.TrimSpace(i.ID) == "" {
-		return errors.New("event id is required")
+func (i DaemonFrame) Validate() error {
+	n := 0
+	for _, p := range []any{i.Hello, i.Start, i.Ack, i.Stop} {
+		if !isNil(p) {
+			n++
+		}
 	}
-	if i.Mentions != nil {
-		if err := i.Mentions.Validate(); err != nil {
+	if n != 1 {
+		return errors.New("inbound frame must contain exactly one payload")
+	}
+	switch i.Type {
+	case "hello":
+		if i.Hello == nil {
+			return errors.New("hello payload missing")
+		}
+		if i.Hello.Version.Major != ProtocolMajor {
+			return fmt.Errorf("unsupported protocol major %d", i.Hello.Version.Major)
+		}
+		if i.Hello.Version.Minor != 0 {
+			return fmt.Errorf("unsupported protocol minor %d", i.Hello.Version.Minor)
+		}
+		if i.Hello.DeploymentID == "" || i.Hello.Generation == 0 || i.Hello.WorkerToken == "" {
+			return errors.New("hello identity, generation, and token are required")
+		}
+		if len(i.Hello.State) == 0 || !json.Valid(i.Hello.State) {
+			return errors.New("hello state must be valid JSON")
+		}
+		if len(i.Hello.State) > MaxStateBytes || len(i.Hello.DeploymentID) > 128 || len(i.Hello.DeploymentName) > 128 || len(i.Hello.WorkerToken) > 512 {
+			return errors.New("hello field exceeds protocol limit")
+		}
+		if len(i.Hello.Checkpoints) > MaxCheckpointsPerTransaction {
+			return errors.New("hello has too many checkpoints")
+		}
+		for source, raw := range i.Hello.Checkpoints {
+			if source == "" || len(source) > 128 || len(raw) > MaxCheckpointBytes || !json.Valid(raw) {
+				return fmt.Errorf("invalid hello checkpoint %q", source)
+			}
+		}
+		if err := i.Hello.Policy.Validate(); err != nil {
+			return fmt.Errorf("invalid deployment policy: %w", err)
+		}
+	case "start":
+		if i.Start == nil {
+			return errors.New("start payload missing")
+		}
+		if err := i.Start.Plan.Validate(); err != nil {
+			return fmt.Errorf("invalid start plan: %w", err)
+		}
+	case "ack":
+		if i.Ack == nil {
+			return errors.New("ack payload missing")
+		}
+		if i.Ack.DeploymentID == "" || i.Ack.Generation == 0 || i.Ack.Sequence == 0 || i.Ack.ResultRevision < 0 || !validSHA256(i.Ack.PayloadHash) || (i.Ack.Status != "accepted" && i.Ack.Status != "replayed") {
+			return errors.New("invalid transaction ACK")
+		}
+	case "stop":
+		if i.Stop == nil {
+			return errors.New("stop payload missing")
+		}
+		if i.Stop.Deadline == "" {
+			return errors.New("stop deadline is required")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, i.Stop.Deadline); err != nil {
+			return errors.New("stop deadline is invalid")
+		}
+	default:
+		return fmt.Errorf("unsupported inbound frame type %q", i.Type)
+	}
+	return nil
+}
+func (o WorkerFrame) Validate() error {
+	n := 0
+	for _, p := range []any{o.Monitor, o.Ready, o.Run, o.Transaction, o.Stopped} {
+		if !isNil(p) {
+			n++
+		}
+	}
+	if n != 1 {
+		return errors.New("outbound frame must contain exactly one payload")
+	}
+	switch o.Type {
+	case "monitor":
+		if o.Monitor == nil {
+			return errors.New("monitor payload missing")
+		}
+		if err := o.Monitor.Info.Validate(); err != nil {
 			return err
 		}
+		if err := o.Monitor.Plan.Validate(); err != nil {
+			return err
+		}
+		if len(o.Monitor.State) > 0 && (len(o.Monitor.State) > MaxStateBytes || !json.Valid(o.Monitor.State)) {
+			return errors.New("monitor state is invalid or too large")
+		}
+	case "ready":
+		if o.Ready == nil {
+			return errors.New("ready payload missing")
+		}
+		if o.Ready.Generation == 0 {
+			return errors.New("ready generation is required")
+		}
+	case "run":
+		if o.Run == nil {
+			return errors.New("run payload missing")
+		}
+		if o.Run.Generation == 0 || o.Run.Duration < 0 || (o.Run.Status != "success" && o.Run.Status != "failure") {
+			return errors.New("invalid run outcome")
+		}
+		if (o.Run.Status == "failure") != (o.Run.Error != "") || len(o.Run.Error) > MaxOperationalErrorBytes {
+			return errors.New("run error does not match status or exceeds limit")
+		}
+	case "transaction":
+		if o.Transaction == nil {
+			return errors.New("transaction payload missing")
+		}
+		t := o.Transaction
+		if t.DeploymentID == "" || t.Generation == 0 || t.Sequence == 0 || t.WorkerToken == "" || !validSHA256(t.PayloadHash) || t.BaseStateRevision < 0 || len(t.NextState) == 0 || !json.Valid(t.NextState) {
+			return errors.New("transaction identity, sequence, token, and hash are required")
+		}
+		if len(t.NextState) > MaxStateBytes {
+			return errors.New("transaction state exceeds limit")
+		}
+		if len(t.Checkpoints) > MaxCheckpointsPerTransaction {
+			return errors.New("transaction has too many checkpoints")
+		}
+		for source, raw := range t.Checkpoints {
+			if source == "" || len(source) > 128 || len(raw) > MaxCheckpointBytes || !json.Valid(raw) {
+				return fmt.Errorf("invalid transaction checkpoint %q", source)
+			}
+		}
+		if len(t.Events) > MaxEventsPerTransaction {
+			return errors.New("transaction has too many events")
+		}
+		for index, event := range t.Events {
+			if err := event.Validate(); err != nil {
+				return fmt.Errorf("event %d: %w", index, err)
+			}
+		}
+	case "stopped":
+		if o.Stopped == nil {
+			return errors.New("stopped payload missing")
+		}
+		if o.Stopped.Generation == 0 {
+			return errors.New("stopped generation is required")
+		}
+		if o.Stopped.Clean && (o.Stopped.Error != "" || o.Stopped.RunFailureReported) {
+			return errors.New("clean stop cannot contain an error")
+		}
+		if o.Stopped.RunFailureReported && o.Stopped.Error == "" {
+			return errors.New("reported run failure requires a stop error")
+		}
+		if len(o.Stopped.Error) > MaxOperationalErrorBytes {
+			return errors.New("stopped error exceeds limit")
+		}
+	default:
+		return fmt.Errorf("unsupported outbound frame type %q", o.Type)
 	}
-	if i.Severity != "" {
-		return i.Severity.Validate()
-	}
-
 	return nil
 }
-
-func isSnowflake(value string) bool {
-	if len(value) < 5 || len(value) > 25 {
+func validSHA256(value string) bool {
+	if len(value) != 64 {
 		return false
 	}
-	for _, r := range value {
-		if r < '0' || r > '9' {
-			return false
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func (p PlanDescription) Validate() error {
+	if p.Timeout < 0 {
+		return errors.New("plan timeout cannot be negative")
+	}
+	if len(p.Secrets) > 128 {
+		return errors.New("plan has too many secret refs")
+	}
+	if _, err := normalizeSecretRefs(p.Secrets); err != nil {
+		return err
+	}
+	switch p.Kind {
+	case "continuous":
+		if p.Interval != 0 {
+			return errors.New("invalid continuous plan shape")
 		}
-	}
-
-	return true
-}
-
-// Validate reports whether the result is usable.
-func (r Result) Validate() error {
-	return r.Status.Validate()
-}
-
-// Validate reports whether the result status is supported.
-func (s ResultStatus) Validate() error {
-	switch s {
-	case StatusSuccess, StatusFailure:
-		return nil
-	case "":
-		return errors.New("result status is required")
+	case "every":
+		if p.Interval <= 0 {
+			return errors.New("invalid polling plan shape")
+		}
 	default:
-		return fmt.Errorf("unsupported result status %q", s)
+		return fmt.Errorf("unsupported plan kind %q", p.Kind)
 	}
+	return nil
 }
-
-// Validate reports whether the log level is supported.
-func (l LogLevel) Validate() error {
-	switch l {
-	case LogDebug, LogInfo, LogWarn, LogError:
-		return nil
-	default:
-		return fmt.Errorf("unsupported log level %q", l)
+func isNil(v any) bool {
+	switch x := v.(type) {
+	case *Hello:
+		return x == nil
+	case *Start:
+		return x == nil
+	case *TransactionAck:
+		return x == nil
+	case *Stop:
+		return x == nil
+	case *MonitorFrame:
+		return x == nil
+	case *ReadyFrame:
+		return x == nil
+	case *RunFrame:
+		return x == nil
+	case *TransactionFrame:
+		return x == nil
+	case *StoppedFrame:
+		return x == nil
 	}
+	return false
 }
-
-// Validate reports whether the event severity is supported.
-func (s Severity) Validate() error {
-	switch s {
-	case SeverityInfo, SeverityWarn, SeverityCritical:
-		return nil
-	default:
-		return fmt.Errorf("unsupported event severity %q", s)
-	}
-}
-
-// String returns the raw result status.
-func (s ResultStatus) String() string { return string(s) }
-
-// String returns the raw log level.
-func (l LogLevel) String() string { return string(l) }
-
-// String returns the raw severity.
-func (s Severity) String() string { return string(s) }
-
-// String returns the raw monitor name.
-func (n MonitorName) String() string { return string(n) }

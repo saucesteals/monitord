@@ -4,341 +4,360 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
 	monitord "github.com/saucesteals/monitord"
+	"github.com/saucesteals/monitord/internal/delivery"
 	"github.com/saucesteals/monitord/internal/monitor"
+	"github.com/saucesteals/monitord/internal/secrets"
 	"github.com/saucesteals/monitord/internal/storage"
 )
 
-const (
-	// maxProtocolMessage bounds one worker protocol frame accepted by the
-	// daemon. Saved state travels in result frames before being persisted.
-	maxProtocolMessage = 1024 * 1024
-	// maxCapturedOutput bounds per-run stdout/stderr retained for the runs table.
-	maxCapturedOutput = 64 * 1024
-)
-
-// handshakeTimeout bounds how long a freshly started worker may take to accept
-// its network assignment.
-const handshakeTimeout = 30 * time.Second
-
-// worker is a long-lived monitor process. It is started once per artifact and
-// handles every tick for that monitor, so HTTP clients, connection pools, and
-// TLS sessions survive between runs.
 type worker struct {
-	binaryPath string
-	cmd        *exec.Cmd
-	stdin      io.WriteCloser
-	stdout     *bufio.Scanner
-	pgid       int
-	clients    int
-
-	stderr   buffer
-	exit     chan error
-	runMu    sync.Mutex
-	killOnce sync.Once
-	exited   bool
-	exitErr  error
+	deployment        storage.RuntimeDeployment
+	generation        storage.ActiveGeneration
+	cmd               *exec.Cmd
+	in                io.WriteCloser
+	out               *bufio.Reader
+	readCh            chan readResult
+	pgid              int
+	logger            *slog.Logger
+	writeMu           sync.Mutex
+	lifecycleMu       sync.Mutex
+	done              chan error
+	secretFingerprint string
+	planKind          string
+	requestedStop     string
+	redactor          secrets.Redactor
+}
+type readResult struct {
+	v   monitord.WorkerFrame
+	err error
+}
+type workerStoppedError struct {
+	message         string
+	failureReported bool
 }
 
-// tickOutput collects everything one tick produced. Events are not collected
-// here: they are delivered as they arrive, so only the final result and the
-// captured stdout survive the tick.
-type tickOutput struct {
-	Result monitord.Result
-	Stdout string
-}
+func (e *workerStoppedError) Error() string { return e.message }
 
-// start launches a worker process and completes the handshake.
-func startWorker(ctx context.Context, logger *slog.Logger, m storage.Monitor, network monitord.Network) (*worker, error) {
-	if err := m.Definition.Validate(); err != nil {
-		return nil, fmt.Errorf("monitor artifact requires redeploy: %w", err)
-	}
-
-	cmd := exec.Command(m.BinaryPath, monitord.FlagWorker)
+func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDeployment, generation storage.ActiveGeneration, secretMap map[string]map[string]string, redactor secrets.Redactor) (*worker, error) {
+	cmd := exec.Command(dep.ArtifactPath, monitord.FlagWorker)
 	setMonitorProcessGroup(cmd)
-	// Proxies travel in the handshake, not the environment, so credentials
-	// never show up in the process table.
 	cmd.Env = monitor.Env()
-	// Run from the monitor's source directory so it can read data files that
-	// live beside its source.
-	cmd.Dir = m.SourceDir
-
-	stdin, err := cmd.StdinPipe()
+	// Workers execute beside the immutable artifact, never from mutable source.
+	cmd.Dir = filepath.Dir(dep.ArtifactPath)
+	in, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, fmt.Errorf("open worker stdin: %w", err)
+		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
+	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("open worker stdout: %w", err)
+		return nil, err
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, fmt.Errorf("open worker stderr: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start worker process: %w", err)
-	}
-
-	w := &worker{
-		binaryPath: m.BinaryPath,
-		cmd:        cmd,
-		stdin:      stdin,
-		stdout:     bufio.NewScanner(stdout),
-		exit:       make(chan error, 1),
-	}
-	w.stdout.Buffer(make([]byte, 0, 64*1024), maxProtocolMessage)
-
-	pgid, err := monitorProcessGroup(cmd)
-	if err != nil {
-		logger.Warn("worker process group lookup failed", "monitor", m.Name, "pid", cmd.Process.Pid, "error", err)
-		_ = cmd.Process.Kill()
-
-		return nil, fmt.Errorf("resolve worker process group: %w", err)
-	}
-	w.pgid = pgid
-
-	go func() { _, _ = io.Copy(&w.stderr, stderr) }()
-	go func() { w.exit <- cmd.Wait() }()
-
-	handshakeCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
-	defer cancel()
-	if err := w.handshake(handshakeCtx, logger, m, network); err != nil {
-		w.terminate(logger)
-
 		return nil, err
 	}
-
-	logger.Info("monitor worker started",
-		"monitor", m.Name,
-		"pid", cmd.Process.Pid,
-		"clients", w.clients,
-		"proxies", len(network.Proxies),
-	)
-
+	if err = cmd.Start(); err != nil {
+		return nil, err
+	}
+	w := &worker{deployment: dep, generation: generation, cmd: cmd, in: in, out: bufio.NewReaderSize(out, 64<<10), readCh: make(chan readResult, 1), logger: logger, done: make(chan error, 1), redactor: redactor}
+	w.pgid, _ = monitorProcessGroup(cmd)
+	go func() {
+		digest := sha256.New()
+		captured, _ := io.Copy(digest, io.LimitReader(stderr, 64<<10))
+		discarded, _ := io.Copy(io.Discard, stderr)
+		if captured+discarded > 0 {
+			logger.Warn("worker wrote stderr; content suppressed", "deployment", dep.Name, "generation", generation.Generation, "bytes", captured+discarded, "captured_bytes", captured, "sha256", hex.EncodeToString(digest.Sum(nil)))
+		}
+	}()
+	go func() { w.done <- cmd.Wait() }()
+	go w.readLoop()
+	hello := monitord.Hello{Version: monitord.ProtocolVersion{Major: monitord.ProtocolMajor}, DeploymentID: dep.ID, DeploymentName: dep.Name, Generation: uint64(generation.Generation), WorkerToken: hex.EncodeToString(generation.WorkerToken), ArtifactHash: dep.ArtifactHash, ConfigHash: dep.ConfigHash, StateRevision: dep.StateRevision, State: dep.State, Checkpoints: dep.Checkpoints, Secrets: secretMap, Policy: monitord.DeploymentPolicy{Health: monitord.HealthPolicy{FailureThreshold: dep.FailureThreshold}, Events: monitord.EventPolicy{MaxPerTransaction: dep.MaxEventsPerTransaction, Retention: dep.EventRetention}}}
+	if err = w.send(ctx, monitord.DaemonFrame{Type: "hello", Hello: &hello}); err != nil {
+		w.kill()
+		return nil, err
+	}
+	msg, err := w.read(ctx)
+	if err != nil {
+		w.kill()
+		return nil, fmt.Errorf("worker monitor handshake: %w", err)
+	}
+	if msg.Type != "monitor" {
+		w.kill()
+		return nil, fmt.Errorf("expected monitor frame, got %q", msg.Type)
+	}
+	var persisted monitord.MonitorFrame
+	if err = json.Unmarshal(dep.Describe, &persisted); err != nil {
+		w.kill()
+		return nil, fmt.Errorf("decode persisted describe: %w", err)
+	}
+	w.planKind = persisted.Plan.Kind
+	want, marshalErr := json.Marshal(struct {
+		Info monitord.Info
+		Plan monitord.PlanDescription
+	}{persisted.Info, persisted.Plan})
+	if marshalErr != nil {
+		w.kill()
+		return nil, marshalErr
+	}
+	got, _ := json.Marshal(struct {
+		Info monitord.Info
+		Plan monitord.PlanDescription
+	}{msg.Monitor.Info, msg.Monitor.Plan})
+	if !bytes.Equal(want, got) {
+		w.kill()
+		return nil, errors.New("worker monitor frame differs from persisted artifact description")
+	}
+	if err = w.send(ctx, monitord.DaemonFrame{Type: "start", Start: &monitord.Start{Plan: persisted.Plan}}); err != nil {
+		w.kill()
+		return nil, err
+	}
+	msg, err = w.read(ctx)
+	if err != nil {
+		w.kill()
+		return nil, err
+	}
+	if msg.Type == "stopped" && msg.Stopped.Generation == uint64(generation.Generation) && msg.Stopped.Error != "" {
+		w.kill()
+		return nil, fmt.Errorf("worker start: %s", msg.Stopped.Error)
+	}
+	if msg.Type != "ready" || msg.Ready.Generation != uint64(generation.Generation) {
+		w.kill()
+		return nil, errors.New("worker ready generation mismatch")
+	}
 	return w, nil
 }
 
-func (w *worker) handshake(ctx context.Context, logger *slog.Logger, m storage.Monitor, network monitord.Network) error {
-	if err := w.send(monitord.Inbound{
-		Type: monitord.InboundHello,
-		Hello: &monitord.Hello{
-			Monitor: monitord.MonitorName(m.Name.String()),
-			Dir:     m.SourceDir,
-			Network: network,
-		},
-	}); err != nil {
-		return err
+func (w *worker) serve(ctx context.Context, store *storage.Store) error {
+	var stable <-chan time.Time
+	var stableTimer *time.Timer
+	if w.planKind == "continuous" {
+		stableTimer = time.NewTimer(workerStableAfter)
+		stable = stableTimer.C
+		defer stableTimer.Stop()
 	}
-
-	line, err := w.readLine(ctx, logger)
-	if err != nil {
-		return fmt.Errorf("read worker handshake: %w (stderr: %s)", err, w.stderr.String())
-	}
-
-	var msg monitord.Outbound
-	if err := json.Unmarshal(line, &msg); err != nil {
-		return fmt.Errorf("decode worker handshake: %w", err)
-	}
-	if err := msg.Validate(); err != nil {
-		return err
-	}
-	if msg.Type != monitord.OutboundReady {
-		return fmt.Errorf("expected %q from worker, got %q", monitord.OutboundReady, msg.Type)
-	}
-	w.clients = msg.Ready.Clients
-
-	return nil
-}
-
-// tick sends one run to the worker and consumes messages until its result.
-func (w *worker) tick(ctx context.Context, logger *slog.Logger, m storage.Monitor, t monitord.Tick, emit func(monitord.Event)) (tickOutput, error) {
-	w.runMu.Lock()
-	defer w.runMu.Unlock()
-
-	var out tickOutput
-	if w.hasExited() {
-		return out, fmt.Errorf("worker exited before tick: %v", w.exitErr)
-	}
-	if err := w.send(monitord.Inbound{
-		Type: monitord.InboundTick,
-		Tick: &t,
-	}); err != nil {
-		return out, err
-	}
-
-	var captured buffer
 	for {
-		line, err := w.readLine(ctx, logger)
-		if err != nil {
-			out.Stdout = captured.String()
-
-			return out, err
-		}
-		if len(bytes.TrimSpace(line)) == 0 {
+		var msg monitord.WorkerFrame
+		select {
+		case result := <-w.readCh:
+			if result.err != nil {
+				return result.err
+			}
+			msg = result.v
+		case <-stable:
+			stable = nil
+			transition, err := store.MarkGenerationStable(ctx, w.deployment.ID, w.generation.Generation, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			logHealthTransition(w.logger, w.deployment.Name, w.generation.Generation, transition)
 			continue
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-
-		var msg monitord.Outbound
-		if err := json.Unmarshal(line, &msg); err != nil {
-			captured.Write(append(line, '\n'))
-			out.Stdout = captured.String()
-
-			return out, fmt.Errorf("decode worker message: %w", err)
-		}
-		if err := msg.Validate(); err != nil {
-			out.Stdout = captured.String()
-
-			return out, err
-		}
-		if msg.RunID != "" && msg.RunID != t.RunID {
-			out.Stdout = captured.String()
-
-			return out, fmt.Errorf("worker reported run %s while %s was active", msg.RunID, t.RunID)
-		}
-		captured.Write(capturedMessage(msg))
-
-		w.consume(logger, m, msg, &out, emit)
-		if msg.Type == monitord.OutboundResult {
-			out.Stdout = captured.String()
-
-			return out, nil
+		var err error
+		switch msg.Type {
+		case "transaction":
+			if err = w.transaction(ctx, store, *msg.Transaction); err != nil {
+				return err
+			}
+		case "run":
+			if msg.Run.Generation != uint64(w.generation.Generation) {
+				return storage.ErrGenerationFenced
+			}
+			transition, healthErr := store.RecordRun(ctx, storage.RunOutcome{DeploymentID: w.deployment.ID, Generation: w.generation.Generation, Status: storage.RunStatus(msg.Run.Status), Duration: msg.Run.Duration, Error: w.redact(msg.Run.Error), FinishedAt: time.Now().UTC()})
+			if healthErr != nil {
+				return healthErr
+			}
+			logHealthTransition(w.logger, w.deployment.Name, w.generation.Generation, transition)
+		case "stopped":
+			if msg.Stopped.Generation != uint64(w.generation.Generation) {
+				return storage.ErrGenerationFenced
+			}
+			if msg.Stopped.Error != "" {
+				return &workerStoppedError{message: msg.Stopped.Error, failureReported: msg.Stopped.RunFailureReported}
+			}
+			if !msg.Stopped.Clean {
+				return &workerStoppedError{message: "worker stopped unsuccessfully", failureReported: msg.Stopped.RunFailureReported}
+			}
+			return nil
+		default:
+			return fmt.Errorf("unexpected worker frame %q", msg.Type)
 		}
 	}
 }
 
-// capturedMessage strips state from result frames before retaining worker
-// protocol output. State is persisted separately by the store and can be much
-// larger than the useful run summary.
-func capturedMessage(msg monitord.Outbound) []byte {
-	if msg.Type == monitord.OutboundResult {
-		result := *msg.Result
-		result.State = nil
-		msg.Result = &result
+func logHealthTransition(logger *slog.Logger, deployment string, generation int64, transition storage.HealthTransition) {
+	switch transition {
+	case storage.HealthBecameUnhealthy:
+		logger.Warn("deployment unhealthy", "deployment", deployment, "generation", generation)
+	case storage.HealthRecovered:
+		logger.Info("deployment recovered", "deployment", deployment, "generation", generation)
 	}
+}
 
-	payload, err := json.Marshal(msg)
+func (w *worker) redact(message string) string { return w.redactor.Redact(message) }
+
+func (w *worker) transaction(ctx context.Context, store *storage.Store, wire monitord.TransactionFrame) error {
+	if wire.DeploymentID != w.deployment.ID || wire.Generation != uint64(w.generation.Generation) || wire.WorkerToken != hex.EncodeToString(w.generation.WorkerToken) {
+		return storage.ErrGenerationFenced
+	}
+	if err := verifyWireHash(wire); err != nil {
+		return err
+	}
+	if len(wire.Events) > w.deployment.MaxEventsPerTransaction {
+		return fmt.Errorf("transaction has %d events; deployment limit is %d", len(wire.Events), w.deployment.MaxEventsPerTransaction)
+	}
+	bindings, err := store.ListActiveBindings(ctx, w.deployment.ID)
 	if err != nil {
-		return nil
+		return err
 	}
-
-	return append(payload, '\n')
-}
-
-func (w *worker) consume(logger *slog.Logger, m storage.Monitor, msg monitord.Outbound, out *tickOutput, emit func(monitord.Event)) {
-	switch msg.Type {
-	case monitord.OutboundLog:
-		logger.Info("monitor log", "monitor", m.Name, "level", msg.Log.Level, "message", msg.Log.Message)
-	case monitord.OutboundEvent:
-		logger.Info("monitor event", "monitor", m.Name, "severity", msg.Event.Severity, "title", msg.Event.Title)
-		emit(*msg.Event)
-	case monitord.OutboundResult:
-		out.Result = *msg.Result
+	checkpoints := make([]storage.CheckpointMutation, 0, len(wire.Checkpoints))
+	keys := make([]string, 0, len(wire.Checkpoints))
+	for k := range wire.Checkpoints {
+		keys = append(keys, k)
 	}
-}
-
-func (w *worker) send(msg monitord.Inbound) error {
-	payload, err := json.Marshal(msg)
+	sort.Strings(keys)
+	for _, k := range keys {
+		checkpoints = append(checkpoints, storage.CheckpointMutation{Source: k, Value: wire.Checkpoints[k]})
+	}
+	events := make([]storage.OutboxEvent, 0, len(wire.Events))
+	for i, event := range wire.Events {
+		fields := dataFields(event.Data)
+		if event.CorrectionOf != "" {
+			fields = append([]delivery.Field{{Name: "corrects", Value: event.CorrectionOf}}, fields...)
+		}
+		message := delivery.Message{
+			Title: event.Title, Message: event.Body, URL: event.URL,
+			Level: eventLevel(event.Severity), Fields: fields,
+			Footer: w.deployment.Name,
+		}
+		deliveries := make([]storage.OutboxDelivery, 0, len(bindings))
+		for _, b := range bindings {
+			deliveries = append(deliveries, storage.OutboxDelivery{DestinationID: b.ID, DestinationRevision: b.Revision})
+		}
+		sum := sha256.Sum256([]byte(w.deployment.ID + "\x00" + strconv.FormatUint(wire.Generation, 10) + "\x00" + strconv.FormatUint(wire.Sequence, 10) + "\x00" + strconv.Itoa(i)))
+		events = append(events, storage.OutboxEvent{OutboxID: hex.EncodeToString(sum[:]), EventID: event.ID, Message: message, Deliveries: deliveries})
+	}
+	hash, _ := hex.DecodeString(wire.PayloadHash)
+	var fixed [sha256.Size]byte
+	copy(fixed[:], hash)
+	frame := storage.TransactionFrame{DeploymentID: wire.DeploymentID, Generation: int64(wire.Generation), WorkerToken: w.generation.WorkerToken, Sequence: int64(wire.Sequence), BaseStateRevision: wire.BaseStateRevision, NextState: wire.NextState, Checkpoints: checkpoints, Events: events, PayloadHash: fixed}
+	ack, err := store.ApplyTransaction(ctx, frame)
 	if err != nil {
-		return fmt.Errorf("encode worker message: %w", err)
+		return err
 	}
-	if _, err := w.stdin.Write(append(payload, '\n')); err != nil {
-		return fmt.Errorf("write worker message: %w", err)
-	}
+	return w.send(ctx, monitord.DaemonFrame{Type: "ack", Ack: &monitord.TransactionAck{DeploymentID: ack.DeploymentID, Generation: uint64(ack.Generation), Sequence: uint64(ack.Sequence), PayloadHash: wire.PayloadHash, ResultRevision: ack.ResultRevision, Status: ack.Status}})
+}
 
+func verifyWireHash(frame monitord.TransactionFrame) error {
+	sum := monitord.HashTransactionFrame(frame)
+	want := hex.EncodeToString(sum[:])
+	if !bytes.Equal([]byte(frame.PayloadHash), []byte(want)) {
+		return fmt.Errorf("%w: got %s want %s", storage.ErrPayloadConflict, frame.PayloadHash, want)
+	}
 	return nil
 }
-
-// readLine reads one NDJSON line, terminating the worker if ctx expires first.
-func (w *worker) readLine(ctx context.Context, logger *slog.Logger) ([]byte, error) {
-	type result struct {
-		line []byte
-		err  error
+func (w *worker) send(ctx context.Context, v monitord.DaemonFrame) error {
+	if err := v.Validate(); err != nil {
+		return err
 	}
-
-	done := make(chan result, 1)
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	if len(raw) > monitord.MaxFrameBytes {
+		return errors.New("outbound frame too large")
+	}
+	result := make(chan error, 1)
 	go func() {
-		if w.stdout.Scan() {
-			done <- result{line: append([]byte(nil), w.stdout.Bytes()...)}
-
-			return
-		}
-		if err := w.stdout.Err(); err != nil {
-			done <- result{err: fmt.Errorf("read worker stdout: %w", err)}
-
-			return
-		}
-		done <- result{err: io.EOF}
+		w.writeMu.Lock()
+		defer w.writeMu.Unlock()
+		_, writeErr := io.Copy(w.in, bytes.NewReader(raw))
+		result <- writeErr
 	}()
-
 	select {
-	case r := <-done:
-		return r.line, r.err
+	case err = <-result:
+		return err
 	case <-ctx.Done():
-		// The scan goroutine is unblocked by killing the process, which closes
-		// stdout.
-		w.terminate(logger)
-
-		return nil, ctx.Err()
+		// Closing the pipe releases a write blocked on a worker that no longer
+		// reads stdin. The caller will retire this worker.
+		_ = w.in.Close()
+		return ctx.Err()
 	}
 }
-
-// hasExited reports whether the process has already been reaped.
-func (w *worker) hasExited() bool {
-	if w.exited {
-		return true
-	}
-
+func (w *worker) read(ctx context.Context) (monitord.WorkerFrame, error) {
 	select {
-	case err := <-w.exit:
-		w.exited = true
-		w.exitErr = err
-
-		return true
-	default:
-		return false
+	case r := <-w.readCh:
+		return r.v, r.err
+	case <-ctx.Done():
+		return monitord.WorkerFrame{}, ctx.Err()
 	}
 }
-
-// terminate stops the worker and its whole process group.
-func (w *worker) terminate(logger *slog.Logger) {
-	w.killOnce.Do(func() {
-		_ = w.stdin.Close()
-		terminateMonitorProcessGroup(w.pgid, logger)
-		if w.cmd != nil && w.cmd.Process != nil {
-			_ = w.cmd.Process.Kill()
+func (w *worker) readLoop() {
+	for {
+		raw := make([]byte, 0, 64<<10)
+		for {
+			part, err := w.out.ReadSlice('\n')
+			if len(raw)+len(part) > monitord.MaxFrameBytes {
+				w.readCh <- readResult{err: errors.New("protocol frame exceeds maximum size")}
+				return
+			}
+			raw = append(raw, part...)
+			if err == nil {
+				break
+			}
+			if errors.Is(err, bufio.ErrBufferFull) {
+				continue
+			}
+			w.readCh <- readResult{err: err}
+			return
 		}
-	})
-}
-
-// buffer is a bounded, concurrency-safe output capture.
-type buffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *buffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if remaining := maxCapturedOutput - b.buf.Len(); remaining > 0 {
-		b.buf.Write(p[:min(len(p), remaining)])
+		v, decodeErr := monitord.DecodeWorkerFrame(bytes.NewReader(raw))
+		w.readCh <- readResult{v: v, err: decodeErr}
+		if decodeErr != nil {
+			return
+		}
 	}
-
-	return len(p), nil
 }
-
-func (b *buffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	return b.buf.String()
+func (w *worker) stop(ctx context.Context, reason string) error {
+	w.lifecycleMu.Lock()
+	w.requestedStop = reason
+	w.lifecycleMu.Unlock()
+	deadline, _ := ctx.Deadline()
+	_ = w.send(ctx, monitord.DaemonFrame{Type: "stop", Stop: &monitord.Stop{Reason: reason, Deadline: deadline.UTC().Format(time.RFC3339Nano)}})
+	select {
+	case err := <-w.done:
+		return err
+	case <-ctx.Done():
+		w.kill()
+		return ctx.Err()
+	}
+}
+func (w *worker) stopReason() string {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+	return w.requestedStop
+}
+func (w *worker) kill() {
+	_ = w.in.Close()
+	terminateMonitorProcessGroup(w.pgid, w.logger)
+	if w.cmd != nil && w.cmd.Process != nil {
+		_ = w.cmd.Process.Kill()
+	}
 }

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"runtime/debug"
 
 	"github.com/spf13/cobra"
@@ -15,14 +16,14 @@ func (c *CLI) newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print the build revision",
 		Args:  noArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return c.version()
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return c.version(cmd.OutOrStdout())
 		},
 	}
 }
 
-func (c *CLI) version() error {
-	fmt.Printf("monitord %s\n", buildRevision())
+func (c *CLI) version(out io.Writer) error {
+	fmt.Fprintf(out, "monitord %s\n", buildRevision())
 
 	return nil
 }

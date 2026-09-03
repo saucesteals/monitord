@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/model"
@@ -52,9 +53,11 @@ func Scaffold(paths config.Paths, name model.MonitorName) (string, error) {
 		return "", fmt.Errorf("create monitor dir: %w", err)
 	}
 
-	source := scaffoldTemplate
-	if err := os.WriteFile(filepath.Join(dir, "monitor.go"), []byte(source), 0o600); err != nil {
-		return "", fmt.Errorf("write monitor source: %w", err)
+	for _, file := range scaffoldFiles {
+		source := strings.ReplaceAll(file.template, "MONITOR_NAME", name.String())
+		if err := os.WriteFile(filepath.Join(dir, file.name), []byte(source), 0o600); err != nil {
+			return "", fmt.Errorf("write %s: %w", file.name, err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(dir, ConfigFileName), []byte(scaffoldConfig), 0o600); err != nil {
 		return "", fmt.Errorf("write monitor config: %w", err)
@@ -63,58 +66,73 @@ func Scaffold(paths config.Paths, name model.MonitorName) (string, error) {
 	return dir, nil
 }
 
-const scaffoldTemplate = `package main
+var scaffoldFiles = []struct {
+	name     string
+	template string
+}{
+	{"monitor.go", `package main
 
 import (
-	"context"
+	"time"
 
 	"github.com/saucesteals/monitord"
-	http "github.com/saucesteals/fhttp"
 )
 
-// State persists across ticks and daemon restarts.
+// State is the monitor's durable schema.
 type State struct {
-	LastStatus int ` + "`json:\"last_status\"`" + `
+	LastStatus  int  ` + "`json:\"last_status\"`" + `
+	Initialized bool ` + "`json:\"initialized\"`" + `
 }
 
 func main() {
-	monitord.Main(run)
+	monitord.Run(monitord.Define(
+		monitord.Info{Name: "MONITOR_NAME", Description: "HTTP status monitor"},
+		monitord.Every(5*time.Minute, check),
+	))
 }
+`},
+	{"check.go", `package main
 
-func run(ctx context.Context, r *monitord.Run[State]) monitord.Result {
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/saucesteals/monitord"
+)
+
+func check(ctx context.Context, session *monitord.Session[State]) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/", nil)
 	if err != nil {
-		return monitord.Failuref("build request: %v", err)
+		return fmt.Errorf("build request: %w", err)
 	}
 
-	resp, err := r.Client().Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return monitord.Failuref("request failed: %v", err)
+		return fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	observedAt := time.Now().UTC()
 
-	if resp.StatusCode != r.State.LastStatus {
-		r.Logf(monitord.LogInfo, "status changed %d -> %d", r.State.LastStatus, resp.StatusCode)
-		r.State.LastStatus = resp.StatusCode
-		r.Save()
-	}
-
-	if resp.StatusCode >= 400 {
-		return monitord.Failuref("HTTP %d", resp.StatusCode)
-	}
-
-	return monitord.Successf("HTTP %d", resp.StatusCode)
+	return session.Commit(ctx, func(tx *monitord.Tx[State]) error {
+		previous := tx.State.LastStatus
+		tx.State.LastStatus = resp.StatusCode
+		if tx.State.Initialized && previous == resp.StatusCode {
+			return nil
+		}
+		tx.State.Initialized = true
+		if resp.StatusCode >= 400 {
+			return tx.Emit(monitord.Event{
+				ID:    fmt.Sprintf("http:%d:%d", resp.StatusCode, observedAt.UnixNano()),
+				Title: fmt.Sprintf("HTTP %d", resp.StatusCode),
+			})
+		}
+		return nil
+	})
 }
-`
+`},
+}
 
-const scaffoldConfig = `description: HTTP status monitor
-clients: 1
-every: 5m
-ttl: 24h
-timeout: 30s
-failure_threshold: 3 # alert after three consecutive failed ticks
-deliveries:
-  - discord:
-      account: jarvis
-      channel_id: "CHANNEL_ID"
+const scaffoldConfig = `ttl: 24h
 `

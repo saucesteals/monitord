@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/saucesteals/monitord/internal/model"
-	"github.com/saucesteals/monitord/internal/routes"
+	monitord "github.com/saucesteals/monitord"
+	"github.com/saucesteals/monitord/internal/delivery"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -20,36 +20,33 @@ const ConfigFileName = "monitor.yaml"
 
 // Config is the validated runtime configuration loaded from monitor.yaml.
 type Config struct {
-	Description      string
-	Clients          int
-	Every            time.Duration
-	TTL              time.Duration
-	Timeout          time.Duration
-	Persistent       bool
-	FailureThreshold int
-	// MaxEvents caps how many events one tick may deliver. Zero means the
-	// daemon default.
-	MaxEvents  int
-	ProxyPool  model.PoolName
-	Deliveries []routes.Delivery
+	TTL        time.Duration
+	Persistent bool
+	Deliveries []delivery.Delivery
+	Policy     monitord.DeploymentPolicy
 }
 
 type fileConfig struct {
-	Description      string         `yaml:"description"`
-	Clients          int            `yaml:"clients"`
-	Every            string         `yaml:"every"`
-	TTL              string         `yaml:"ttl"`
-	Timeout          string         `yaml:"timeout"`
-	Persistent       bool           `yaml:"persistent"`
-	FailureThreshold int            `yaml:"failure_threshold"`
-	MaxEvents        int            `yaml:"max_events"`
-	Proxies          string         `yaml:"proxies"`
-	Deliveries       []fileDelivery `yaml:"deliveries"`
-	Routes           []fileRoute    `yaml:"routes"`
+	TTL        string         `yaml:"ttl"`
+	Persistent bool           `yaml:"persistent"`
+	Deliveries []fileDelivery `yaml:"deliveries"`
+	Health     fileHealth     `yaml:"health"`
+	Events     fileEvents     `yaml:"events"`
+}
+
+type fileHealth struct {
+	FailureThreshold *int `yaml:"failure_threshold"`
+}
+
+type fileEvents struct {
+	MaxPerTransaction *int   `yaml:"max_per_transaction"`
+	Retention         string `yaml:"retention"`
 }
 
 type fileDelivery struct {
-	Discord *fileDiscord `yaml:"discord"`
+	Discord   *fileDiscord  `yaml:"discord"`
+	OpenClaw  *fileOpenClaw `yaml:"openclaw"`
+	RateLimit fileRateLimit `yaml:"rate_limit"`
 }
 
 type fileDiscord struct {
@@ -60,9 +57,20 @@ type fileDiscord struct {
 	Mentions   string `yaml:"mentions"`
 }
 
-type fileRoute struct {
-	Route   string         `yaml:"route"`
-	Options map[string]any `yaml:"options"`
+type fileOpenClaw struct {
+	Account string `yaml:"account"`
+	Prompt  string `yaml:"prompt"`
+	AgentID string `yaml:"agent_id"`
+	URL     string `yaml:"url"`
+}
+
+type fileRateLimit struct {
+	PerSecond float64 `yaml:"per_second"`
+	Burst     int     `yaml:"burst"`
+}
+
+func (limit fileRateLimit) rateLimit() delivery.RateLimit {
+	return delivery.RateLimit{PerSecond: limit.PerSecond, Burst: limit.Burst}
 }
 
 // LoadConfig reads and validates one monitor's authored configuration.
@@ -98,38 +106,32 @@ func LoadConfig(dir string) (Config, error) {
 }
 
 func (raw fileConfig) validate() (Config, error) {
-	clients := raw.Clients
-	if clients == 0 {
-		clients = 1
+	policy := monitord.DeploymentPolicy{
+		Health: monitord.HealthPolicy{FailureThreshold: 3},
+		Events: monitord.EventPolicy{
+			MaxPerTransaction: monitord.MaxEventsPerTransaction,
+			Retention:         30 * 24 * time.Hour,
+		},
 	}
-	if clients < 0 {
-		return Config{}, errors.New("clients must be positive")
+	if raw.Health.FailureThreshold != nil {
+		policy.Health.FailureThreshold = *raw.Health.FailureThreshold
 	}
-
-	if raw.MaxEvents < 0 {
-		return Config{}, errors.New("max_events cannot be negative")
+	if raw.Events.MaxPerTransaction != nil {
+		policy.Events.MaxPerTransaction = *raw.Events.MaxPerTransaction
 	}
-	failureThreshold := raw.FailureThreshold
-	if failureThreshold == 0 {
-		failureThreshold = 3
-	}
-	if failureThreshold < 0 {
-		return Config{}, errors.New("failure_threshold must be positive")
-	}
-
-	every, err := requiredDuration("every", raw.Every)
-	if err != nil {
-		return Config{}, err
-	}
-	timeout := 30 * time.Second
-	if strings.TrimSpace(raw.Timeout) != "" {
-		timeout, err = requiredDuration("timeout", raw.Timeout)
+	if value := strings.TrimSpace(raw.Events.Retention); value != "" {
+		retention, err := parseDuration(value)
 		if err != nil {
-			return Config{}, err
+			return Config{}, fmt.Errorf("events.retention: %w", err)
 		}
+		policy.Events.Retention = retention
+	}
+	if err := policy.Validate(); err != nil {
+		return Config{}, err
 	}
 
 	var ttl time.Duration
+	var err error
 	if raw.Persistent {
 		if strings.TrimSpace(raw.TTL) != "" {
 			return Config{}, errors.New("ttl cannot be combined with persistent: true")
@@ -141,86 +143,53 @@ func (raw fileConfig) validate() (Config, error) {
 		}
 	}
 
-	proxyPool, err := model.ParsePoolName(strings.TrimSpace(raw.Proxies))
-	if err != nil {
-		return Config{}, err
-	}
-	if len(raw.Deliveries) == 0 && len(raw.Routes) == 0 {
-		return Config{}, errors.New("at least one delivery is required")
-	}
-
-	deliveries := make([]routes.Delivery, 0, len(raw.Deliveries)+len(raw.Routes))
+	deliveries := make([]delivery.Delivery, 0, len(raw.Deliveries))
 	for index, item := range raw.Deliveries {
-		if item.Discord == nil {
-			return Config{}, fmt.Errorf("deliveries[%d]: discord is required", index)
+		destination := delivery.Delivery{RateLimit: item.RateLimit.rateLimit()}
+		if item.Discord != nil {
+			destination.Discord = &delivery.Discord{
+				Account:    strings.TrimSpace(item.Discord.Account),
+				ChannelID:  strings.TrimSpace(item.Discord.ChannelID),
+				ThreadID:   strings.TrimSpace(item.Discord.ThreadID),
+				WebhookURL: strings.TrimSpace(item.Discord.WebhookURL),
+				Mentions:   strings.TrimSpace(item.Discord.Mentions),
+			}
 		}
-		delivery := routes.Delivery{Discord: &routes.Discord{
-			Account:    strings.TrimSpace(item.Discord.Account),
-			ChannelID:  strings.TrimSpace(item.Discord.ChannelID),
-			ThreadID:   strings.TrimSpace(item.Discord.ThreadID),
-			WebhookURL: strings.TrimSpace(item.Discord.WebhookURL),
-			Mentions:   strings.TrimSpace(item.Discord.Mentions),
-		}}
-		if err := delivery.Validate(); err != nil {
+		if item.OpenClaw != nil {
+			destination.OpenClaw = &delivery.OpenClaw{
+				Account: strings.TrimSpace(item.OpenClaw.Account),
+				Prompt:  strings.TrimSpace(item.OpenClaw.Prompt),
+				AgentID: strings.TrimSpace(item.OpenClaw.AgentID),
+				URL:     strings.TrimSpace(item.OpenClaw.URL),
+			}
+		}
+		if err := destination.Validate(); err != nil {
 			return Config{}, fmt.Errorf("deliveries[%d]: %w", index, err)
 		}
-
-		deliveries = append(deliveries, delivery)
-	}
-	for index, item := range raw.Routes {
-		name, err := model.ParseRouteName(strings.TrimSpace(item.Route))
-		if err != nil {
-			return Config{}, fmt.Errorf("routes[%d]: %w", index, err)
-		}
-		options, err := scalarOptions(item.Options)
-		if err != nil {
-			return Config{}, fmt.Errorf("route %s: %w", name, err)
-		}
-		deliveries = append(deliveries, routes.Delivery{Route: name, Options: options})
+		deliveries = append(deliveries, destination)
 	}
 
 	return Config{
-		Description:      strings.TrimSpace(raw.Description),
-		Clients:          clients,
-		Every:            every,
-		TTL:              ttl,
-		Timeout:          timeout,
-		Persistent:       raw.Persistent,
-		FailureThreshold: failureThreshold,
-		MaxEvents:        raw.MaxEvents,
-		ProxyPool:        proxyPool,
-		Deliveries:       deliveries,
+		TTL: ttl, Persistent: raw.Persistent, Deliveries: deliveries, Policy: policy,
 	}, nil
 }
 
-func scalarOptions(raw map[string]any) (routes.Options, error) {
-	options := make(routes.Options, len(raw))
-	for key, value := range raw {
-		key = routes.NormalizeOptionKey(key)
-		if key == "" {
-			return nil, errors.New("route option names must not be empty")
+func parseDuration(value string) (time.Duration, error) {
+	if strings.HasSuffix(value, "d") {
+		days, err := strconv.ParseInt(strings.TrimSuffix(value, "d"), 10, 32)
+		if err != nil || days <= 0 {
+			return 0, fmt.Errorf("%q is not a positive duration", value)
 		}
-		switch typed := value.(type) {
-		case string:
-			options[key] = typed
-		case bool:
-			options[key] = strconv.FormatBool(typed)
-		case int:
-			options[key] = strconv.Itoa(typed)
-		case int64:
-			options[key] = strconv.FormatInt(typed, 10)
-		case uint64:
-			options[key] = strconv.FormatUint(typed, 10)
-		case float64:
-			options[key] = strconv.FormatFloat(typed, 'g', -1, 64)
-		case nil:
-			options[key] = ""
-		default:
-			return nil, fmt.Errorf("route option %q must be a scalar value", key)
-		}
+		return time.Duration(days) * 24 * time.Hour, nil
 	}
-
-	return options, nil
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	if duration <= 0 {
+		return 0, errors.New("must be positive")
+	}
+	return duration, nil
 }
 
 func requiredDuration(field string, value string) (time.Duration, error) {

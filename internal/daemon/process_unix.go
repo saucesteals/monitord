@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os/exec"
 	"syscall"
-	"time"
 )
 
 func setMonitorProcessGroup(cmd *exec.Cmd) {
@@ -29,15 +28,9 @@ func terminateMonitorProcessGroup(pgid int, logger *slog.Logger) {
 	if pgid <= 0 {
 		return
 	}
-	if err := syscall.Kill(-pgid, syscall.SIGTERM); err != nil {
-		if err == syscall.ESRCH {
-			return
-		}
-		logger.Warn("monitor process group sigterm failed", "pgid", pgid, "error", err)
-
-		return
-	}
-	time.Sleep(2 * time.Second)
+	// This is the forced path after graceful stop has failed or a handshake
+	// never completed. Kill immediately: delaying by process-group ID risks
+	// signaling an unrelated group if the ID is recycled in the meantime.
 	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
 		logger.Warn("monitor process group sigkill failed", "pgid", pgid, "error", err)
 	}

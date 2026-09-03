@@ -1,10 +1,8 @@
-description: Checks a list of URLs and alerts on status changes
-clients: 4
-every: 5m
 ttl: 24h
-timeout: 30s
-failure_threshold: 3 # alert after three consecutive failed ticks
 deliveries:
   - discord:
       account: jarvis
-      channel_id: "CHANNEL_ID"
+      channel_id: "123456789012345678" # replace with your Discord channel ID
+    rate_limit:
+      per_second: 1
+      burst: 5
