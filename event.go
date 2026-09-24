@@ -29,6 +29,19 @@ type Event struct {
 	Body         string            `json:"body,omitempty"`
 	URL          string            `json:"url,omitempty"`
 	Data         map[string]string `json:"data,omitempty"`
+
+	// Description supplies extended notification text, separate from Body.
+	Description string `json:"description,omitempty"`
+	// Image is the notification thumbnail URL for adapters that support it.
+	Image string `json:"image,omitempty"`
+	// Color overrides the severity color; zero keeps the adapter default.
+	Color int `json:"color,omitempty"`
+	// InlineData requests inline layout for Data fields where supported.
+	InlineData bool `json:"inline_data,omitempty"`
+	// HideFooter omits the deployment-name footer from the notification.
+	HideFooter bool `json:"hide_footer,omitempty"`
+	// MuteMentions suppresses configured mentions for this occurrence.
+	MuteMentions bool `json:"mute_mentions,omitempty"`
 }
 
 func (e Event) Validate() error {

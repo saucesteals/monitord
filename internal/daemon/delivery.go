@@ -9,7 +9,7 @@ import (
 	"github.com/saucesteals/monitord/internal/delivery"
 )
 
-func dataFields(data map[string]string) []delivery.Field {
+func dataFields(data map[string]string, inline bool) []delivery.Field {
 	if len(data) == 0 {
 		return nil
 	}
@@ -20,7 +20,7 @@ func dataFields(data map[string]string) []delivery.Field {
 	sort.Strings(keys)
 	out := make([]delivery.Field, 0, len(data))
 	for _, key := range keys {
-		out = append(out, delivery.Field{Name: key, Value: data[key]})
+		out = append(out, delivery.Field{Name: key, Value: data[key], Inline: inline})
 	}
 	return out
 }

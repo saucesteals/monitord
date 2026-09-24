@@ -413,3 +413,46 @@ monitord inspect inventory
 ```
 
 Local tests do not persist state, checkpoints, or deliveries. They print state changes and emitted events. Polling monitors run one callback; continuous monitors run until `--duration` and then receive the normal graceful shutdown lifecycle. After deployment, use `inspect` to confirm the generation is ready, required secrets are available, and the first callback succeeds.
+
+## Event presentation
+
+An `Event` can supply optional presentation hints without changing its identity,
+state transaction, or destinations:
+
+```go
+monitord.Event{
+	ID:           "inventory:revision-42",
+	Title:        "Inventory updated",
+	Body:         "A watched item is available.",
+	Description:  "The item is available in the selected size.",
+	URL:          "https://example.com/items/42",
+	Image:        "https://example.com/images/42.png",
+	Color:        0x3498db,
+	InlineData:   true,
+	HideFooter:   true,
+	MuteMentions: true,
+	Data:         map[string]string{"Size": "Medium", "Status": "Available"},
+}
+```
+
+- `Description` is extended notification text. Discord uses it as the embed
+  description; `Body` remains the top-level message content.
+- `Image` maps to the notification thumbnail, not a full-width embed image.
+- `Color` requests an RGB embed color. Zero retains the severity-based default.
+- `InlineData` requests inline layout for the sorted `Data` fields. A correction
+  reference remains a separate non-inline field.
+- `HideFooter` omits the default deployment-name footer. It does not change the
+  deployment identity or destination bindings. For OpenClaw delivery, it also
+  omits the monitor-name context and uses the generic run name.
+- `MuteMentions` suppresses configured mentions for this event only.
+
+Presentation support is adapter-specific; these hints do not add a new delivery
+backend. Existing URL filtering, text limits, and mention handling still apply.
+All new fields are optional and omitted from JSON at their zero values, preserving
+existing event payloads and default rendering. Presentation content participates
+in event content hashing: replay an event with the same ID and the same content,
+not a newly formatted variant of an already committed event.
+
+The daemon and monitor SDK must both support these fields. Rebuild and deploy
+monitors against the matching SDK after upgrading the daemon; older daemons can
+reject events containing unknown fields.
