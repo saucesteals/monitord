@@ -438,7 +438,8 @@ monitord.Event{
 
 `Description` becomes the Discord embed description; `Body` remains message
 content. `Image` is a thumbnail, not a full-width image. Zero `Color` retains the
-severity-based default. Sorted `Data` fields remain supported and precede ordered
+severity-based default. `Data` is deprecated compatibility shorthand; prefer `Fields` in new monitors.
+Sorted `Data` fields remain supported and precede ordered
 `Fields`; correction references remain separate non-inline fields.
 
 `Footer` is opt-in: emitted events no longer automatically include the deployment
@@ -451,7 +452,9 @@ generic run name. Deployment identity and destination bindings are unchanged.
 an explicit empty slice (`[]string{}`, JSON `[]`) suppresses them. A populated
 array replaces—not appends to—the destination list. Each element is validated as
 one target. Explicit empty arrays survive serialization and outbox persistence.
-Health notifications retain their existing mention suppression.
+Health notifications explicitly use empty mention arrays. The old mute boolean
+is no longer written; already-persisted muted messages are translated to empty
+mention arrays when the outbox reads them.
 
 Presentation support is adapter-specific. Existing URL filtering, text limits,
 and allowed-mention handling still apply. Except for the intentional removal of

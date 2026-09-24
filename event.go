@@ -24,13 +24,15 @@ const (
 // Event is a transport-neutral occurrence emitted by a monitor. Delivery
 // adapters decide how to present its fields on their respective platforms.
 type Event struct {
-	ID           string            `json:"id"`
-	CorrectionOf string            `json:"correction_of,omitempty"`
-	Severity     Severity          `json:"severity,omitempty"`
-	Title        string            `json:"title"`
-	Body         string            `json:"body,omitempty"`
-	URL          string            `json:"url,omitempty"`
-	Data         map[string]string `json:"data,omitempty"`
+	ID           string   `json:"id"`
+	CorrectionOf string   `json:"correction_of,omitempty"`
+	Severity     Severity `json:"severity,omitempty"`
+	Title        string   `json:"title"`
+	Body         string   `json:"body,omitempty"`
+	URL          string   `json:"url,omitempty"`
+	// Data is the legacy shorthand for sorted, non-inline fields.
+	// Deprecated: use Fields for explicit ordering and layout.
+	Data map[string]string `json:"data,omitempty"`
 
 	// Description supplies extended notification text, separate from Body.
 	Description string `json:"description,omitempty"`

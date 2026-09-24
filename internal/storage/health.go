@@ -266,7 +266,7 @@ func enqueueHealthNotification(ctx context.Context, tx *sql.Tx, deploymentID, de
 	if _, err := tx.ExecContext(ctx, `UPDATE deployment_health SET unhealthy_notified=? WHERE deployment_id=?`, unhealthy, deploymentID); err != nil {
 		return fmt.Errorf("mark health notification state: %w", err)
 	}
-	message := delivery.Message{Footer: deploymentName, Time: at.UTC(), MuteMentions: true}
+	message := delivery.Message{Footer: deploymentName, Time: at.UTC(), Mentions: []string{}}
 	switch status {
 	case "unhealthy":
 		message.Title = "Monitor unhealthy"
