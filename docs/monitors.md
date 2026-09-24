@@ -438,9 +438,8 @@ monitord.Event{
 
 `Description` becomes the Discord embed description; `Body` remains message
 content. `Image` is a thumbnail, not a full-width image. Zero `Color` retains the
-severity-based default. `Data` is deprecated compatibility shorthand; prefer `Fields` in new monitors.
-Sorted `Data` fields remain supported and precede ordered
-`Fields`; correction references remain separate non-inline fields.
+severity-based default. `Fields` is the single field representation; correction references remain
+separate non-inline fields.
 
 `Footer` is opt-in: emitted events no longer automatically include the deployment
 name. Set it explicitly when desired. For OpenClaw delivery, footer text also
@@ -466,3 +465,18 @@ variant of an already committed event.
 Upgrade the daemon before monitors emit the new fields; older daemons can reject
 unknown fields. Rebuild monitors against the matching SDK. Already persisted
 outbox messages are not rewritten by this change.
+
+### Upgrading from Event.Data
+
+This is a breaking SDK/protocol change: `Event.Data` and its map renderer are
+removed. Convert each map entry to `EventField{Name: key, Value: value}` in the
+order you want displayed. For dynamic maps, sort the keys before constructing
+fields to retain the old deterministic order. Do not rely on Go map iteration.
+
+Prepare and compile updated monitor sources against the new SDK before cutover.
+Coordinate daemon and monitor-binary replacement: old binaries emitting `data`
+are not compatible with the new strict protocol. Preserve checkpoints, state,
+deployment identities and pending delivery records during the upgrade; do not
+reset the database. Drain in-flight transactions before switching, since changing
+the event representation also changes transaction content hashes. Persisted
+outbox messages already contain rendered fields and do not need conversion.

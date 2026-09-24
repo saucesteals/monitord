@@ -237,7 +237,7 @@ func (w *worker) transaction(ctx context.Context, store *storage.Store, wire mon
 	}
 	events := make([]storage.OutboxEvent, 0, len(wire.Events))
 	for i, event := range wire.Events {
-		fields := dataFields(event.Data)
+		fields := make([]delivery.Field, 0, len(event.Fields)+1)
 		for _, field := range event.Fields {
 			fields = append(fields, delivery.Field{Name: field.Name, Value: field.Value, Inline: field.Inline})
 		}

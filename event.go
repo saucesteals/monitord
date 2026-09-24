@@ -30,9 +30,6 @@ type Event struct {
 	Title        string   `json:"title"`
 	Body         string   `json:"body,omitempty"`
 	URL          string   `json:"url,omitempty"`
-	// Data is the legacy shorthand for sorted, non-inline fields.
-	// Deprecated: use Fields for explicit ordering and layout.
-	Data map[string]string `json:"data,omitempty"`
 
 	// Description supplies extended notification text, separate from Body.
 	Description string `json:"description,omitempty"`
@@ -40,7 +37,7 @@ type Event struct {
 	Image string `json:"image,omitempty"`
 	// Color overrides the severity color; zero keeps the adapter default.
 	Color int `json:"color,omitempty"`
-	// Fields are ordered presentation fields, appended after sorted Data.
+	// Fields are ordered presentation fields.
 	Fields []EventField `json:"fields,omitempty"`
 	// Footer is optional notification footer text. Empty means no footer.
 	Footer string `json:"footer,omitempty"`
