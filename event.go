@@ -33,9 +33,11 @@ type Event struct {
 
 	// Description supplies extended notification text, separate from Body.
 	Description string `json:"description,omitempty"`
-	// Image is the notification thumbnail URL for adapters that support it.
+	// Image is the full-size notification image URL.
 	Image string `json:"image,omitempty"`
-	// Color overrides the severity color; zero keeps the adapter default.
+	// Thumbnail is the compact notification image URL.
+	Thumbnail string `json:"thumbnail,omitempty"`
+	// Color is an RGB value in [0, 0xFFFFFF]; zero keeps the severity default.
 	Color int `json:"color,omitempty"`
 	// Fields are ordered presentation fields.
 	Fields []EventField `json:"fields,omitempty"`
@@ -72,6 +74,9 @@ func (e Event) Validate() error {
 	}
 	if strings.TrimSpace(e.Title) == "" {
 		return errors.New("event title is required")
+	}
+	if e.Color < 0 || e.Color > 0xFFFFFF {
+		return errors.New("event color must be between 0 and 0xFFFFFF")
 	}
 	for _, mention := range e.Mentions {
 		if _, err := delivery.ParseMention(mention); err != nil {

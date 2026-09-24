@@ -246,7 +246,7 @@ func (w *worker) transaction(ctx context.Context, store *storage.Store, wire mon
 		}
 		message := delivery.Message{
 			Title: event.Title, Message: event.Body, Summary: event.Description, URL: event.URL,
-			Thumbnail: event.Image, Color: event.Color,
+			Image: event.Image, Thumbnail: event.Thumbnail, Color: event.Color,
 			Level: eventLevel(event.Severity), Fields: fields,
 			Footer: event.Footer, Mentions: event.Mentions,
 		}

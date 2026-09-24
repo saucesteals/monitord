@@ -93,6 +93,7 @@ return tx.Emit(monitord.Event{
 	Body:        "A watched item is available.",
 	Description: "Available in the selected size.",
 	Image:       "https://example.com/images/42.png",
+	Thumbnail:   "https://example.com/images/42-thumb.png",
 	Color:       0x3498db,
 	Footer:      "Inventory watcher",
 	Fields: []monitord.EventField{
@@ -104,7 +105,8 @@ return tx.Emit(monitord.Event{
 ```
 
 Discord renders `Body` as message content, `Description` as the embed description,
-and `Image` as a thumbnail. Zero `Color` uses the severity color. `Footer` is
+`Image` as the full-size embed image, and `Thumbnail` as the compact thumbnail.
+`Color` must be between `0` and `0xFFFFFF`; zero uses the severity color. `Footer` is
 opt-in; an empty value adds no footer. OpenClaw delivery also uses footer text
 for monitor-name context and the run-name suffix.
 
