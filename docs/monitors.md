@@ -82,6 +82,39 @@ that may already have been seen.
 
 The valid severities are `info`, `warn`, and `critical`. Keep scraped or untrusted text in event fields; delivery adapters constrain mentions so source text cannot create arbitrary pings.
 
+### Presentation
+
+Use `Fields` for ordered notification fields. Each field controls its own inline layout:
+
+```go
+return tx.Emit(monitord.Event{
+	ID:          "inventory:revision-42",
+	Title:       "Inventory updated",
+	Body:        "A watched item is available.",
+	Description: "Available in the selected size.",
+	Image:       "https://example.com/images/42.png",
+	Thumbnail:   "https://example.com/images/42-thumb.png",
+	Color:       0x3498db,
+	Footer:      "Inventory watcher",
+	Fields: []monitord.EventField{
+		{Name: "Size", Value: "Medium", Inline: true},
+		{Name: "Details", Value: "Available for delivery"},
+	},
+	Mentions: []string{"user:123456789012345678"},
+})
+```
+
+Discord renders `Body` as message content, `Description` as the embed description,
+`Image` as the full-size embed image, and `Thumbnail` as the compact thumbnail.
+`Color` must be between `0` and `0xFFFFFF`; zero uses the severity color. `Footer` is
+opt-in; an empty value adds no footer. OpenClaw delivery also uses footer text
+for monitor-name context and the run-name suffix.
+
+`Mentions` accepts `user:ID`, `role:ID`, `here`, or `everyone`. Omitted/nil inherits
+the destination list, `[]string{}` suppresses mentions, and a populated array
+replaces the list. Health notifications use an empty array. Text in other fields
+cannot create arbitrary pings.
+
 ## Exact secrets
 
 Declare every required value on the plan and keep the `SecretRef` for access:

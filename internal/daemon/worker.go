@@ -237,14 +237,18 @@ func (w *worker) transaction(ctx context.Context, store *storage.Store, wire mon
 	}
 	events := make([]storage.OutboxEvent, 0, len(wire.Events))
 	for i, event := range wire.Events {
-		fields := dataFields(event.Data)
+		fields := make([]delivery.Field, 0, len(event.Fields)+1)
+		for _, field := range event.Fields {
+			fields = append(fields, delivery.Field{Name: field.Name, Value: field.Value, Inline: field.Inline})
+		}
 		if event.CorrectionOf != "" {
 			fields = append([]delivery.Field{{Name: "corrects", Value: event.CorrectionOf}}, fields...)
 		}
 		message := delivery.Message{
-			Title: event.Title, Message: event.Body, URL: event.URL,
+			Title: event.Title, Message: event.Body, Summary: event.Description, URL: event.URL,
+			Image: event.Image, Thumbnail: event.Thumbnail, Color: event.Color,
 			Level: eventLevel(event.Severity), Fields: fields,
-			Footer: w.deployment.Name,
+			Footer: event.Footer, Mentions: event.Mentions,
 		}
 		deliveries := make([]storage.OutboxDelivery, 0, len(bindings))
 		for _, b := range bindings {
