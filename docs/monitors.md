@@ -416,43 +416,50 @@ Local tests do not persist state, checkpoints, or deliveries. They print state c
 
 ## Event presentation
 
-An `Event` can supply optional presentation hints without changing its identity,
-state transaction, or destinations:
+Events may supply description, thumbnail (`Image`), RGB color (`Color`), explicit
+footer text (`Footer`), ordered `Fields`, and per-event `Mentions`:
 
 ```go
 monitord.Event{
-	ID:           "inventory:revision-42",
-	Title:        "Inventory updated",
-	Body:         "A watched item is available.",
-	Description:  "The item is available in the selected size.",
-	URL:          "https://example.com/items/42",
-	Image:        "https://example.com/images/42.png",
-	Color:        0x3498db,
-	InlineData:   true,
-	HideFooter:   true,
-	MuteMentions: true,
-	Data:         map[string]string{"Size": "Medium", "Status": "Available"},
+ ID: "inventory:revision-42",
+ Title: "Inventory updated",
+ Body: "A watched item is available.",
+ Description: "The item is available in the selected size.",
+ Image: "https://example.com/images/42.png",
+ Color: 0x3498db,
+ Footer: "Inventory watcher",
+ Fields: []monitord.EventField{
+  {Name: "Size", Value: "Medium", Inline: true},
+  {Name: "Details", Value: "Available for delivery"},
+ },
+ Mentions: []string{"user:123456789012345678"},
 }
 ```
 
-- `Description` is extended notification text. Discord uses it as the embed
-  description; `Body` remains the top-level message content.
-- `Image` maps to the notification thumbnail, not a full-width embed image.
-- `Color` requests an RGB embed color. Zero retains the severity-based default.
-- `InlineData` requests inline layout for the sorted `Data` fields. A correction
-  reference remains a separate non-inline field.
-- `HideFooter` omits the default deployment-name footer. It does not change the
-  deployment identity or destination bindings. For OpenClaw delivery, it also
-  omits the monitor-name context and uses the generic run name.
-- `MuteMentions` suppresses configured mentions for this event only.
+`Description` becomes the Discord embed description; `Body` remains message
+content. `Image` is a thumbnail, not a full-width image. Zero `Color` retains the
+severity-based default. Sorted `Data` fields remain supported and precede ordered
+`Fields`; correction references remain separate non-inline fields.
 
-Presentation support is adapter-specific; these hints do not add a new delivery
-backend. Existing URL filtering, text limits, and mention handling still apply.
-All new fields are optional and omitted from JSON at their zero values, preserving
-existing event payloads and default rendering. Presentation content participates
-in event content hashing: replay an event with the same ID and the same content,
-not a newly formatted variant of an already committed event.
+`Footer` is opt-in: emitted events no longer automatically include the deployment
+name. Set it explicitly when desired. For OpenClaw delivery, footer text also
+supplies monitor-name context and the run-name suffix; an empty footer uses the
+generic run name. Deployment identity and destination bindings are unchanged.
 
-The daemon and monitor SDK must both support these fields. Rebuild and deploy
-monitors against the matching SDK after upgrading the daemon; older daemons can
-reject events containing unknown fields.
+`Mentions` uses the existing target syntax: `user:ID`, `role:ID`, `here`, or
+`everyone`. An omitted/nil slice inherits the destination's configured mentions;
+an explicit empty slice (`[]string{}`, JSON `[]`) suppresses them. A populated
+array replaces—not appends to—the destination list. Each element is validated as
+one target. Explicit empty arrays survive serialization and outbox persistence.
+Health notifications retain their existing mention suppression.
+
+Presentation support is adapter-specific. Existing URL filtering, text limits,
+and allowed-mention handling still apply. Except for the intentional removal of
+the automatic footer, omitted options retain prior rendering. Nil optional fields
+are omitted from JSON, preserving existing event payloads. Presentation participates
+in content hashing: replay an event ID with the same content, not a reformatted
+variant of an already committed event.
+
+Upgrade the daemon before monitors emit the new fields; older daemons can reject
+unknown fields. Rebuild monitors against the matching SDK. Already persisted
+outbox messages are not rewritten by this change.

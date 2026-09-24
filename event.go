@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/saucesteals/monitord/internal/delivery"
 )
 
 const (
@@ -36,12 +38,19 @@ type Event struct {
 	Image string `json:"image,omitempty"`
 	// Color overrides the severity color; zero keeps the adapter default.
 	Color int `json:"color,omitempty"`
-	// InlineData requests inline layout for Data fields where supported.
-	InlineData bool `json:"inline_data,omitempty"`
-	// HideFooter omits the deployment-name footer from the notification.
-	HideFooter bool `json:"hide_footer,omitempty"`
-	// MuteMentions suppresses configured mentions for this occurrence.
-	MuteMentions bool `json:"mute_mentions,omitempty"`
+	// Fields are ordered presentation fields, appended after sorted Data.
+	Fields []EventField `json:"fields,omitempty"`
+	// Footer is optional notification footer text. Empty means no footer.
+	Footer string `json:"footer,omitempty"`
+	// Mentions overrides destination mentions. Nil inherits; empty suppresses.
+	Mentions []string `json:"mentions,omitzero"`
+}
+
+// EventField is one ordered notification field.
+type EventField struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline,omitempty"`
 }
 
 func (e Event) Validate() error {
@@ -64,6 +73,11 @@ func (e Event) Validate() error {
 	}
 	if strings.TrimSpace(e.Title) == "" {
 		return errors.New("event title is required")
+	}
+	for _, mention := range e.Mentions {
+		if _, err := delivery.ParseMention(mention); err != nil {
+			return err
+		}
 	}
 	if e.Severity != "" {
 		return e.Severity.Validate()

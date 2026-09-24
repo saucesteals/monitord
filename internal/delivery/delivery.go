@@ -143,6 +143,16 @@ func DeliverDiscord(ctx context.Context, delivery Delivery, msg Message) error {
 	if err != nil {
 		return err
 	}
+	if msg.Mentions != nil {
+		mentions = nil
+		for _, spec := range msg.Mentions {
+			mention, err := ParseMention(spec)
+			if err != nil {
+				return err
+			}
+			mentions = append(mentions, mention)
+		}
+	}
 	if msg.MuteMentions {
 		mentions = nil
 	}
@@ -234,6 +244,8 @@ type Message struct {
 	Fields     []Field `json:"fields,omitempty"`
 	Footer     string  `json:"footer,omitempty"`
 	FooterIcon string  `json:"footer_icon,omitempty"`
+	// Mentions overrides destination mentions. Nil inherits; empty suppresses.
+	Mentions []string `json:"mentions,omitzero"`
 	// MuteMentions prevents health failures and recoveries from paging people.
 	MuteMentions bool `json:"mute_mentions,omitempty"`
 	// Time is the notification timestamp. Zero means now at render time.
