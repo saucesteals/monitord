@@ -82,6 +82,37 @@ that may already have been seen.
 
 The valid severities are `info`, `warn`, and `critical`. Keep scraped or untrusted text in event fields; delivery adapters constrain mentions so source text cannot create arbitrary pings.
 
+### Presentation
+
+Use `Fields` for ordered notification fields. Each field controls its own inline layout:
+
+```go
+return tx.Emit(monitord.Event{
+	ID:          "inventory:revision-42",
+	Title:       "Inventory updated",
+	Body:        "A watched item is available.",
+	Description: "Available in the selected size.",
+	Image:       "https://example.com/images/42.png",
+	Color:       0x3498db,
+	Footer:      "Inventory watcher",
+	Fields: []monitord.EventField{
+		{Name: "Size", Value: "Medium", Inline: true},
+		{Name: "Details", Value: "Available for delivery"},
+	},
+	Mentions: []string{"user:123456789012345678"},
+})
+```
+
+Discord renders `Body` as message content, `Description` as the embed description,
+and `Image` as a thumbnail. Zero `Color` uses the severity color. `Footer` is
+opt-in; an empty value adds no footer. OpenClaw delivery also uses footer text
+for monitor-name context and the run-name suffix.
+
+`Mentions` accepts `user:ID`, `role:ID`, `here`, or `everyone`. Omitted/nil inherits
+the destination list, `[]string{}` suppresses mentions, and a populated array
+replaces the list. Health notifications use an empty array. Text in other fields
+cannot create arbitrary pings.
+
 ## Exact secrets
 
 Declare every required value on the plan and keep the `SecretRef` for access:
@@ -413,70 +444,3 @@ monitord inspect inventory
 ```
 
 Local tests do not persist state, checkpoints, or deliveries. They print state changes and emitted events. Polling monitors run one callback; continuous monitors run until `--duration` and then receive the normal graceful shutdown lifecycle. After deployment, use `inspect` to confirm the generation is ready, required secrets are available, and the first callback succeeds.
-
-## Event presentation
-
-Events may supply description, thumbnail (`Image`), RGB color (`Color`), explicit
-footer text (`Footer`), ordered `Fields`, and per-event `Mentions`:
-
-```go
-monitord.Event{
- ID: "inventory:revision-42",
- Title: "Inventory updated",
- Body: "A watched item is available.",
- Description: "The item is available in the selected size.",
- Image: "https://example.com/images/42.png",
- Color: 0x3498db,
- Footer: "Inventory watcher",
- Fields: []monitord.EventField{
-  {Name: "Size", Value: "Medium", Inline: true},
-  {Name: "Details", Value: "Available for delivery"},
- },
- Mentions: []string{"user:123456789012345678"},
-}
-```
-
-`Description` becomes the Discord embed description; `Body` remains message
-content. `Image` is a thumbnail, not a full-width image. Zero `Color` retains the
-severity-based default. `Fields` is the single field representation; correction references remain
-separate non-inline fields.
-
-`Footer` is opt-in: emitted events no longer automatically include the deployment
-name. Set it explicitly when desired. For OpenClaw delivery, footer text also
-supplies monitor-name context and the run-name suffix; an empty footer uses the
-generic run name. Deployment identity and destination bindings are unchanged.
-
-`Mentions` uses the existing target syntax: `user:ID`, `role:ID`, `here`, or
-`everyone`. An omitted/nil slice inherits the destination's configured mentions;
-an explicit empty slice (`[]string{}`, JSON `[]`) suppresses them. A populated
-array replaces—not appends to—the destination list. Each element is validated as
-one target. Explicit empty arrays survive serialization and outbox persistence.
-Health notifications explicitly use empty mention arrays. The old mute boolean
-is no longer written; already-persisted muted messages are translated to empty
-mention arrays when the outbox reads them.
-
-Presentation support is adapter-specific. Existing URL filtering, text limits,
-and allowed-mention handling still apply. Except for the intentional removal of
-the automatic footer, omitted options retain prior rendering. Nil optional fields
-are omitted from JSON, preserving existing event payloads. Presentation participates
-in content hashing: replay an event ID with the same content, not a reformatted
-variant of an already committed event.
-
-Upgrade the daemon before monitors emit the new fields; older daemons can reject
-unknown fields. Rebuild monitors against the matching SDK. Already persisted
-outbox messages are not rewritten by this change.
-
-### Upgrading from Event.Data
-
-This is a breaking SDK/protocol change: `Event.Data` and its map renderer are
-removed. Convert each map entry to `EventField{Name: key, Value: value}` in the
-order you want displayed. For dynamic maps, sort the keys before constructing
-fields to retain the old deterministic order. Do not rely on Go map iteration.
-
-Prepare and compile updated monitor sources against the new SDK before cutover.
-Coordinate daemon and monitor-binary replacement: old binaries emitting `data`
-are not compatible with the new strict protocol. Preserve checkpoints, state,
-deployment identities and pending delivery records during the upgrade; do not
-reset the database. Drain in-flight transactions before switching, since changing
-the event representation also changes transaction content hashes. Persisted
-outbox messages already contain rendered fields and do not need conversion.

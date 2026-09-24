@@ -39,18 +39,11 @@ func (s daemonDeliverySender) Send(ctx context.Context, claimed storage.ClaimedD
 	if err := binding.Validate(); err != nil {
 		return permanentDeliveryError{fmt.Errorf("invalid destination binding: %w", err)}
 	}
-	// Decode the old suppression flag only for already-persisted outbox messages.
-	var message struct {
-		delivery.Message
-		LegacyMuteMentions bool `json:"mute_mentions"`
-	}
+	var message delivery.Message
 	if err := json.Unmarshal(claimed.MessagePayload, &message); err != nil {
 		return permanentDeliveryError{fmt.Errorf("decode message: %w", err)}
 	}
-	if message.LegacyMuteMentions {
-		message.Mentions = []string{}
-	}
-	return s.daemon.deliverDestination(ctx, binding, message.Message)
+	return s.daemon.deliverDestination(ctx, binding, message)
 }
 
 type permanentDeliveryError struct{ error }
