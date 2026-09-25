@@ -22,7 +22,7 @@ func (s *Store) ListOutboxHistory(ctx context.Context, id string, limit int, fai
 	if failed {
 		filter = " AND d.status='dead'"
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT e.outbox_id,e.kind,e.event_id,d.destination_id,d.status,d.last_error,e.created_at,d.attempt_count FROM outbox_events e JOIN outbox_deliveries d ON d.outbox_id=e.outbox_id WHERE e.deployment_id=?`+filter+` ORDER BY e.created_at DESC LIMIT ?`, id, limit)
+	rows, err := s.readDB.QueryContext(ctx, `SELECT e.outbox_id,e.kind,e.event_id,d.destination_id,d.status,d.last_error,e.created_at,d.attempt_count FROM outbox_events e JOIN outbox_deliveries d ON d.outbox_id=e.outbox_id WHERE e.deployment_id=?`+filter+` ORDER BY e.created_at DESC LIMIT ?`, id, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +144,7 @@ func (s *Store) MarkDeliveryFailed(ctx context.Context, outboxID, destinationID,
 	}
 	message = boundedText(message, maxStoredErrorBytes)
 	var attempts int
-	err := s.db.QueryRowContext(ctx, `SELECT attempt_count FROM outbox_deliveries WHERE outbox_id=? AND destination_id=? AND status='sending' AND lease_owner=?`, outboxID, destinationID, owner).Scan(&attempts)
+	err := s.readDB.QueryRowContext(ctx, `SELECT attempt_count FROM outbox_deliveries WHERE outbox_id=? AND destination_id=? AND status='sending' AND lease_owner=?`, outboxID, destinationID, owner).Scan(&attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrLeaseLost
 	}

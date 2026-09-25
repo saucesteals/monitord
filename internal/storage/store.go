@@ -23,6 +23,7 @@ const maxStoredErrorBytes = 16 << 10
 
 type Store struct {
 	db                 *sql.DB
+	readDB             *sql.DB
 	checkpointDB       *sql.DB
 	checkpointCancel   context.CancelFunc
 	checkpointDone     chan struct{}
@@ -35,7 +36,8 @@ func Open(path string) (*Store, error) {
 }
 
 // OpenWithCheckpointer owns a background PASSIVE checkpointer until Close.
-// The operational pool remains serialized, with automatic checkpoints disabled.
+// Writes remain serialized, with automatic checkpoints disabled. Read-only
+// snapshots use an independent pool.
 func OpenWithCheckpointer(path string, logger *slog.Logger) (*Store, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -59,10 +61,16 @@ func openStore(path string, logger *slog.Logger) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	s := &Store{db: db}
+	readDB, err := openSQLiteReader(path)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	s := &Store{db: db, readDB: readDB}
 	if logger != nil {
 		checkpointDB, err := openSQLite(path, 1000)
 		if err != nil {
+			_ = readDB.Close()
 			_ = db.Close()
 			return nil, err
 		}
@@ -70,12 +78,14 @@ func openStore(path string, logger *slog.Logger) (*Store, error) {
 		initial, err := readWAL(context.Background(), checkpointDB, false)
 		if err != nil {
 			_ = checkpointDB.Close()
+			_ = readDB.Close()
 			_ = db.Close()
 			return nil, fmt.Errorf("initialize checkpointer: %w", err)
 		}
 		var pageSize int64
 		if err := checkpointDB.QueryRow("PRAGMA main.page_size").Scan(&pageSize); err != nil {
 			_ = checkpointDB.Close()
+			_ = readDB.Close()
 			_ = db.Close()
 			return nil, fmt.Errorf("read page size: %w", err)
 		}
@@ -133,7 +143,7 @@ func (s *Store) Close() error {
 		s.checkpointCancel()
 		<-s.checkpointDone
 	}
-	err := s.db.Close()
+	err := errors.Join(s.readDB.Close(), s.db.Close())
 	if s.checkpointDB != nil {
 		err = errors.Join(err, s.checkpointDB.Close())
 	}
@@ -150,4 +160,30 @@ func boundedText(value string, limit int) string {
 		value = value[:len(value)-1]
 	}
 	return value
+}
+
+// openSQLiteReader never reserves the writer. DSN settings also protect replacement
+// connections; mode=ro prevents writes even if query_only is accidentally changed.
+func openSQLiteReader(path string) (*sql.DB, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve reader path: %w", err)
+	}
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
+	q := u.Query()
+	q.Set("mode", "ro")
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "query_only(ON)")
+	u.RawQuery = q.Encode()
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite reader: %w", err)
+	}
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
+	if err := db.PingContext(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("initialize sqlite reader: %w", err)
+	}
+	return db, nil
 }

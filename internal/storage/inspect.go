@@ -42,7 +42,7 @@ type TransactionStatus struct {
 // read transaction so related status cannot be assembled from different
 // moments in time.
 func (s *Store) InspectDeployment(ctx context.Context, selector string) (Inspection, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := s.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return Inspection{}, err
 	}

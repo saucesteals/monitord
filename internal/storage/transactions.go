@@ -235,7 +235,7 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 
 func (s *Store) resolveTransaction(ctx context.Context, frame TransactionFrame) (TransactionACK, bool, error) {
 	var storedHash, ackPayload []byte
-	err := s.db.QueryRowContext(ctx, `
+	err := s.readDB.QueryRowContext(ctx, `
 		SELECT payload_hash, ack_payload FROM transactions
 		WHERE deployment_id = ? AND generation = ? AND seq = ?`,
 		frame.DeploymentID, frame.Generation, frame.Sequence).Scan(&storedHash, &ackPayload)

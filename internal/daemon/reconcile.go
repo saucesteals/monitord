@@ -18,7 +18,7 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	if _, err := d.store.DeactivateDueDeployments(ctx, now); err != nil {
 		reconcileErrs = append(reconcileErrs, fmt.Errorf("deactivate deployments: %w", err))
 	}
-	deps, err := d.store.ListRuntimeDeployments(ctx)
+	deps, err := d.store.ListRuntimeMetadata(ctx)
 	if err != nil {
 		return err
 	}
@@ -37,7 +37,7 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 		if existing == nil && now.Before(next) {
 			continue
 		}
-		secretMap, fingerprint, redactor, err := d.resolveDeploymentSecrets(dep)
+		secretMap, fingerprint, redactor, err := d.resolveDeploymentSecrets(dep.SourceDir, dep.Describe)
 		if err != nil {
 			if existing != nil {
 				d.stopWorker(dep.ID, "secret resolution failed")
@@ -70,7 +70,16 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 		if existing != nil {
 			continue
 		}
-		if err = d.launch(ctx, dep, secretMap, fingerprint, redactor); err != nil {
+		snapshot, snapshotErr := d.store.GetRuntimeDeployment(ctx, dep.ID)
+		if snapshotErr == nil && (snapshot.ArtifactID != dep.ArtifactID || snapshot.ConfigRevision != dep.ConfigRevision || snapshot.ActiveGeneration != dep.ActiveGeneration || snapshot.SourceDir != dep.SourceDir) {
+			// Reconcile again rather than launch with secrets from a different artifact.
+			continue
+		}
+		err = snapshotErr
+		if err == nil {
+			err = d.launch(ctx, snapshot, secretMap, fingerprint, redactor)
+		}
+		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -125,9 +134,9 @@ func (d *Daemon) stopWorker(id, reason string) {
 	cancel()
 }
 
-func (d *Daemon) resolveDeploymentSecrets(dep storage.RuntimeDeployment) (map[string]map[string]string, string, secrets.Redactor, error) {
+func (d *Daemon) resolveDeploymentSecrets(sourceDir string, describe json.RawMessage) (map[string]map[string]string, string, secrets.Redactor, error) {
 	var described monitord.MonitorFrame
-	if err := json.Unmarshal(dep.Describe, &described); err != nil {
+	if err := json.Unmarshal(describe, &described); err != nil {
 		return nil, "", secrets.Redactor{}, fmt.Errorf("decode artifact describe: %w", err)
 	}
 	refs := described.Plan.SecretRefs()
@@ -135,7 +144,7 @@ func (d *Daemon) resolveDeploymentSecrets(dep storage.RuntimeDeployment) (map[st
 	for _, r := range refs {
 		requested = append(requested, secrets.Ref{Group: r.Group, Key: r.Key, Required: r.Required})
 	}
-	values, err := secrets.Resolve(requested, secrets.Sources{Root: d.paths.Root, MonitorDir: dep.SourceDir})
+	values, err := secrets.Resolve(requested, secrets.Sources{Root: d.paths.Root, MonitorDir: sourceDir})
 	if err != nil {
 		return nil, "", secrets.Redactor{}, err
 	}

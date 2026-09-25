@@ -23,7 +23,7 @@ type workerSlot struct {
 }
 
 func (d *Daemon) launch(parent context.Context, dep storage.RuntimeDeployment, secretMap map[string]map[string]string, fingerprint string, redactor secrets.Redactor) error {
-	gen, err := d.store.ActivateGeneration(parent, storage.GenerationActivation{DeploymentID: dep.ID, ArtifactID: dep.ArtifactID, ConfigRevision: dep.ConfigRevision, StateRevision: dep.StateRevision, SecretFingerprint: []byte(fingerprint)})
+	gen, err := d.store.ActivateGeneration(parent, storage.GenerationActivation{DeploymentID: dep.ID, ArtifactID: dep.ArtifactID, ConfigRevision: dep.ConfigRevision, StateRevision: dep.StateRevision, ActiveGeneration: dep.ActiveGeneration, SecretFingerprint: []byte(fingerprint)})
 	if err != nil {
 		return err
 	}

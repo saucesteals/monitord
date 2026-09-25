@@ -16,7 +16,7 @@ type DeploymentSummary struct {
 
 // ListDeploymentSummaries reads deployment status without loading state or history.
 func (s *Store) ListDeploymentSummaries(ctx context.Context) ([]DeploymentSummary, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id,d.name,d.status,h.status,h.consecutive_failures,d.expires_at
+	rows, err := s.readDB.QueryContext(ctx, `SELECT d.id,d.name,d.status,h.status,h.consecutive_failures,d.expires_at
  FROM deployments d LEFT JOIN deployment_health h ON h.deployment_id=d.id ORDER BY d.name`)
 	if err != nil {
 		return nil, fmt.Errorf("list deployment summaries: %w", err)

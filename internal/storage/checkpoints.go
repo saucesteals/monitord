@@ -16,69 +16,81 @@ type RuntimeDeployment struct {
 	Checkpoints                map[string]json.RawMessage
 }
 
+// RuntimeMetadata is the scheduler's payload-free reconciliation snapshot.
+type RuntimeMetadata struct {
+	ID, Name, SourceDir, ArtifactID  string
+	ConfigRevision, ActiveGeneration int64
+	Describe                         json.RawMessage
+}
+
+// ListRuntimeMetadata lists only launch identity and secret declarations, not
+// mutable state or checkpoint payloads.
+func (s *Store) ListRuntimeMetadata(ctx context.Context) ([]RuntimeMetadata, error) {
+	rows, err := s.readDB.QueryContext(ctx, `SELECT d.id,d.name,d.source_dir,d.artifact_id,d.config_revision,d.active_generation,a.describe_json
+ FROM deployments d JOIN artifacts a ON a.id=d.artifact_id
+ WHERE d.status='active' AND (d.expires_at IS NULL OR d.expires_at>?) ORDER BY d.name`, toMs(time.Now()))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []RuntimeMetadata
+	for rows.Next() {
+		var r RuntimeMetadata
+		if err := rows.Scan(&r.ID, &r.Name, &r.SourceDir, &r.ArtifactID, &r.ConfigRevision, &r.ActiveGeneration, &r.Describe); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// GetRuntimeDeployment reads state, checkpoints and configuration from one short
+// WAL snapshot. Activation revalidates this snapshot before advancing the fence.
 func (s *Store) GetRuntimeDeployment(ctx context.Context, selector string) (RuntimeDeployment, error) {
-	d, err := s.GetDeployment(ctx, selector)
+	tx, err := s.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return RuntimeDeployment{}, err
 	}
+	defer func() { _ = tx.Rollback() }()
 	var r RuntimeDeployment
-	r.Deployment = d
-	err = s.db.QueryRowContext(ctx, `SELECT path,content_hash,describe_json FROM artifacts WHERE id=?`, d.ArtifactID).Scan(&r.ArtifactPath, &r.ArtifactHash, &r.Describe)
-	return r, err
-}
-
-func (s *Store) ListRuntimeDeployments(ctx context.Context) ([]RuntimeDeployment, error) {
-	now := toMs(time.Now().UTC())
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id,d.name,d.info_name,d.source_dir,d.status,COALESCE(d.artifact_id,''),d.config_revision,d.config_hash,d.failure_threshold,d.max_events_per_transaction,d.event_retention_ms,d.active_generation,d.state,d.state_revision,d.created_at,d.updated_at,d.expires_at,d.archived_at,a.path,a.content_hash,a.describe_json FROM deployments d JOIN artifacts a ON a.id=d.artifact_id WHERE d.status='active' AND (d.expires_at IS NULL OR d.expires_at>?) ORDER BY d.name`, now)
-	if err != nil {
-		return nil, err
+	var created, updated, retention int64
+	var expires, archived sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT d.id,d.name,d.info_name,d.source_dir,d.status,COALESCE(d.artifact_id,''),d.config_revision,d.config_hash,d.failure_threshold,d.max_events_per_transaction,d.event_retention_ms,d.active_generation,d.state,d.state_revision,d.created_at,d.updated_at,d.expires_at,d.archived_at,a.path,a.content_hash,a.describe_json
+ FROM deployments d JOIN artifacts a ON a.id=d.artifact_id WHERE d.id=? OR d.name=? ORDER BY CASE WHEN d.id=? THEN 0 ELSE 1 END LIMIT 1`, selector, selector, selector).
+		Scan(&r.ID, &r.Name, &r.InfoName, &r.SourceDir, &r.Status, &r.ArtifactID, &r.ConfigRevision, &r.ConfigHash, &r.FailureThreshold, &r.MaxEventsPerTransaction, &retention, &r.ActiveGeneration, &r.State, &r.StateRevision, &created, &updated, &expires, &archived, &r.ArtifactPath, &r.ArtifactHash, &r.Describe)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RuntimeDeployment{}, ErrNotFound
 	}
-	defer rows.Close()
-	var out []RuntimeDeployment
+	if err != nil {
+		return RuntimeDeployment{}, err
+	}
+	r.EventRetention = time.Duration(retention) * time.Millisecond
+	r.CreatedAt = fromMs(created)
+	r.UpdatedAt = fromMs(updated)
+	r.ExpiresAt = nullTime(expires)
+	r.ArchivedAt = nullTime(archived)
+	rows, err := tx.QueryContext(ctx, `SELECT source,value FROM checkpoints WHERE deployment_id=? ORDER BY source`, r.ID)
+	if err != nil {
+		return RuntimeDeployment{}, err
+	}
+	r.Checkpoints = make(map[string]json.RawMessage)
 	for rows.Next() {
-		var r RuntimeDeployment
-		var state []byte
-		var created, updated int64
-		var retentionMS int64
-		var expires, archived sql.NullInt64
-		if err = rows.Scan(&r.ID, &r.Name, &r.InfoName, &r.SourceDir, &r.Status, &r.ArtifactID, &r.ConfigRevision, &r.ConfigHash, &r.FailureThreshold, &r.MaxEventsPerTransaction, &retentionMS, &r.ActiveGeneration, &state, &r.StateRevision, &created, &updated, &expires, &archived, &r.ArtifactPath, &r.ArtifactHash, &r.Describe); err != nil {
-			return nil, err
+		var source string
+		var value json.RawMessage
+		if err := rows.Scan(&source, &value); err != nil {
+			_ = rows.Close()
+			return RuntimeDeployment{}, err
 		}
-		r.State = append(json.RawMessage(nil), state...)
-		r.EventRetention = time.Duration(retentionMS) * time.Millisecond
-		r.CreatedAt = fromMs(created)
-		r.UpdatedAt = fromMs(updated)
-		r.ExpiresAt = nullTime(expires)
-		r.ArchivedAt = nullTime(archived)
-		out = append(out, r)
+		r.Checkpoints[source] = value
 	}
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-	if err = rows.Close(); err != nil {
-		return nil, err
-	}
-	byID := make(map[string]*RuntimeDeployment, len(out))
-	for i := range out {
-		out[i].Checkpoints = map[string]json.RawMessage{}
-		byID[out[i].ID] = &out[i]
-	}
-	checkpointRows, err := s.db.QueryContext(ctx, `SELECT c.deployment_id,c.source,c.value FROM checkpoints c JOIN deployments d ON d.id=c.deployment_id WHERE d.status='active' AND (d.expires_at IS NULL OR d.expires_at>?) ORDER BY c.deployment_id,c.source`, now)
+	err = errors.Join(rows.Err(), rows.Close())
 	if err != nil {
-		return nil, err
+		return RuntimeDeployment{}, err
 	}
-	defer checkpointRows.Close()
-	for checkpointRows.Next() {
-		var deploymentID, source string
-		var value []byte
-		if err = checkpointRows.Scan(&deploymentID, &source, &value); err != nil {
-			return nil, err
-		}
-		if deployment := byID[deploymentID]; deployment != nil {
-			deployment.Checkpoints[source] = append(json.RawMessage(nil), value...)
-		}
+	if err = tx.Commit(); err != nil {
+		return RuntimeDeployment{}, err
 	}
-	return out, checkpointRows.Err()
+	return r, nil
 }
 
 // ClearCheckpoints removes all durable source progress for an inactive

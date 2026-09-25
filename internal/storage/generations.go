@@ -15,6 +15,7 @@ type GenerationActivation struct {
 	ArtifactID        string
 	ConfigRevision    int64
 	StateRevision     int64
+	ActiveGeneration  int64
 	SecretFingerprint []byte
 }
 
@@ -72,7 +73,7 @@ func (s *Store) ActivateGeneration(ctx context.Context, activation GenerationAct
 	err = tx.QueryRowContext(ctx, `
 		SELECT artifact_id, active_generation, config_revision, state_revision
 		FROM deployments
-		WHERE id = ? AND status = 'active'`, activation.DeploymentID).
+		WHERE id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at>?)`, activation.DeploymentID, toMs(time.Now())).
 		Scan(&artifactID, &activeGeneration, &configRevision, &stateRevision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ActiveGeneration{}, fmt.Errorf("active deployment %q not found", activation.DeploymentID)
@@ -83,7 +84,7 @@ func (s *Store) ActivateGeneration(ctx context.Context, activation GenerationAct
 	if configRevision != activation.ConfigRevision {
 		return ActiveGeneration{}, fmt.Errorf("config revision changed: got %d, current %d", activation.ConfigRevision, configRevision)
 	}
-	if artifactID != activation.ArtifactID || stateRevision != activation.StateRevision {
+	if artifactID != activation.ArtifactID || stateRevision != activation.StateRevision || activeGeneration != activation.ActiveGeneration {
 		return ActiveGeneration{}, errors.New("deployment snapshot changed during generation activation")
 	}
 

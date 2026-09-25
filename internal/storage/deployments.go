@@ -127,7 +127,7 @@ func (s *Store) Deploy(ctx context.Context, in DeployInput) (Deployment, error) 
 }
 
 func (s *Store) ListDeployments(ctx context.Context) ([]Deployment, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,active_generation,state,state_revision,created_at,updated_at,expires_at,archived_at FROM deployments ORDER BY name`)
+	rows, err := s.readDB.QueryContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,active_generation,state,state_revision,created_at,updated_at,expires_at,archived_at FROM deployments ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -154,6 +154,16 @@ func (s *Store) ListDeployments(ctx context.Context) ([]Deployment, error) {
 }
 
 func (s *Store) DeactivateDueDeployments(ctx context.Context, now time.Time) (int64, error) {
+	// The common reconciliation pass must not reserve the writer when no watch
+	// has expired. The mutation below rechecks expiry after acquiring the writer.
+	var due bool
+	if err := s.readDB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM deployments WHERE status='active' AND expires_at IS NOT NULL AND expires_at<=?)`, toMs(now)).Scan(&due); err != nil {
+		return 0, err
+	}
+	if !due {
+		return 0, nil
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -186,7 +196,7 @@ func (s *Store) GetDeployment(ctx context.Context, selector string) (Deployment,
 	var created, updated int64
 	var retentionMS int64
 	var expires, archived sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,active_generation,state,state_revision,created_at,updated_at,expires_at,archived_at
+	err := s.readDB.QueryRowContext(ctx, `SELECT id,name,info_name,source_dir,status,COALESCE(artifact_id,''),config_revision,config_hash,failure_threshold,max_events_per_transaction,event_retention_ms,active_generation,state,state_revision,created_at,updated_at,expires_at,archived_at
 		FROM deployments WHERE id=? OR name=? ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END LIMIT 1`, selector, selector, selector).Scan(&d.ID, &d.Name, &d.InfoName, &d.SourceDir, &d.Status, &d.ArtifactID, &d.ConfigRevision, &d.ConfigHash, &d.FailureThreshold, &d.MaxEventsPerTransaction, &retentionMS, &d.ActiveGeneration, &state, &d.StateRevision, &created, &updated, &expires, &archived)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, fmt.Errorf("deployment %q: %w", selector, ErrNotFound)
