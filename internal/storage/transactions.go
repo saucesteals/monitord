@@ -68,8 +68,13 @@ type TransactionACK struct {
 // generation replacement remains recoverable.
 func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (TransactionACK, error) {
 	started := time.Now()
+	timing := transactionTiming{
+		started:   started,
+		operation: "validate",
+	}
 	var acquired, committing time.Time
 	defer func() {
+		timing.next("")
 		elapsed := time.Since(started)
 		if elapsed < time.Second {
 			return
@@ -83,12 +88,13 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 			sqlWork = committing.Sub(acquired)
 			commitTime = time.Since(committing)
 		}
-		slog.Warn("slow transaction persistence", "deployment", frame.DeploymentID, "generation", frame.Generation, "sequence", frame.Sequence, "duration", elapsed, "pool_wait", poolWait, "sql_work", sqlWork, "commit", commitTime)
+		slog.Warn("slow transaction persistence", "deployment", frame.DeploymentID, "generation", frame.Generation, "sequence", frame.Sequence, "duration", elapsed, "pool_wait", poolWait, "sql_work", sqlWork, "commit", commitTime, "slowest_operation", timing.slowestOperation, "slowest_operation_duration", timing.slowestDuration, "state_bytes", len(frame.NextState), "checkpoints", len(frame.Checkpoints), "events", len(frame.Events))
 	}()
 	if err := validateFrame(frame); err != nil {
 		return TransactionACK{}, err
 	}
 
+	timing.next("begin")
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return TransactionACK{}, fmt.Errorf("begin transaction frame: %w", err)
@@ -96,6 +102,7 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 	acquired = time.Now()
 	defer tx.Rollback()
 
+	timing.next("lookup_ack")
 	ack, found, err := lookupTransaction(ctx, tx, frame)
 	if err != nil {
 		return TransactionACK{}, err
@@ -106,6 +113,7 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 
 	var activeGeneration, stateRevision, lastSequence int64
 	var tokenHash []byte
+	timing.next("load_generation")
 	err = tx.QueryRowContext(ctx, `
 		SELECT d.active_generation, d.state_revision,
 		       g.last_transaction_seq, g.worker_token_hash
@@ -137,6 +145,7 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 
 	resultRevision := stateRevision + 1
 	now := time.Now().UTC()
+	timing.next("update_state")
 	result, err := tx.ExecContext(ctx, `
 		UPDATE deployments
 		SET state = ?, state_revision = ?, updated_at = ?
@@ -150,7 +159,42 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 		return TransactionACK{}, ErrGenerationFenced
 	}
 
+	// Write the parent ledger record before outbox children so SQLite does not
+	// need to resolve deferred child references on the parent insert.
+	ack = TransactionACK{
+		DeploymentID: frame.DeploymentID, Generation: frame.Generation,
+		Sequence: frame.Sequence, PayloadHash: hex.EncodeToString(frame.PayloadHash[:]),
+		ResultRevision: resultRevision, Status: "accepted",
+	}
+	ackPayload, err := json.Marshal(ack)
+	if err != nil {
+		return TransactionACK{}, fmt.Errorf("encode transaction ack: %w", err)
+	}
+	timing.next("advance_sequence")
+	result, err = tx.ExecContext(ctx, `
+		UPDATE deployment_generations SET last_transaction_seq = ?
+		WHERE deployment_id = ? AND generation = ? AND last_transaction_seq = ?`,
+		frame.Sequence, frame.DeploymentID, frame.Generation, lastSequence)
+	if err != nil {
+		return TransactionACK{}, fmt.Errorf("advance transaction sequence: %w", err)
+	}
+	if err := requireOneRow(result, "advance transaction sequence"); err != nil {
+		return TransactionACK{}, ErrSequenceConflict
+	}
+	timing.next("insert_ledger")
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO transactions (
+			deployment_id, generation, seq, payload_hash, base_revision,
+			result_revision, ack_payload, committed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, frame.DeploymentID, frame.Generation,
+		frame.Sequence, frame.PayloadHash[:], frame.BaseStateRevision, resultRevision,
+		ackPayload, toMs(now)); err != nil {
+		return TransactionACK{}, fmt.Errorf("write transaction ledger: %w", err)
+	}
+
+	timing.next("prepare_checkpoints")
 	for _, checkpoint := range frame.Checkpoints {
+		timing.next("write_checkpoint")
 		hash := sha256.Sum256(checkpoint.Value)
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO checkpoints (
@@ -168,42 +212,15 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 	}
 
 	for _, event := range frame.Events {
-		if err := insertOutboxEvent(ctx, tx, frame, event, now); err != nil {
+		if err := insertOutboxEvent(ctx, tx, frame, event, now, &timing); err != nil {
 			return TransactionACK{}, err
 		}
 	}
 
-	ack = TransactionACK{
-		DeploymentID: frame.DeploymentID, Generation: frame.Generation,
-		Sequence: frame.Sequence, PayloadHash: hex.EncodeToString(frame.PayloadHash[:]),
-		ResultRevision: resultRevision, Status: "accepted",
-	}
-	ackPayload, err := json.Marshal(ack)
-	if err != nil {
-		return TransactionACK{}, fmt.Errorf("encode transaction ack: %w", err)
-	}
-	result, err = tx.ExecContext(ctx, `
-		UPDATE deployment_generations SET last_transaction_seq = ?
-		WHERE deployment_id = ? AND generation = ? AND last_transaction_seq = ?`,
-		frame.Sequence, frame.DeploymentID, frame.Generation, lastSequence)
-	if err != nil {
-		return TransactionACK{}, fmt.Errorf("advance transaction sequence: %w", err)
-	}
-	if err := requireOneRow(result, "advance transaction sequence"); err != nil {
-		return TransactionACK{}, ErrSequenceConflict
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO transactions (
-			deployment_id, generation, seq, payload_hash, base_revision,
-			result_revision, ack_payload, committed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, frame.DeploymentID, frame.Generation,
-		frame.Sequence, frame.PayloadHash[:], frame.BaseStateRevision, resultRevision,
-		ackPayload, toMs(now)); err != nil {
-		return TransactionACK{}, fmt.Errorf("write transaction ledger: %w", err)
-	}
-
+	timing.next("commit")
 	committing = time.Now()
 	if err := tx.Commit(); err != nil {
+		timing.next("resolve_ack")
 		resolved, found, lookupErr := s.resolveTransaction(ctx, frame)
 		if lookupErr == nil && found {
 			return resolved, nil
@@ -260,7 +277,8 @@ func lookupTransaction(ctx context.Context, tx *sql.Tx, frame TransactionFrame) 
 	return ack, true, nil
 }
 
-func insertOutboxEvent(ctx context.Context, tx *sql.Tx, frame TransactionFrame, event OutboxEvent, now time.Time) error {
+func insertOutboxEvent(ctx context.Context, tx *sql.Tx, frame TransactionFrame, event OutboxEvent, now time.Time, timing *transactionTiming) error {
+	timing.next("encode_event")
 	// The payload is already destination-neutral. Stamp it once when the
 	// transaction commits so every retry and destination renders the same occurrence.
 	identityPayload, err := json.Marshal(event.Message)
@@ -273,6 +291,7 @@ func insertOutboxEvent(ctx context.Context, tx *sql.Tx, frame TransactionFrame, 
 	if err != nil {
 		return fmt.Errorf("encode event message %q: %w", event.EventID, err)
 	}
+	timing.next("insert_event")
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO outbox_events (
 			outbox_id, deployment_id, kind, generation, transaction_seq,
@@ -282,6 +301,7 @@ func insertOutboxEvent(ctx context.Context, tx *sql.Tx, frame TransactionFrame, 
 		// Event IDs identify immutable source occurrences across transactions.
 		// An inclusive replay with identical content coalesces; reusing the ID
 		// for different content is a fatal application conflict.
+		timing.next("lookup_event_conflict")
 		var storedHash []byte
 		lookupErr := tx.QueryRowContext(ctx, `SELECT payload_hash FROM outbox_events WHERE deployment_id=? AND kind='monitor' AND event_id=?`, frame.DeploymentID, event.EventID).Scan(&storedHash)
 		if lookupErr == nil && bytes.Equal(storedHash, identityHash[:]) {
@@ -293,6 +313,7 @@ func insertOutboxEvent(ctx context.Context, tx *sql.Tx, frame TransactionFrame, 
 		return fmt.Errorf("insert outbox event %q: %w", event.EventID, err)
 	}
 	for _, delivery := range event.Deliveries {
+		timing.next("insert_delivery")
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO outbox_deliveries (
 				outbox_id, deployment_id, destination_id, destination_revision, next_attempt_at
@@ -352,4 +373,22 @@ func validateFrame(frame TransactionFrame) error {
 		return errors.New("transaction frame payload hash is missing")
 	}
 	return nil
+}
+
+// transactionTiming reports labels and durations only, never SQL arguments or state.
+type transactionTiming struct {
+	started          time.Time
+	operation        string
+	slowestOperation string
+	slowestDuration  time.Duration
+}
+
+func (t *transactionTiming) next(operation string) {
+	now := time.Now()
+	if elapsed := now.Sub(t.started); elapsed > t.slowestDuration {
+		t.slowestOperation = t.operation
+		t.slowestDuration = elapsed
+	}
+	t.started = now
+	t.operation = operation
 }

@@ -30,7 +30,9 @@ The daemon normally reconciles every five seconds. Scheduling deadlines remain e
 
 ## Replacing an installation
 
-monitord has one current database shape and does not transform another installation in place. To replace an installation:
+Supported database upgrades run transactionally when the store opens. Stop the daemon and back up the whole root before upgrading; index creation can delay the first open. An older binary may reject an upgraded schema, so rollback requires the matching backup, not just the old executable. Unknown or unversioned nonempty schemas are rejected.
+
+To replace an incompatible installation:
 
 1. Stop or unload the existing service.
 2. Move the entire old root to a timestamped backup.
@@ -149,7 +151,9 @@ Delivery is at least once. If a destination accepts a request just before the da
 
 Per-destination rate limiting delays rows without charging a failed attempt. Pending and leased deliveries are retained regardless of age. Terminal events are pruned only after `events.retention` has elapsed and every destination is delivered or dead.
 
-Hourly maintenance prunes up to 1,000 unreferenced transaction ACKs from generations retired more than seven days ago. Active-generation ACKs and transactions referenced by retained outbox events are preserved. Retired ACK recovery is not guaranteed beyond that horizon; missing old-generation frames are fenced rather than reapplied. Maintenance does not vacuum the database.
+Maintenance visits at most 1,000 outbox events and 1,000 transaction ACKs per batch, including records that cannot yet be deleted. It saves each scan position atomically with deletion and resumes it after restart. Each sweep has a fixed high-water mark so new records cannot extend it indefinitely. Pending/leased deliveries, active-generation ACKs, and ACKs referenced by retained events remain protected; unreferenced ACKs become eligible only after their generation has been retired for more than seven days.
+
+Batches continue with a one-second pause while a sweep has more candidates, releasing the database between transactions. Completed sweeps are revisited after an hour; protected records are reconsidered then. Cleanup runs independently of delivery requests; pages taking at least one second produce a `slow maintenance page` diagnostic with duration and candidate/deletion counts. Retired ACK recovery is not guaranteed beyond the retention horizon; missing old-generation frames are fenced rather than reapplied. Maintenance does not vacuum the database.
 
 ## Logs and service checks
 
@@ -162,7 +166,7 @@ The daemon writes structured operational logs to stdout and reserves stderr for 
 
 A nonempty macOS stderr log indicates a process-level failure rather than a copy of routine INFO output. The default Linux systemd service sends both streams to the user journal. Persisted health and delivery errors are bounded and secret values are redacted; avoid returning scraped credentials or complete authenticated URLs from monitor code. Preserve chain-named QuickNode endpoint values exactly as issued and never write them to events or logs.
 
-Transactions taking at least one second produce `slow transaction persistence` and `slow transaction settlement` diagnostics. These separate connection acquisition, SQL work, commit, and overall settlement duration without logging transaction contents. Commit time can include SQLite checkpoint work; it is not an isolated fsync measurement.
+Transactions taking at least one second produce `slow transaction persistence` and `slow transaction settlement` diagnostics. These separate connection acquisition, SQL work, commit, and overall settlement duration. Persistence diagnostics also report the slowest operation label and duration, state size, and checkpoint/event counts without logging transaction contents. Commit time can include SQLite checkpoint work; it is not an isolated fsync measurement.
 
 Useful checks:
 

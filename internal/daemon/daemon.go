@@ -64,6 +64,12 @@ func (d *Daemon) run(ctx context.Context) error {
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
 	defer d.stopWorkers()
+	maintenanceDone := make(chan struct{})
+	go func() {
+		defer close(maintenanceDone)
+		d.runMaintenance(ctx)
+	}()
+	defer func() { <-maintenanceDone }()
 	var outboxDone chan struct{}
 	if d.deliverySender != nil {
 		outboxDone = make(chan struct{})
@@ -93,23 +99,6 @@ func (d *Daemon) run(ctx context.Context) error {
 func (d *Daemon) runOutbox(ctx context.Context, outbox *outboxWorker) {
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
-	pruneTicker := time.NewTicker(time.Hour)
-	defer pruneTicker.Stop()
-	prune := func() {
-		count, err := d.store.PruneTerminalOutbox(ctx, time.Now().UTC())
-		if err != nil && !errors.Is(err, context.Canceled) {
-			d.logger.Error("outbox pruning failed", "error", err)
-		} else if count > 0 {
-			d.logger.Debug("pruned terminal outbox events", "count", count)
-		}
-		count, err = d.store.PruneRetiredTransactions(ctx, time.Now().UTC())
-		if err != nil && !errors.Is(err, context.Canceled) {
-			d.logger.Error("transaction ledger pruning failed", "error", err)
-		} else if count > 0 {
-			d.logger.Debug("pruned retired transactions", "count", count)
-		}
-	}
-	prune()
 	for {
 		if _, err := outbox.process(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			d.logger.Warn("outbox delivery failed", "error", err)
@@ -118,8 +107,6 @@ func (d *Daemon) runOutbox(ctx context.Context, outbox *outboxWorker) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-		case <-pruneTicker.C:
-			prune()
 		}
 	}
 }

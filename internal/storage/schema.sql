@@ -146,3 +146,19 @@ CREATE INDEX outbox_deliveries_lease
     WHERE status = 'sending';
 CREATE INDEX outbox_events_retention
     ON outbox_events(deployment_id, created_at);
+
+-- Child keys used by ledger foreign-key checks and replay-safe retention.
+CREATE INDEX outbox_events_transaction
+    ON outbox_events(deployment_id, generation, transaction_seq);
+CREATE INDEX outbox_deliveries_deployment
+    ON outbox_deliveries(deployment_id, status);
+
+CREATE INDEX outbox_deliveries_event
+    ON outbox_deliveries(outbox_id, deployment_id);
+
+CREATE TABLE maintenance_cursors (
+    name            TEXT PRIMARY KEY CHECK(name IN ('outbox','transactions')),
+    after_rowid     INTEGER NOT NULL DEFAULT 0 CHECK(after_rowid >= 0),
+    through_rowid   INTEGER NOT NULL DEFAULT 0 CHECK(through_rowid >= after_rowid),
+    next_sweep_at   INTEGER NOT NULL DEFAULT 0
+) STRICT;
