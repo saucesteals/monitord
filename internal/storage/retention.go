@@ -15,9 +15,9 @@ func (s *Store) PruneRetiredTransactions(ctx context.Context, now time.Time) (in
    SELECT t.rowid FROM deployment_generations g
    JOIN transactions t ON t.deployment_id=g.deployment_id AND t.generation=g.generation
    WHERE g.status='retired' AND g.retired_at < ?
-   AND (t.deployment_id,t.generation,t.seq) NOT IN (
-    SELECT deployment_id,generation,transaction_seq FROM outbox_events
-    WHERE transaction_seq IS NOT NULL
+   AND NOT EXISTS (
+    SELECT 1 FROM outbox_events e
+    WHERE e.deployment_id=t.deployment_id AND e.generation=t.generation AND e.transaction_seq=t.seq
    )
    LIMIT 1000
   )`, toMs(now.Add(-7*24*time.Hour)))

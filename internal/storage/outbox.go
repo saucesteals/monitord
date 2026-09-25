@@ -159,19 +159,19 @@ func (s *Store) MarkDeliveryFailed(ctx context.Context, outboxID, destinationID,
 
 // PruneTerminalOutbox removes expired events only after every associated
 // delivery has reached a terminal state. Pending and leased work is retained
-// regardless of age.
+// regardless of age. Each call deletes at most 1,000 events.
 func (s *Store) PruneTerminalOutbox(ctx context.Context, now time.Time) (int64, error) {
 	result, err := s.db.ExecContext(ctx, `
-		DELETE FROM outbox_events AS e
-		WHERE e.created_at < (
-			SELECT ? - p.event_retention_ms
-			FROM deployments AS p
-			WHERE p.id=e.deployment_id
-		)
+		DELETE FROM outbox_events WHERE rowid IN (
+		SELECT e.rowid FROM deployments AS p
+		CROSS JOIN outbox_events AS e
+		WHERE e.deployment_id=p.id AND e.created_at < ? - p.event_retention_ms
 		AND NOT EXISTS (
 			SELECT 1 FROM outbox_deliveries AS d
 			WHERE d.outbox_id=e.outbox_id
 			AND d.status IN ('pending','sending')
+		)
+		LIMIT 1000
 		)`, toMs(now))
 	if err != nil {
 		return 0, err

@@ -31,7 +31,7 @@ func (c *CLI) list(ctx context.Context, out io.Writer) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	monitors, err := store.ListDeployments(ctx)
+	monitors, err := store.ListDeploymentSummaries(ctx)
 	if err != nil {
 		return err
 	}
@@ -43,11 +43,7 @@ func (c *CLI) list(ctx context.Context, out io.Writer) error {
 
 	fmt.Fprintf(out, "%-24s %-34s %-10s %-10s %-8s %-20s\n", "NAME", "ID", "DEPLOYMENT", "HEALTH", "FAILURES", "EXPIRES")
 	for _, m := range monitors {
-		view, inspectErr := store.InspectDeployment(ctx, m.ID)
-		if inspectErr != nil {
-			return inspectErr
-		}
-		fmt.Fprintf(out, "%-24s %-34s %-10s %-10s %-8d %-20s\n", m.Name, m.ID, m.Status, view.Health.Status, view.Health.ConsecutiveFailures, formatTime(m.ExpiresAt))
+		fmt.Fprintf(out, "%-24s %-34s %-10s %-10s %-8d %-20s\n", m.Name, m.ID, m.Status, m.HealthStatus, m.ConsecutiveFailures, formatTime(m.ExpiresAt))
 	}
 
 	return nil

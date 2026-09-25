@@ -146,3 +146,9 @@ CREATE INDEX outbox_deliveries_lease
     WHERE status = 'sending';
 CREATE INDEX outbox_events_retention
     ON outbox_events(deployment_id, created_at);
+
+-- Child keys used by ledger foreign-key checks and replay-safe retention.
+CREATE INDEX outbox_events_transaction
+    ON outbox_events(deployment_id, generation, transaction_seq);
+CREATE INDEX outbox_deliveries_deployment
+    ON outbox_deliveries(deployment_id, status);
