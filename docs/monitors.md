@@ -58,6 +58,10 @@ Perform network I/O, sleeping, and expensive parsing before `Session.Commit`. Th
 
 Only one transaction is admitted at a time. If its ACK is lost, the SDK resends the exact serialized transaction and the daemon returns its ledgered ACK. Do not implement persistence retry by rerunning the closure.
 
+Pass the callback context (or a derived context) to `Session.Commit`. Cancellation rejects new commits, but an admitted transaction has up to 30 seconds from submission to settle; retries do not extend that deadline. A late ACK still updates canonical state even if the callback reports a deadline failure. That failure does not imply rollback. Unsettled transactions terminate the worker with an unknown durable outcome; replacement workers reload persisted state.
+
+Commits with identical state and checkpoints and no events are skipped. Event-only and changed-checkpoint commits remain durable.
+
 External effects that cannot be expressed as monitord deliveries must happen after a successful commit. They are not made atomic by the framework.
 
 ## Event identity

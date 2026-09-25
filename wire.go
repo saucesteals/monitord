@@ -80,6 +80,11 @@ func (w *wire) sendBytes(raw []byte) error {
 		if err == nil && n != len(raw) {
 			err = io.ErrShortWrite
 		}
+		// Publish failure before releasing the serialization lock; a queued
+		// sender must never append another frame to a damaged stream.
+		if err != nil {
+			err = w.failWrite(err)
+		}
 		result <- err
 	}()
 	timer := time.NewTimer(5 * time.Second)
@@ -91,11 +96,16 @@ func (w *wire) sendBytes(raw []byte) error {
 		err = errors.New("worker protocol write deadline exceeded")
 	}
 	if err != nil {
-		w.failureMu.Lock()
-		if w.writeFailure == nil {
-			w.writeFailure = err
-		}
-		w.failureMu.Unlock()
+		return w.failWrite(err)
 	}
-	return err
+	return nil
+}
+
+func (w *wire) failWrite(err error) error {
+	w.failureMu.Lock()
+	defer w.failureMu.Unlock()
+	if w.writeFailure == nil {
+		w.writeFailure = err
+	}
+	return w.writeFailure
 }
