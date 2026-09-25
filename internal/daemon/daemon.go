@@ -31,7 +31,7 @@ type Daemon struct {
 	secretKey      []byte
 }
 
-func New(store *storage.Store, paths config.Paths, logger *slog.Logger, interval time.Duration) *Daemon {
+func New(paths config.Paths, logger *slog.Logger, interval time.Duration) *Daemon {
 	if interval <= 0 {
 		interval = DefaultInterval
 	}
@@ -40,19 +40,29 @@ func New(store *storage.Store, paths config.Paths, logger *slog.Logger, interval
 	}
 	key := make([]byte, 32)
 	_, _ = rand.Read(key)
-	d := &Daemon{store: store, paths: paths, logger: logger, interval: interval, workers: map[string]*workerSlot{}, secretKey: key}
+	d := &Daemon{paths: paths, logger: logger, interval: interval, workers: map[string]*workerSlot{}, secretKey: key}
 	d.deliverySender = daemonDeliverySender{daemon: d}
 	return d
 }
 
 func (d *Daemon) SetDeliverySender(sender DeliverySender) { d.deliverySender = sender }
 
-func (d *Daemon) Run(ctx context.Context) error {
+func (d *Daemon) Run(ctx context.Context) (err error) {
 	lock, err := acquireDaemonLock(d.paths)
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	// Own storage and its checkpointer strictly inside the singleton lock.
+	store, err := storage.OpenWithCheckpointer(d.paths.DBPath, d.logger)
+	if err != nil {
+		return err
+	}
+	d.store = store
+	defer func() {
+		err = errors.Join(err, store.Close())
+		d.store = nil
+	}()
 	if err := d.store.RecoverGenerations(ctx, time.Now().UTC()); err != nil {
 		return err
 	}

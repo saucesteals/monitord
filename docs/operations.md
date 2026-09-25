@@ -155,6 +155,36 @@ Maintenance visits at most 1,000 outbox events and 1,000 transaction ACKs per ba
 
 Batches continue with a one-second pause while a sweep has more candidates, releasing the database between transactions. Completed sweeps are revisited after an hour; protected records are reconsidered then. Cleanup runs independently of delivery requests; pages taking at least one second produce a `slow maintenance page` diagnostic with duration and candidate/deletion counts. Retired ACK recovery is not guaranteed beyond the retention horizon; missing old-generation frames are fenced rather than reapplied. Maintenance does not vacuum the database.
 
+## SQLite checkpointing
+
+The daemon acquires its singleton lock before opening storage and joins/closes
+the checkpointer before releasing that lock. It uses a separate connection for
+background `PASSIVE` WAL checkpoints;
+its serialized operational connection retains `synchronous=FULL` but disables
+automatic checkpoints. Both pools configure every replacement connection.
+Standalone CLI commands retain SQLite's 1,000-frame automatic checkpoint policy.
+
+The background loop checks WAL frame counts each second, checkpointing at 1,000
+uncheckpointed frames or after five seconds since its last attempt. Busy or
+non-progressing attempts back off to at most 30 seconds. Logs report frames,
+checkpointed frames, estimated uncheckpointed bytes, and duration; physical WAL
+file size alone does not indicate backlog because SQLite reuses that file.
+
+Checkpoint errors, contention, or at least 64 MiB awaiting backfill pause optional
+retention cleanup until the pressure clears. Monitor commits continue. Persistent
+failure, stalled progress, and large backlogs produce `wal checkpoint needs
+attention` warnings. Investigate long-lived read transactions and storage errors;
+close unnecessary readers and ensure disk headroom. This is not a hard WAL-size
+cap: pinned readers can prevent reuse even with background checkpointing. The
+daemon never escalates to blocking FULL/RESTART/TRUNCATE checkpoints or weakens
+commit durability to clear pressure.
+
+Shutdown cancels and joins the checkpoint loop before closing the store. SQLite
+may checkpoint when the last connection closes; cancellation cannot guarantee a
+bounded shutdown during blocked operating-system I/O. Preserve the database and
+its WAL together for recovery. Background checkpoints remove checkpoint work
+from the operational connection, not shared-disk contention or slow reads.
+
 ## Logs and service checks
 
 The daemon writes structured operational logs to stdout and reserves stderr for process-level failures. The default macOS LaunchAgent sends them to:
