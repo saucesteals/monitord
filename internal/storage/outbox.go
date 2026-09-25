@@ -157,28 +157,6 @@ func (s *Store) MarkDeliveryFailed(ctx context.Context, outboxID, destinationID,
 	return s.finishDelivery(ctx, outboxID, destinationID, owner, `status='pending',attempt_count=attempt_count+1,next_attempt_at=?,lease_owner=NULL,lease_expires_at=NULL,last_error=?`, toMs(next), message)
 }
 
-// PruneTerminalOutbox removes expired events only after every associated
-// delivery has reached a terminal state. Pending and leased work is retained
-// regardless of age. Each call deletes at most 1,000 events.
-func (s *Store) PruneTerminalOutbox(ctx context.Context, now time.Time) (int64, error) {
-	result, err := s.db.ExecContext(ctx, `
-		DELETE FROM outbox_events WHERE rowid IN (
-		SELECT e.rowid FROM deployments AS p
-		CROSS JOIN outbox_events AS e
-		WHERE e.deployment_id=p.id AND e.created_at < ? - p.event_retention_ms
-		AND NOT EXISTS (
-			SELECT 1 FROM outbox_deliveries AS d
-			WHERE d.outbox_id=e.outbox_id
-			AND d.status IN ('pending','sending')
-		)
-		LIMIT 1000
-		)`, toMs(now))
-	if err != nil {
-		return 0, err
-	}
-
-	return result.RowsAffected()
-}
 func (s *Store) finishDelivery(ctx context.Context, outboxID, destinationID, owner, set string, args ...any) error {
 	args = append(args, outboxID, destinationID, owner)
 	res, err := s.db.ExecContext(ctx, `UPDATE outbox_deliveries SET `+set+` WHERE outbox_id=? AND destination_id=? AND status='sending' AND lease_owner=?`, args...)

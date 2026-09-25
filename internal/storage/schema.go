@@ -13,9 +13,18 @@ const schemaVersion = 2
 //go:embed schema.sql
 var initialSchema string
 
-const performanceIndexes = `
+const performanceMigration = `
 CREATE INDEX outbox_events_transaction ON outbox_events(deployment_id,generation,transaction_seq);
 CREATE INDEX outbox_deliveries_deployment ON outbox_deliveries(deployment_id,status);
+
+CREATE INDEX outbox_deliveries_event ON outbox_deliveries(outbox_id,deployment_id);
+
+CREATE TABLE maintenance_cursors (
+    name            TEXT PRIMARY KEY CHECK(name IN ('outbox','transactions')),
+    after_rowid     INTEGER NOT NULL DEFAULT 0 CHECK(after_rowid >= 0),
+    through_rowid   INTEGER NOT NULL DEFAULT 0 CHECK(through_rowid >= after_rowid),
+    next_sweep_at   INTEGER NOT NULL DEFAULT 0
+) STRICT;
 `
 
 func initializeSchema(db *sql.DB) error {
@@ -58,8 +67,8 @@ func initializeSchema(db *sql.DB) error {
 			return fmt.Errorf("initialize database schema: %w", err)
 		}
 	case 1:
-		if _, err := conn.ExecContext(ctx, performanceIndexes); err != nil {
-			return fmt.Errorf("create storage indexes: %w", err)
+		if _, err := conn.ExecContext(ctx, performanceMigration); err != nil {
+			return fmt.Errorf("migrate storage maintenance: %w", err)
 		}
 	case schemaVersion:
 		// Another opener completed the migration while we waited.

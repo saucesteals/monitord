@@ -151,7 +151,9 @@ Delivery is at least once. If a destination accepts a request just before the da
 
 Per-destination rate limiting delays rows without charging a failed attempt. Pending and leased deliveries are retained regardless of age. Terminal events are pruned only after `events.retention` has elapsed and every destination is delivered or dead.
 
-Startup and hourly maintenance delete at most 1,000 expired terminal events per pass. They also prune up to 1,000 unreferenced transaction ACKs from generations retired more than seven days ago. Active-generation ACKs and transactions referenced by retained outbox events are preserved. Retired ACK recovery is not guaranteed beyond that horizon; missing old-generation frames are fenced rather than reapplied. Maintenance does not vacuum the database.
+Maintenance visits at most 1,000 outbox events and 1,000 transaction ACKs per batch, including records that cannot yet be deleted. It saves each scan position atomically with deletion and resumes it after restart. Each sweep has a fixed high-water mark so new records cannot extend it indefinitely. Pending/leased deliveries, active-generation ACKs, and ACKs referenced by retained events remain protected; unreferenced ACKs become eligible only after their generation has been retired for more than seven days.
+
+Batches continue with a one-second pause while a sweep has more candidates, releasing the database between transactions. Completed sweeps are revisited after an hour; protected records are reconsidered then. Cleanup runs independently of delivery requests; pages taking at least one second produce a `slow maintenance page` diagnostic with duration and candidate/deletion counts. Retired ACK recovery is not guaranteed beyond the retention horizon; missing old-generation frames are fenced rather than reapplied. Maintenance does not vacuum the database.
 
 ## Logs and service checks
 
