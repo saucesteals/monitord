@@ -102,6 +102,12 @@ func (d *Daemon) runOutbox(ctx context.Context, outbox *outboxWorker) {
 		} else if count > 0 {
 			d.logger.Debug("pruned terminal outbox events", "count", count)
 		}
+		count, err = d.store.PruneRetiredTransactions(ctx, time.Now().UTC())
+		if err != nil && !errors.Is(err, context.Canceled) {
+			d.logger.Error("transaction ledger pruning failed", "error", err)
+		} else if count > 0 {
+			d.logger.Debug("pruned retired transactions", "count", count)
+		}
 	}
 	prune()
 	for {

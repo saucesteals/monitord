@@ -245,6 +245,15 @@ func (s *Session[S]) Commit(ctx context.Context, fn func(*Tx[S]) error) error {
 	if err != nil {
 		return err
 	}
+	// Identical checkpoints and state without events are not durable work.
+	for source, raw := range tx.checkpoints {
+		if bytes.Equal(raw, s.checkpoints[source]) {
+			delete(tx.checkpoints, source)
+		}
+	}
+	if bytes.Equal(base, next) && len(tx.events) == 0 && len(tx.checkpoints) == 0 {
+		return nil
+	}
 	acked, err := s.committer.Commit(ctx, transactionCommit{BaseState: base, NextState: next, Events: tx.events, Checkpoints: tx.checkpoints})
 	if err != nil {
 		return err

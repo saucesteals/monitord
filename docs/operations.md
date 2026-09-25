@@ -174,3 +174,50 @@ On macOS, inspect the default service with `launchctl print gui/$(id -u)/dev.mon
 Stop the service before taking a whole-root backup. The simplest recoverable operation is moving the complete root aside and installing into a new directory. Keep the backup until the new daemon, all expected workers, secret availability, and first successful callbacks are verified.
 
 For recovery at the exact same code revision, preserve the whole root together so database rows, artifacts, source, and generation metadata agree. For an incompatible installation or state redesign, prefer a clean root and explicit state restoration rather than copying selected database tables.
+
+## Callback deadlines and durable settlement
+
+Pass the callback context (or a derived context) to `Session.Commit` so its
+settlement participates in supervision. A callback's timeout still cancels that
+context and rejects new commits. A
+transaction already admitted to the worker protocol has a separate **30-second
+settlement deadline measured from submission**, not refreshed by retries. The
+SDK resends the same sequence, hash and payload; it never reruns the commit
+closure. A late accepted ACK updates canonical state even if the callback reports
+a deadline failure. That failure does **not** mean the transaction rolled back.
+After cancellation and settlement, callbacks have 100 ms to unwind. Uncooperative
+callbacks and unsettled transactions terminate the worker without overlapping
+lifecycle cleanup; an exhausted settlement deadline reports **durable outcome
+unknown**. The daemon fences the generation before its replacement reloads state.
+Shutdown's existing stop deadline remains the outer bound. Protocol writes in
+both directions are bounded to five seconds (or an earlier daemon context
+deadline); a failed worker write poisons that transport instead of admitting
+more frames onto an uncertain stream.
+
+Exact unchanged state/checkpoint commits without events are suppressed before
+protocol sequence assignment. Event-only and changed-checkpoint commits remain
+durable. This does not suppress run-health writes or changing observation fields.
+
+Slow transactions (one second or longer) emit structured duration diagnostics:
+`slow transaction persistence` separates connection acquisition, SQL work, and
+commit time; `slow transaction settlement` includes daemon preparation and ACK
+send. No transaction contents or credentials are logged. Inspection finds the newest
+transaction by generation and sequence through the primary-key index, avoiding
+a full ledger timestamp sort on the single connection. Commit timing can
+include SQLite checkpoint work; it is not an isolated fsync measurement.
+
+Hourly maintenance removes at most 1,000 transaction records belonging to
+generations retired more than seven days ago, after terminal outbox maintenance.
+All transactions referenced by retained outbox events and all active-generation
+ACKs remain. Retired ACK recovery is no longer guaranteed after that horizon;
+old frames without an ACK record are fenced, never reapplied. Maintenance does
+not vacuum the database or weaken WAL/FULL durability. Large existing ledgers
+therefore drain gradually, and long-lived active ledgers are not compacted.
+
+### Updating existing workers
+
+Install the reviewed daemon/CLI and SDK revision together, then rebuild/redeploy
+monitor artifacts with state preserved. Replacing only the daemon cannot update
+supervision compiled into existing workers. Inspect artifact identities,
+generations, run outcomes and deliveries after rollout; do not reset state to
+apply this runtime change.

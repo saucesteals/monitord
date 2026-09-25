@@ -148,9 +148,11 @@ func (s *Store) InspectDeployment(ctx context.Context, selector string) (Inspect
 		return Inspection{}, err
 	}
 
+	// Generation and sequence define commit order without sorting the entire
+	// ledger by wall-clock timestamps while holding the sole DB connection.
 	var transaction TransactionStatus
 	var committed int64
-	err = tx.QueryRowContext(ctx, `SELECT generation,seq,committed_at FROM transactions WHERE deployment_id=? ORDER BY committed_at DESC,generation DESC,seq DESC LIMIT 1`, view.Deployment.ID).
+	err = tx.QueryRowContext(ctx, `SELECT generation,seq,committed_at FROM transactions WHERE deployment_id=? ORDER BY generation DESC,seq DESC LIMIT 1`, view.Deployment.ID).
 		Scan(&transaction.Generation, &transaction.Sequence, &committed)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return Inspection{}, fmt.Errorf("inspect latest transaction: %w", err)

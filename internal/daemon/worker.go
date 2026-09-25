@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,10 @@ type worker struct {
 	cmd               *exec.Cmd
 	in                io.WriteCloser
 	out               *bufio.Reader
+	output            io.ReadCloser
+	stderr            io.ReadCloser
+	readStop          chan struct{}
+	closeRead         sync.Once
 	readCh            chan readResult
 	pgid              int
 	logger            *slog.Logger
@@ -46,6 +51,8 @@ type readResult struct {
 	v   monitord.WorkerFrame
 	err error
 }
+type acknowledgementError struct{ error }
+
 type workerStoppedError struct {
 	message         string
 	failureReported bool
@@ -63,20 +70,37 @@ func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDe
 	if err != nil {
 		return nil, err
 	}
-	out, err := cmd.StdoutPipe()
+	out, outWriter, err := os.Pipe()
 	if err != nil {
+		_ = in.Close()
 		return nil, err
 	}
-	stderr, err := cmd.StderrPipe()
+	stderr, errWriter, err := os.Pipe()
 	if err != nil {
+		_ = in.Close()
+		_ = out.Close()
+		_ = outWriter.Close()
 		return nil, err
 	}
-	if err = cmd.Start(); err != nil {
+	cmd.Stdout, cmd.Stderr = outWriter, errWriter
+	err = cmd.Start()
+	_ = outWriter.Close()
+	_ = errWriter.Close()
+	if err != nil {
+		_ = in.Close()
+		_ = out.Close()
+		_ = stderr.Close()
 		return nil, err
 	}
-	w := &worker{deployment: dep, generation: generation, cmd: cmd, in: in, out: bufio.NewReaderSize(out, 64<<10), readCh: make(chan readResult, 1), logger: logger, done: make(chan error, 1), redactor: redactor}
+	w := &worker{
+		deployment: dep, generation: generation, cmd: cmd, in: in,
+		out: bufio.NewReaderSize(out, 64<<10), output: out, stderr: stderr,
+		readStop: make(chan struct{}), readCh: make(chan readResult, 1),
+		logger: logger, done: make(chan error, 1), redactor: redactor,
+	}
 	w.pgid, _ = monitorProcessGroup(cmd)
 	go func() {
+		defer func() { _ = stderr.Close() }()
 		digest := sha256.New()
 		captured, _ := io.Copy(digest, io.LimitReader(stderr, 64<<10))
 		discarded, _ := io.Copy(io.Discard, stderr)
@@ -143,6 +167,8 @@ func startWorker(ctx context.Context, logger *slog.Logger, dep storage.RuntimeDe
 }
 
 func (w *worker) serve(ctx context.Context, store *storage.Store) error {
+	defer w.closeReaders()
+	var ackErr error
 	var stable <-chan time.Time
 	var stableTimer *time.Timer
 	if w.planKind == "continuous" {
@@ -155,7 +181,7 @@ func (w *worker) serve(ctx context.Context, store *storage.Store) error {
 		select {
 		case result := <-w.readCh:
 			if result.err != nil {
-				return result.err
+				return errors.Join(ackErr, result.err)
 			}
 			msg = result.v
 		case <-stable:
@@ -167,13 +193,23 @@ func (w *worker) serve(ctx context.Context, store *storage.Store) error {
 			logHealthTransition(w.logger, w.deployment.Name, w.generation.Generation, transition)
 			continue
 		case <-ctx.Done():
-			return ctx.Err()
+			return errors.Join(ackErr, ctx.Err())
 		}
 		var err error
 		switch msg.Type {
 		case "transaction":
+			if ackErr != nil {
+				continue
+			}
 			if err = w.transaction(ctx, store, *msg.Transaction); err != nil {
-				return err
+				var sendErr *acknowledgementError
+				if !errors.As(err, &sendErr) {
+					return err
+				}
+				ackErr = err
+				drainCtx, drainCancel := context.WithTimeout(ctx, time.Second)
+				defer drainCancel()
+				ctx = drainCtx
 			}
 		case "run":
 			if msg.Run.Generation != uint64(w.generation.Generation) {
@@ -189,12 +225,12 @@ func (w *worker) serve(ctx context.Context, store *storage.Store) error {
 				return storage.ErrGenerationFenced
 			}
 			if msg.Stopped.Error != "" {
-				return &workerStoppedError{message: msg.Stopped.Error, failureReported: msg.Stopped.RunFailureReported}
+				return &workerStoppedError{message: errors.Join(errors.New(msg.Stopped.Error), ackErr).Error(), failureReported: msg.Stopped.RunFailureReported}
 			}
 			if !msg.Stopped.Clean {
 				return &workerStoppedError{message: "worker stopped unsuccessfully", failureReported: msg.Stopped.RunFailureReported}
 			}
-			return nil
+			return ackErr
 		default:
 			return fmt.Errorf("unexpected worker frame %q", msg.Type)
 		}
@@ -213,6 +249,12 @@ func logHealthTransition(logger *slog.Logger, deployment string, generation int6
 func (w *worker) redact(message string) string { return w.redactor.Redact(message) }
 
 func (w *worker) transaction(ctx context.Context, store *storage.Store, wire monitord.TransactionFrame) error {
+	started := time.Now()
+	defer func() {
+		if elapsed := time.Since(started); elapsed >= time.Second {
+			w.logger.Warn("slow transaction settlement", "deployment", w.deployment.Name, "generation", wire.Generation, "sequence", wire.Sequence, "duration", elapsed)
+		}
+	}()
 	if wire.DeploymentID != w.deployment.ID || wire.Generation != uint64(w.generation.Generation) || wire.WorkerToken != hex.EncodeToString(w.generation.WorkerToken) {
 		return storage.ErrGenerationFenced
 	}
@@ -222,9 +264,13 @@ func (w *worker) transaction(ctx context.Context, store *storage.Store, wire mon
 	if len(wire.Events) > w.deployment.MaxEventsPerTransaction {
 		return fmt.Errorf("transaction has %d events; deployment limit is %d", len(wire.Events), w.deployment.MaxEventsPerTransaction)
 	}
-	bindings, err := store.ListActiveBindings(ctx, w.deployment.ID)
-	if err != nil {
-		return err
+	var bindings []storage.DestinationBinding
+	if len(wire.Events) > 0 {
+		var err error
+		bindings, err = store.ListActiveBindings(ctx, w.deployment.ID)
+		if err != nil {
+			return err
+		}
 	}
 	checkpoints := make([]storage.CheckpointMutation, 0, len(wire.Checkpoints))
 	keys := make([]string, 0, len(wire.Checkpoints))
@@ -265,7 +311,11 @@ func (w *worker) transaction(ctx context.Context, store *storage.Store, wire mon
 	if err != nil {
 		return err
 	}
-	return w.send(ctx, monitord.DaemonFrame{Type: "ack", Ack: &monitord.TransactionAck{DeploymentID: ack.DeploymentID, Generation: uint64(ack.Generation), Sequence: uint64(ack.Sequence), PayloadHash: wire.PayloadHash, ResultRevision: ack.ResultRevision, Status: ack.Status}})
+	err = w.send(ctx, monitord.DaemonFrame{Type: "ack", Ack: &monitord.TransactionAck{DeploymentID: ack.DeploymentID, Generation: uint64(ack.Generation), Sequence: uint64(ack.Sequence), PayloadHash: wire.PayloadHash, ResultRevision: ack.ResultRevision, Status: ack.Status}})
+	if err != nil {
+		return &acknowledgementError{fmt.Errorf("send transaction acknowledgement: %w", err)}
+	}
+	return nil
 }
 
 func verifyWireHash(frame monitord.TransactionFrame) error {
@@ -277,6 +327,8 @@ func verifyWireHash(frame monitord.TransactionFrame) error {
 	return nil
 }
 func (w *worker) send(ctx context.Context, v monitord.DaemonFrame) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	if err := v.Validate(); err != nil {
 		return err
 	}
@@ -313,13 +365,23 @@ func (w *worker) read(ctx context.Context) (monitord.WorkerFrame, error) {
 		return monitord.WorkerFrame{}, ctx.Err()
 	}
 }
+func (w *worker) publishRead(r readResult) bool {
+	select {
+	case w.readCh <- r:
+		return true
+	case <-w.readStop:
+		return false
+	}
+}
+
 func (w *worker) readLoop() {
+	defer func() { _ = w.output.Close() }()
 	for {
 		raw := make([]byte, 0, 64<<10)
 		for {
 			part, err := w.out.ReadSlice('\n')
 			if len(raw)+len(part) > monitord.MaxFrameBytes {
-				w.readCh <- readResult{err: errors.New("protocol frame exceeds maximum size")}
+				w.publishRead(readResult{err: errors.New("protocol frame exceeds maximum size")})
 				return
 			}
 			raw = append(raw, part...)
@@ -329,11 +391,13 @@ func (w *worker) readLoop() {
 			if errors.Is(err, bufio.ErrBufferFull) {
 				continue
 			}
-			w.readCh <- readResult{err: err}
+			w.publishRead(readResult{err: err})
 			return
 		}
 		v, decodeErr := monitord.DecodeWorkerFrame(bytes.NewReader(raw))
-		w.readCh <- readResult{v: v, err: decodeErr}
+		if !w.publishRead(readResult{v: v, err: decodeErr}) {
+			return
+		}
 		if decodeErr != nil {
 			return
 		}
@@ -358,7 +422,12 @@ func (w *worker) stopReason() string {
 	defer w.lifecycleMu.Unlock()
 	return w.requestedStop
 }
+func (w *worker) closeReaders() {
+	w.closeRead.Do(func() { close(w.readStop); _ = w.output.Close(); _ = w.stderr.Close() })
+}
+
 func (w *worker) kill() {
+	w.closeReaders()
 	_ = w.in.Close()
 	terminateMonitorProcessGroup(w.pgid, w.logger)
 	if w.cmd != nil && w.cmd.Process != nil {
