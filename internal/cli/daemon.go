@@ -9,7 +9,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/saucesteals/monitord/internal/config"
 	"github.com/saucesteals/monitord/internal/daemon"
+	"github.com/saucesteals/monitord/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -30,7 +32,16 @@ func (c *CLI) newDaemonCmd() *cobra.Command {
 }
 
 func (c *CLI) daemon(parent context.Context, out io.Writer, interval time.Duration) error {
-	store, paths, err := c.store()
+	// The daemon's operational log is stdout, unlike the CLI's, which uses
+	// stderr to keep command output pipeable. That leaves stderr for genuine
+	// process failures, so a non-empty error log is a real signal rather than
+	// a copy of every INFO line.
+	logger := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	paths, err := config.Resolve(c.root)
+	if err != nil {
+		return err
+	}
+	store, err := storage.OpenWithCheckpointer(paths.DBPath, logger)
 	if err != nil {
 		return err
 	}
@@ -38,12 +49,6 @@ func (c *CLI) daemon(parent context.Context, out io.Writer, interval time.Durati
 
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	// The daemon's operational log is stdout, unlike the CLI's, which uses
-	// stderr to keep command output pipeable. That leaves stderr for genuine
-	// process failures, so a non-empty error log is a real signal rather than
-	// a copy of every INFO line.
-	logger := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	return daemon.New(store, paths, logger, interval).Run(ctx)
 }

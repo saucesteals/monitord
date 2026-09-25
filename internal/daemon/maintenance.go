@@ -19,6 +19,10 @@ func (d *Daemon) runMaintenance(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
+		if d.store.CheckpointPressure() {
+			timer.Reset(5 * time.Second)
+			continue
+		}
 		now := time.Now().UTC()
 		started := time.Now()
 		outbox, outboxErr := d.store.PruneTerminalOutbox(ctx, now)
