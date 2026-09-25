@@ -157,7 +157,9 @@ Batches continue with a one-second pause while a sweep has more candidates, rele
 
 ## SQLite checkpointing
 
-The daemon uses a separate connection for background `PASSIVE` WAL checkpoints;
+The daemon acquires its singleton lock before opening storage and joins/closes
+the checkpointer before releasing that lock. It uses a separate connection for
+background `PASSIVE` WAL checkpoints;
 its serialized operational connection retains `synchronous=FULL` but disables
 automatic checkpoints. Both pools configure every replacement connection.
 Standalone CLI commands retain SQLite's 1,000-frame automatic checkpoint policy.
