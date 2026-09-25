@@ -160,5 +160,7 @@ CREATE TABLE maintenance_cursors (
     name            TEXT PRIMARY KEY CHECK(name IN ('outbox','transactions')),
     after_rowid     INTEGER NOT NULL DEFAULT 0 CHECK(after_rowid >= 0),
     through_rowid   INTEGER NOT NULL DEFAULT 0 CHECK(through_rowid >= after_rowid),
-    next_sweep_at   INTEGER NOT NULL DEFAULT 0
+    next_sweep_at   INTEGER NOT NULL DEFAULT 0,
+    generation_rowid INTEGER NOT NULL DEFAULT 0 CHECK(generation_rowid >= 0),
+    after_seq INTEGER NOT NULL DEFAULT 0 CHECK(after_seq >= 0)
 ) STRICT;

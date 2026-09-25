@@ -8,7 +8,7 @@ import (
 )
 
 func (s *Store) ListActiveBindings(ctx context.Context, deploymentID string) ([]DestinationBinding, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,revision,deployment_id,config,created_at,retired_at FROM destination_bindings WHERE deployment_id=? AND retired_at IS NULL ORDER BY id`, deploymentID)
+	rows, err := s.readDB.QueryContext(ctx, `SELECT id,revision,deployment_id,config,created_at,retired_at FROM destination_bindings WHERE deployment_id=? AND retired_at IS NULL ORDER BY id`, deploymentID)
 	if err != nil {
 		return nil, err
 	}

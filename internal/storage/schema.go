@@ -8,7 +8,7 @@ import (
 	"fmt"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 //go:embed schema.sql
 var initialSchema string
@@ -25,6 +25,12 @@ CREATE TABLE maintenance_cursors (
     through_rowid   INTEGER NOT NULL DEFAULT 0 CHECK(through_rowid >= after_rowid),
     next_sweep_at   INTEGER NOT NULL DEFAULT 0
 ) STRICT;
+`
+
+const isolationMigration = `
+ALTER TABLE maintenance_cursors ADD COLUMN generation_rowid INTEGER NOT NULL DEFAULT 0 CHECK(generation_rowid >= 0);
+ALTER TABLE maintenance_cursors ADD COLUMN after_seq INTEGER NOT NULL DEFAULT 0 CHECK(after_seq >= 0);
+UPDATE maintenance_cursors SET after_rowid=0,through_rowid=0,next_sweep_at=0 WHERE name='transactions';
 `
 
 func initializeSchema(db *sql.DB) error {
@@ -70,10 +76,17 @@ func initializeSchema(db *sql.DB) error {
 		if _, err := conn.ExecContext(ctx, performanceMigration); err != nil {
 			return fmt.Errorf("migrate storage maintenance: %w", err)
 		}
+	case 2:
+		// Added below after the prior migration, if any.
 	case schemaVersion:
 		// Another opener completed the migration while we waited.
 	default:
 		return fmt.Errorf("unsupported database schema %d; expected %d", version, schemaVersion)
+	}
+	if version == 1 || version == 2 {
+		if _, err := conn.ExecContext(ctx, isolationMigration); err != nil {
+			return fmt.Errorf("migrate maintenance discovery: %w", err)
+		}
 	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		return fmt.Errorf("record database schema: %w", err)

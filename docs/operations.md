@@ -151,17 +151,23 @@ Delivery is at least once. If a destination accepts a request just before the da
 
 Per-destination rate limiting delays rows without charging a failed attempt. Pending and leased deliveries are retained regardless of age. Terminal events are pruned only after `events.retention` has elapsed and every destination is delivered or dead.
 
-Maintenance visits at most 1,000 outbox events and 1,000 transaction ACKs per batch, including records that cannot yet be deleted. It saves each scan position atomically with deletion and resumes it after restart. Each sweep has a fixed high-water mark so new records cannot extend it indefinitely. Pending/leased deliveries, active-generation ACKs, and ACKs referenced by retained events remain protected; unreferenced ACKs become eligible only after their generation has been retired for more than seven days.
+Maintenance discovers bounded candidate pages on read-only connections, then closes the read snapshot before acquiring the writer. Each write slice handles at most 64 candidates and stops after approximately 10 ms of deletion work; a single SQL operation or commit can exceed that scheduling budget. Eligibility is rechecked before deletion. Scan progress is saved atomically with deletion and resumes after restart. Each sweep has a fixed high-water mark so new records cannot extend it indefinitely. Transaction cleanup traverses eligible retired generations and their indexed sequence numbers rather than scanning active-worker receipts. Pending/leased deliveries, active-generation ACKs, and ACKs referenced by retained events remain protected; unreferenced ACKs become eligible only after their generation has been retired for more than seven days.
 
 Batches continue with a one-second pause while a sweep has more candidates, releasing the database between transactions. Completed sweeps are revisited after an hour; protected records are reconsidered then. Cleanup runs independently of delivery requests; pages taking at least one second produce a `slow maintenance page` diagnostic with duration and candidate/deletion counts. Retired ACK recovery is not guaranteed beyond the retention horizon; missing old-generation frames are fenced rather than reapplied. Maintenance does not vacuum the database.
 
-## SQLite checkpointing
+## SQLite concurrency and checkpointing
+
+The store uses one serialized writer and a small read-only pool. Read snapshots
+must remain short so they do not pin old WAL frames. Scheduler reconciliation
+loads deployment metadata; state and checkpoints are read together only when a
+worker needs launching. Generation activation rechecks that snapshot before
+advancing the worker fence.
 
 The daemon acquires its singleton lock before opening storage and joins/closes
 the checkpointer before releasing that lock. It uses a separate connection for
 background `PASSIVE` WAL checkpoints;
-its serialized operational connection retains `synchronous=FULL` but disables
-automatic checkpoints. Both pools configure every replacement connection.
+its serialized writer connection retains `synchronous=FULL` but disables
+automatic checkpoints. Each pool configures every replacement connection.
 Standalone CLI commands retain SQLite's 1,000-frame automatic checkpoint policy.
 
 The background loop checks WAL frame counts each second, checkpointing at 1,000
