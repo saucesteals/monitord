@@ -24,6 +24,8 @@ The installer pins `lib`, builds the daemon, points the shared monitor module at
 MONITORD_SERVICE=none ./infra/install.sh
 ```
 
+Monitor artifacts embed the SDK. When upgrading monitord, keep the daemon, CLI, and installed SDK on the same revision, then rebuild and redeploy monitors without resetting their state.
+
 The daemon normally reconciles every five seconds. Scheduling deadlines remain exact; `--interval` only bounds idle sleep.
 
 ## Replacing an installation
@@ -147,6 +149,8 @@ Delivery is at least once. If a destination accepts a request just before the da
 
 Per-destination rate limiting delays rows without charging a failed attempt. Pending and leased deliveries are retained regardless of age. Terminal events are pruned only after `events.retention` has elapsed and every destination is delivered or dead.
 
+Hourly maintenance prunes up to 1,000 unreferenced transaction ACKs from generations retired more than seven days ago. Active-generation ACKs and transactions referenced by retained outbox events are preserved. Retired ACK recovery is not guaranteed beyond that horizon; missing old-generation frames are fenced rather than reapplied. Maintenance does not vacuum the database.
+
 ## Logs and service checks
 
 The daemon writes structured operational logs to stdout and reserves stderr for process-level failures. The default macOS LaunchAgent sends them to:
@@ -157,6 +161,8 @@ The daemon writes structured operational logs to stdout and reserves stderr for 
 ```
 
 A nonempty macOS stderr log indicates a process-level failure rather than a copy of routine INFO output. The default Linux systemd service sends both streams to the user journal. Persisted health and delivery errors are bounded and secret values are redacted; avoid returning scraped credentials or complete authenticated URLs from monitor code. Preserve chain-named QuickNode endpoint values exactly as issued and never write them to events or logs.
+
+Transactions taking at least one second produce `slow transaction persistence` and `slow transaction settlement` diagnostics. These separate connection acquisition, SQL work, commit, and overall settlement duration without logging transaction contents. Commit time can include SQLite checkpoint work; it is not an isolated fsync measurement.
 
 Useful checks:
 

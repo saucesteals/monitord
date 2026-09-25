@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -66,6 +67,24 @@ type TransactionACK struct {
 // Ledger lookup intentionally precedes active-generation checks so an ACK lost during
 // generation replacement remains recoverable.
 func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (TransactionACK, error) {
+	started := time.Now()
+	var acquired, committing time.Time
+	defer func() {
+		elapsed := time.Since(started)
+		if elapsed < time.Second {
+			return
+		}
+		poolWait, sqlWork, commitTime := elapsed, time.Duration(0), time.Duration(0)
+		if !acquired.IsZero() {
+			poolWait = acquired.Sub(started)
+			sqlWork = time.Since(acquired)
+		}
+		if !committing.IsZero() {
+			sqlWork = committing.Sub(acquired)
+			commitTime = time.Since(committing)
+		}
+		slog.Warn("slow transaction persistence", "deployment", frame.DeploymentID, "generation", frame.Generation, "sequence", frame.Sequence, "duration", elapsed, "pool_wait", poolWait, "sql_work", sqlWork, "commit", commitTime)
+	}()
 	if err := validateFrame(frame); err != nil {
 		return TransactionACK{}, err
 	}
@@ -74,6 +93,7 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 	if err != nil {
 		return TransactionACK{}, fmt.Errorf("begin transaction frame: %w", err)
 	}
+	acquired = time.Now()
 	defer tx.Rollback()
 
 	ack, found, err := lookupTransaction(ctx, tx, frame)
@@ -182,6 +202,7 @@ func (s *Store) ApplyTransaction(ctx context.Context, frame TransactionFrame) (T
 		return TransactionACK{}, fmt.Errorf("write transaction ledger: %w", err)
 	}
 
+	committing = time.Now()
 	if err := tx.Commit(); err != nil {
 		resolved, found, lookupErr := s.resolveTransaction(ctx, frame)
 		if lookupErr == nil && found {

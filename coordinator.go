@@ -30,7 +30,7 @@ type workerCoordinator struct {
 	fatalErr    error
 }
 
-func (c *workerCoordinator) Commit(ctx context.Context, tx transactionCommit) (json.RawMessage, error) {
+func (c *workerCoordinator) Commit(ctx context.Context, tx transactionCommit) (state json.RawMessage, resultErr error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -55,6 +55,20 @@ func (c *workerCoordinator) Commit(ctx context.Context, tx transactionCommit) (j
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
+	scope, _ := ctx.Value(callbackCommitKey{}).(*callbackCommitScope)
+	if scope != nil {
+		if !scope.begin(ctx) {
+			return nil, ctx.Err()
+		}
+		defer scope.end()
+	}
+	// A write may partially succeed. Never run another callback on uncertain
+	// local state after any failure past this admission point.
+	defer func() {
+		if resultErr != nil {
+			resultErr = &transactionUncertainError{cause: resultErr}
+		}
+	}()
 	c.expectTransactionAck(frame)
 	defer c.clearExpectedAck()
 	if err = c.wire.sendBytes(raw); err != nil {

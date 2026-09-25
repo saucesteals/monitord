@@ -4,9 +4,59 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
+
+// commitSettlementTimeout bounds each admitted transaction, including writes and retries.
+const commitSettlementTimeout = 30 * time.Second
+
+type callbackCommitKey struct{}
+
+type callbackCommitScope struct {
+	mu       sync.Mutex
+	deadline time.Time
+	changed  chan struct{}
+}
+
+func (s *callbackCommitScope) begin(ctx context.Context) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctx.Err() != nil {
+		return false
+	}
+	s.deadline = time.Now().Add(commitSettlementTimeout)
+	s.notify()
+	return true
+}
+
+func (s *callbackCommitScope) end() {
+	s.mu.Lock()
+	s.deadline = time.Time{}
+	s.notify()
+	s.mu.Unlock()
+}
+
+func (s *callbackCommitScope) notify() {
+	select {
+	case s.changed <- struct{}{}:
+	default:
+	}
+}
+
+func (s *callbackCommitScope) remaining() (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Until(s.deadline), !s.deadline.IsZero()
+}
+
+type transactionUncertainError struct{ cause error }
+
+func (e *transactionUncertainError) Error() string {
+	return fmt.Sprintf("transaction settlement failed; durable outcome unknown: %v", e.cause)
+}
+func (e *transactionUncertainError) Unwrap() error { return e.cause }
 
 type callbackStillRunningError struct{ cause error }
 type callbackPanicError struct{ value any }
@@ -30,7 +80,8 @@ func callbackStillRunning(err error) bool {
 
 func callbackFatal(err error) bool {
 	var panicErr *callbackPanicError
-	return callbackStillRunning(err) || errors.As(err, &panicErr)
+	var uncertain *transactionUncertainError
+	return callbackStillRunning(err) || errors.As(err, &panicErr) || errors.As(err, &uncertain)
 }
 
 func runPlan[S any](ctx context.Context, session *Session[S], plan Plan[S], once bool, report func(RunFrame) error) error {
@@ -109,29 +160,74 @@ func runCallback(ctx context.Context, timeout time.Duration, callback func(conte
 	if timeout > 0 {
 		callbackCtx, cancel = context.WithTimeout(ctx, timeout)
 	}
+	defer cancel()
+	scope := &callbackCommitScope{changed: make(chan struct{}, 1)}
+	callbackCtx = context.WithValue(callbackCtx, callbackCommitKey{}, scope)
 	result := make(chan error, 1)
 	go func() { result <- safeCallback(func() error { return callback(callbackCtx) }) }()
-	select {
-	case err := <-result:
-		cancel()
-		if ctx.Err() != nil {
-			return nil
+	var settlement *time.Timer
+	var settlementDeadline <-chan time.Time
+	defer func() {
+		if settlement != nil {
+			settlement.Stop()
 		}
-		return err
-	case <-callbackCtx.Done():
-		err := callbackCtx.Err()
-		cancel()
-		if ctx.Err() != nil {
-			// Lifecycle cleanup must not overlap a callback that still owns its
-			// resources. The daemon's shutdown deadline bounds an uncooperative
-			// callback by terminating the worker process.
-			resultErr := <-result
-			if resultErr != nil && !errors.Is(resultErr, context.Canceled) {
-				return resultErr
+	}()
+	for {
+		select {
+		case err := <-result:
+			if ctx.Err() != nil {
+				return nil
 			}
-			return nil
+			return err
+		case <-scope.changed:
+			if settlement != nil {
+				settlement.Stop()
+			}
+			settlementDeadline = nil
+			if remaining, active := scope.remaining(); active {
+				settlement = time.NewTimer(max(remaining, 0))
+				settlementDeadline = settlement.C
+			}
+		case <-settlementDeadline:
+			if remaining, active := scope.remaining(); active && remaining <= 0 {
+				return &callbackStillRunningError{cause: errors.New("transaction settlement deadline exceeded; durable outcome unknown")}
+			}
+			settlementDeadline = nil
+		case <-callbackCtx.Done():
+			cause := callbackCtx.Err()
+			if ctx.Err() != nil {
+				// The daemon's earlier stop deadline bounds shutdown. Never clean up
+				// resources while the callback still owns them.
+				err := <-result
+				if err != nil && !errors.Is(err, context.Canceled) {
+					return err
+				}
+				return nil
+			}
+			// Cancellation rejects further admission. Preserve the original submission
+			// deadline, then allow a short unwind after the ACK updates canonical state.
+			for {
+				remaining, active := scope.remaining()
+				if !active {
+					remaining = 100 * time.Millisecond
+				}
+				timer := time.NewTimer(max(remaining, 0))
+				select {
+				case err := <-result:
+					timer.Stop()
+					return fmt.Errorf("callback deadline exceeded: %w", errors.Join(cause, err))
+				case <-scope.changed:
+					timer.Stop()
+					continue
+				case <-timer.C:
+					message := "callback deadline exceeded"
+					if active {
+						message = "transaction settlement deadline exceeded; durable outcome unknown"
+					}
+					return &callbackStillRunningError{cause: fmt.Errorf("%s: %w", message, cause)}
+				}
+			}
 		}
-		return &callbackStillRunningError{cause: fmt.Errorf("callback deadline exceeded: %w", err)}
 	}
 }
 

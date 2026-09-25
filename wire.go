@@ -7,12 +7,15 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"time"
 )
 
 type wire struct {
-	r  *bufio.Reader
-	w  io.Writer
-	mu sync.Mutex
+	r            *bufio.Reader
+	w            io.Writer
+	mu           sync.Mutex
+	failureMu    sync.Mutex
+	writeFailure error
 }
 
 func newWire(r io.Reader, w io.Writer) *wire { return &wire{r: bufio.NewReaderSize(r, 64<<10), w: w} }
@@ -53,8 +56,56 @@ func (w *wire) sendBytes(raw []byte) error {
 	if len(raw) > MaxFrameBytes {
 		return errors.New("protocol frame exceeds maximum size")
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	_, err := w.w.Write(raw)
-	return err
+	// A daemon that stops reading must not hold the protocol mutex forever and
+	// prevent the supervisor from exiting. At most one blocked write survives
+	// until process exit; subsequent sends fail closed on this poisoned wire.
+	w.failureMu.Lock()
+	failure := w.writeFailure
+	w.failureMu.Unlock()
+	if failure != nil {
+		return failure
+	}
+	result := make(chan error, 1)
+	go func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.failureMu.Lock()
+		failure := w.writeFailure
+		w.failureMu.Unlock()
+		if failure != nil {
+			result <- failure
+			return
+		}
+		n, err := w.w.Write(raw)
+		if err == nil && n != len(raw) {
+			err = io.ErrShortWrite
+		}
+		// Publish failure before releasing the serialization lock; a queued
+		// sender must never append another frame to a damaged stream.
+		if err != nil {
+			err = w.failWrite(err)
+		}
+		result <- err
+	}()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	var err error
+	select {
+	case err = <-result:
+	case <-timer.C:
+		err = errors.New("worker protocol write deadline exceeded")
+	}
+	if err != nil {
+		return w.failWrite(err)
+	}
+	return nil
+}
+
+func (w *wire) failWrite(err error) error {
+	w.failureMu.Lock()
+	defer w.failureMu.Unlock()
+	if w.writeFailure == nil {
+		w.writeFailure = err
+	}
+	return w.writeFailure
 }
