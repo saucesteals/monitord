@@ -126,6 +126,14 @@ func (c *workerCoordinator) Commit(ctx context.Context, tx transactionCommit) (s
 
 // HashTransactionFrame returns the canonical semantic payload hash.
 func HashTransactionFrame(frame TransactionFrame) [32]byte {
+	// Empty optional collections are omitted on the wire and decode as nil.
+	if len(frame.Checkpoints) == 0 {
+		frame.Checkpoints = nil
+	}
+	if len(frame.Events) == 0 {
+		frame.Events = nil
+	}
+
 	h := sha256.New()
 	fields := []any{frame.DeploymentID, frame.Generation, frame.WorkerToken, frame.Sequence, frame.BaseStateRevision, frame.NextState, frame.Checkpoints, frame.Events}
 	var size [8]byte
