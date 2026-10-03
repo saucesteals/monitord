@@ -14,12 +14,15 @@ import (
 	"github.com/saucesteals/monitord"
 )
 
-const chromiumVersion = "131.0.0.0"
-
 // NewClient creates a reusable browser-compatible client using the host's
 // direct network path.
-func NewClient() (*http.Client, error) {
-	return newClient(nil)
+func NewClient(options ...Option) (*http.Client, error) {
+	config, err := resolveOptions(options)
+	if err != nil {
+		return nil, err
+	}
+
+	return newClient(nil, config)
 }
 
 // ProxyClient distributes requests across a fixed set of proxy-bound clients.
@@ -32,7 +35,12 @@ type ProxyClient struct {
 
 // NewProxyClient loads a JSON array of proxy URLs from ref and creates one
 // reusable client per proxy.
-func NewProxyClient(secrets monitord.SecretSet, ref monitord.SecretRef) (*ProxyClient, error) {
+func NewProxyClient(secrets monitord.SecretSet, ref monitord.SecretRef, options ...Option) (*ProxyClient, error) {
+	config, err := resolveOptions(options)
+	if err != nil {
+		return nil, err
+	}
+
 	if secrets == nil {
 		return nil, errors.New("proxy secrets are unavailable")
 	}
@@ -55,7 +63,7 @@ func NewProxyClient(secrets monitord.SecretSet, ref monitord.SecretRef) (*ProxyC
 		if !ok {
 			return nil, fmt.Errorf("proxy entry %d is not a supported URL", i)
 		}
-		client, err := newClient(proxy)
+		client, err := newClient(proxy, config)
 		if err != nil {
 			return nil, fmt.Errorf("create client for proxy entry %d", i)
 		}
@@ -101,7 +109,7 @@ func parseProxy(raw string) (*url.URL, bool) {
 	}
 }
 
-func newClient(proxy *url.URL) (*http.Client, error) {
+func newClient(proxy *url.URL, config clientOptions) (*http.Client, error) {
 	var proxyFunc func(*http.Request) (*url.URL, error)
 	if proxy != nil {
 		proxyFunc = http.ProxyURL(proxy)
@@ -120,7 +128,7 @@ func newClient(proxy *url.URL) (*http.Client, error) {
 		ExpectContinueTimeout: time.Second,
 	}
 	transport, err := mimic.NewTransport(mimic.TransportOptions{
-		Version:   chromiumVersion,
+		Version:   config.chromeVersion,
 		Brand:     mimic.BrandChrome,
 		Platform:  mimic.PlatformMac,
 		Transport: base,

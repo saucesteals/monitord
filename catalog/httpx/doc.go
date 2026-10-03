@@ -7,6 +7,9 @@
 // transports separate prevents connections and TLS sessions from drifting
 // between exits; redirects remain on the client selected for the request.
 //
+// Both constructors use DefaultChromeVersion unless WithChromeVersion is supplied.
+// Options are scoped to the new client or pool and never change existing clients.
+//
 // Clients are intended to be worker-generation resources. Construct them once
 // from a monitor's Start method, using the secrets in monitord.Environment, and
 // close idle connections from Stop. Do not build a new proxy pool on every

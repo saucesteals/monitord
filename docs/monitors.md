@@ -200,6 +200,29 @@ isps='["http://user:pass@proxy-1.invalid:8080","socks5://proxy-2.invalid:1080"]'
 
 `httpx.ProxyClient` creates one reusable browser-compatible client per proxy and selects the next client for each request. Redirects stay on the selected proxy. Use `httpx.NewClient` for the same browser-compatible transport without a proxy.
 
+Both constructors default to `httpx.DefaultChromeVersion` (Chrome stable milestone 154,
+advertised as `154.0.0.0` for macOS, verified on 2026-10-03). To pin a different version,
+pass the same option to either constructor:
+
+```go
+client, err := httpx.NewClient(httpx.WithChromeVersion("147.0.0.0"))
+// Or apply the version to every client in a proxy pool:
+pool, err := httpx.NewProxyClient(env.Secrets(), proxies, httpx.WithChromeVersion("147.0.0.0"))
+```
+
+Existing calls without options continue to work. Overrides are per client/pool,
+not global; use four unsigned decimal components with a major version of at
+least 100. Invalid options return an error during construction, before reading
+proxy secrets. Multiple version options are applied in order; the last wins.
+
+The default is pinned, not fetched at startup. Maintainers should check the
+[Chrome stable release feed](https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Mac&num=1)
+when updating it. The version controls Mimic's User-Agent, client hints, and
+selection among its available TLS/HTTP2 profiles. It does **not** install Chrome
+or guarantee exact emulation of a new release: the current Mimic dependency
+selects its Chrome 133 TLS profile for versions 133 and newer. Updating those
+underlying profiles is separate from selecting the advertised browser version.
+
 ## Catalog monitors
 
 QuickNode support has one provider layer and separate chain layers:
