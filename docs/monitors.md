@@ -2,11 +2,13 @@
 
 A monitor is a Go `main` package containing one `monitord.Monitor[S]` and a `monitor.yaml`. `S` is the deployment's current durable state type. The daemon, not the monitor process, owns persistence and delivery.
 
+For complete monitor implementations and setup instructions, see [saucesteals/monitors](https://github.com/saucesteals/monitors).
+
 ## Package shape
 
 Keep `main`, metadata, plan, and the state contract in `monitor.go`. A simple monitor may need only that file. Split network adapters, parsers, or domain models when those boundaries make the package easier to understand; file count is not a design goal.
 
-Deployments contain the compiled monitor, not loose files from its source directory. Embed static runtime assets with Go's `//go:embed` directive, as the [HTTP watch example](../examples/http-watch) does for `targets.json`. Keep operator-editable configuration in typed state or secrets instead of a sidecar file.
+Deployments contain the compiled monitor, not loose files from its source directory. Embed static runtime assets with Go's `//go:embed` directive. Keep operator-editable configuration in typed state or secrets instead of a sidecar file.
 
 `monitord.Define` is the concise form:
 
