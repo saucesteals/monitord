@@ -202,6 +202,17 @@ isps='["http://user:pass@proxy-1.invalid:8080","socks5://proxy-2.invalid:1080"]'
 
 `httpx.ProxyClient` creates one reusable browser-compatible client per proxy and selects the next client for each request. Redirects stay on the selected proxy. Use `httpx.NewClient` for the same browser-compatible transport without a proxy.
 
+The HTTP catalog uses Mimic `v1.1.0-beta.4` and requires Go 1.27.2 or later.
+Clients, requests, responses, headers, and cookie jars use standard `net/http`
+types. When migrating a monitor, replace `github.com/saucesteals/fhttp` imports
+(and its `cookiejar` package) with `net/http` (and `net/http/cookiejar`). Replace
+`fhttp.HeaderOrderKey` with `mimic.HeaderOrderKey` if setting explicit header order.
+Existing `fhttp` identifiers can stay unchanged by using `fhttp "net/http"`;
+new monitors should use the normal `http` name. Let the transport negotiate
+compression unless decoding it yourself: an explicit `Accept-Encoding` header
+disables automatic decoding.
+Rebuild and redeploy affected monitors to adopt the new transport.
+
 Both constructors default to `httpx.DefaultChromeVersion` (Chrome stable milestone 154,
 advertised as `154.0.0.0` for macOS, verified on 2026-10-03). To pin a different version,
 pass the same option to either constructor:
@@ -214,16 +225,17 @@ pool, err := httpx.NewProxyClient(env.Secrets(), proxies, httpx.WithChromeVersio
 
 Existing calls without options continue to work. Overrides are per client/pool,
 not global; use four unsigned decimal components with a major version of at
-least 100. Invalid options return an error during construction, before reading
+least 107. Versions 115–119 and 124–130 are rejected because they require
+obsolete draft-Kyber. Invalid options return an error during construction, before reading
 proxy secrets. Multiple version options are applied in order; the last wins.
 
 The default is pinned, not fetched at startup. Maintainers should check the
 [Chrome stable release feed](https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Mac&num=1)
 when updating it. The version controls Mimic's User-Agent, client hints, and
 selection among its available TLS/HTTP2 profiles. It does **not** install Chrome
-or guarantee exact emulation of a new release: the current Mimic dependency
-selects its Chrome 133 TLS profile for versions 133 and newer. Updating those
-underlying profiles is separate from selecting the advertised browser version.
+or guarantee exact emulation of a new release: newer versions reuse Mimic's
+latest implemented wire behavior. Updating those underlying profiles is separate
+from selecting the advertised browser version.
 
 ## Catalog monitors
 
