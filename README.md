@@ -29,6 +29,10 @@ Use it when cron is too stateless and building another service is too much.
 - Inspect readiness, failures, recovery, checkpoint progress, and outbox state from one CLI.
 - Send rich Discord alerts or turn an event into an OpenClaw agent task.
 
+## Monitors
+
+Browse [saucesteals/monitors](https://github.com/saucesteals/monitors) for monitors covering shopping, travel, dining, feeds, and service status. Each monitor includes source and a README to help you configure and run it with `monitord`.
+
 ## Code
 
 Monitors are ordinary Go programs. Source I/O stays ordinary; the durable decision stays small.
@@ -149,5 +153,4 @@ cd monitord
 
 - [Monitor authoring](docs/monitors.md)
 - [Operations](docs/operations.md)
-- [HTTP watch example](examples/http-watch)
 - [Agent skill](SKILL.md)
