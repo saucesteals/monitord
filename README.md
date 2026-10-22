@@ -4,7 +4,7 @@
 
 **Stateful monitors. Durable delivery. One small daemon.**
 
-[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go&logoColor=white)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.27.2+-00ADD8?style=flat&logo=go&logoColor=white)](https://go.dev)
 [![SQLite](https://img.shields.io/badge/State-SQLite-3f7f5f?style=flat)](https://sqlite.org/)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-lightgrey)]()
 

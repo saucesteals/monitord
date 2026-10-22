@@ -5,11 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"sync/atomic"
 	"time"
 
-	http "github.com/saucesteals/fhttp"
 	"github.com/saucesteals/mimic"
 	"github.com/saucesteals/monitord"
 )
@@ -127,11 +127,9 @@ func newClient(proxy *url.URL, config clientOptions) (*http.Client, error) {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}
-	transport, err := mimic.NewTransport(mimic.TransportOptions{
-		Version:   config.chromeVersion,
-		Brand:     mimic.BrandChrome,
-		Platform:  mimic.PlatformMac,
-		Transport: base,
+	transport, err := mimic.NewTransport(mimic.Config{
+		Profile: config.profile,
+		HTTP:    base,
 	})
 	if err != nil {
 		return nil, err

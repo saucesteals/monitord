@@ -4,6 +4,9 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+
+	"github.com/saucesteals/mimic"
+	"github.com/saucesteals/mimic/chromium"
 )
 
 // DefaultChromeVersion is the Chrome stable milestone used by new clients unless
@@ -18,11 +21,13 @@ type Option func(*clientOptions) error
 
 type clientOptions struct {
 	chromeVersion string
+	profile       *mimic.Profile
 }
 
 // WithChromeVersion sets the Chromium version supplied to Mimic. The version
 // must contain four unsigned decimal components (for example, "147.0.0.0")
-// and a major version of at least 100, as required by Mimic. The last option wins.
+// and a major version of at least 107. Mimic rejects versions 115–119 and
+// 124–130 because they require obsolete draft-Kyber. The last option wins.
 // Mimic controls the available TLS profiles; a version override does not add a
 // new TLS implementation or guarantee an exact fingerprint for that release.
 func WithChromeVersion(version string) Option {
@@ -36,8 +41,8 @@ func WithChromeVersion(version string) Option {
 			if err != nil {
 				return errors.New("chrome version must contain four unsigned decimal components")
 			}
-			if i == 0 && n < 100 {
-				return errors.New("chrome major version must be at least 100")
+			if i == 0 && n < 107 {
+				return errors.New("chrome major version must be at least 107")
 			}
 		}
 		options.chromeVersion = version
@@ -56,6 +61,16 @@ func resolveOptions(options []Option) (clientOptions, error) {
 			return clientOptions{}, err
 		}
 	}
+
+	profile, err := chromium.New(chromium.Config{
+		Brand:    chromium.Chrome,
+		Version:  config.chromeVersion,
+		Platform: chromium.Mac,
+	})
+	if err != nil {
+		return clientOptions{}, err
+	}
+	config.profile = profile
 
 	return config, nil
 }
