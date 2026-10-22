@@ -62,6 +62,10 @@ Use lower-case kebab-case for monitor names and secret group/key components. `Se
 
 Perform network I/O, sleeping, and expensive parsing outside `Commit`. Recheck ordering and repeated-condition predicates inside the closure. Keep it bounded and deterministic; do not retain `tx.State` references or launch goroutines from it. The SDK retains and resends an unacknowledged transaction, so never implement ACK retry by rerunning a closure.
 
+## HTTP types
+
+Use standard `net/http` (and `net/http/cookiejar` when needed) with `catalog/httpx`. New monitors should use the normal `http` package name. Existing code may keep `fhttp "net/http"` as an alias during migration; do not rename identifiers just for style. Do not import `github.com/saucesteals/fhttp`. Let the transport negotiate compression unless the monitor explicitly handles decoding; setting `Accept-Encoding` disables automatic decoding.
+
 ## Lifecycle-owned resources
 
 When no managed catalog source owns a reusable client, proxy pool, connection, or subscription, implement `monitord.Starter` and optionally `monitord.Stopper` on the monitor. Construct the resource in `Start(context.Context, monitord.Environment)`, after exact secrets are available and before the worker becomes ready. Stop closes resources after callbacks have ended. A failing `Start` must clean up its partial work.

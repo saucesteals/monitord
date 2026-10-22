@@ -207,6 +207,10 @@ Clients, requests, responses, headers, and cookie jars use standard `net/http`
 types. When migrating a monitor, replace `github.com/saucesteals/fhttp` imports
 (and its `cookiejar` package) with `net/http` (and `net/http/cookiejar`). Replace
 `fhttp.HeaderOrderKey` with `mimic.HeaderOrderKey` if setting explicit header order.
+Existing `fhttp` identifiers can stay unchanged by using `fhttp "net/http"`;
+new monitors should use the normal `http` name. Let the transport negotiate
+compression unless decoding it yourself: an explicit `Accept-Encoding` header
+disables automatic decoding.
 Rebuild and redeploy affected monitors to adopt the new transport.
 
 Both constructors default to `httpx.DefaultChromeVersion` (Chrome stable milestone 154,
