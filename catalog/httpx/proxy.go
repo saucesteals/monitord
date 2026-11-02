@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -34,7 +35,8 @@ type ProxyClient struct {
 }
 
 // NewProxyClient loads a JSON array of proxy URLs from ref and creates one
-// reusable client per proxy.
+// reusable client per proxy. Each pool shuffles its clients once to avoid
+// consistently starting independent workers and restarts at the same proxy.
 func NewProxyClient(secrets monitord.SecretSet, ref monitord.SecretRef, options ...Option) (*ProxyClient, error) {
 	config, err := resolveOptions(options)
 	if err != nil {
@@ -70,11 +72,16 @@ func NewProxyClient(secrets monitord.SecretSet, ref monitord.SecretRef, options 
 		clients[i] = client
 	}
 
+	rand.Shuffle(len(clients), func(i, j int) {
+		clients[i], clients[j] = clients[j], clients[i]
+	})
+
 	return &ProxyClient{clients: clients}, nil
 }
 
-// Do sends req through the next proxy in round-robin order. Redirects remain
-// on the selected client and therefore on the same proxy.
+// Do sends req through the next proxy in the pool's shuffled round-robin order.
+// The counter advances even when the request fails. Redirects remain on the
+// selected client and therefore on the same proxy.
 func (c *ProxyClient) Do(req *http.Request) (*http.Response, error) {
 	if c == nil || len(c.clients) == 0 {
 		return nil, errors.New("proxy client is not initialized")

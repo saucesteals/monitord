@@ -200,7 +200,20 @@ The proxy secret is a JSON array of URLs:
 isps='["http://user:pass@proxy-1.invalid:8080","socks5://proxy-2.invalid:1080"]'
 ```
 
-`httpx.ProxyClient` creates one reusable browser-compatible client per proxy and selects the next client for each request. Redirects stay on the selected proxy. Use `httpx.NewClient` for the same browser-compatible transport without a proxy.
+`httpx.ProxyClient` creates one reusable browser-compatible client per proxy,
+shuffles the client order once at construction, and then selects the next client
+round-robin for each request. Each pool gets its own random order; the configured
+secret URLs are not changed. A failed request still advances the counter, and
+redirects stay on the selected proxy. This is request-level rotation, not a
+sticky session or an automatic request-retry policy. Use `httpx.NewClient` for
+the same browser-compatible transport without a proxy.
+
+Construct the pool in `Start`, not inside the polling callback. Ordinary polling
+errors are recorded without restarting the worker or calling `Start` again, so
+the pool and its rotation counter survive failed scans. Returning a rate-limit
+error does not replay the failed request; the next poll runs after the configured
+interval. Keep source-specific retry/backoff and session-affinity decisions in
+the monitor or provider rather than restarting the process to rotate proxies.
 
 The HTTP catalog uses Mimic `v1.1.0-beta.4` and requires Go 1.27.2 or later.
 Clients, requests, responses, headers, and cookie jars use standard `net/http`
