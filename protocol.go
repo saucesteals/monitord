@@ -265,10 +265,10 @@ func (o WorkerFrame) Validate() error {
 		if o.Run == nil {
 			return errors.New("run payload missing")
 		}
-		if o.Run.Generation == 0 || o.Run.Duration < 0 || (o.Run.Status != "success" && o.Run.Status != "failure") {
+		if o.Run.Generation == 0 || o.Run.Duration < 0 || (o.Run.Status != "success" && o.Run.Status != "failure" && o.Run.Status != "deferred") {
 			return errors.New("invalid run outcome")
 		}
-		if (o.Run.Status == "failure") != (o.Run.Error != "") || len(o.Run.Error) > MaxOperationalErrorBytes {
+		if (o.Run.Status != "success") != (o.Run.Error != "") || len(o.Run.Error) > MaxOperationalErrorBytes {
 			return errors.New("run error does not match status or exceeds limit")
 		}
 	case "transaction":

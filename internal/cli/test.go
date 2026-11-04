@@ -268,6 +268,11 @@ func runLocal(
 			}
 		case "ready":
 			fmt.Fprintln(out, "ready")
+		case "run":
+			status = msg.Run.Status
+			if status == "deferred" {
+				fmt.Fprintf(out, "[callback] deferred: %s\n", redactor.Redact(msg.Run.Error))
+			}
 		case "transaction":
 			if monitord.HashTransactionFrame(*msg.Transaction) != mustHash(msg.Transaction.PayloadHash) {
 				return nil, "", fmt.Errorf("worker transaction hash mismatch")
