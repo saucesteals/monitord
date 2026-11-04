@@ -115,14 +115,19 @@ func runPlan[S any](ctx context.Context, session *Session[S], plan Plan[S], once
 			return nil
 		}
 		outcome := RunFrame{Status: "success", Duration: time.Since(started)}
+		var deferred *deferredError
+		isDeferred := errors.As(err, &deferred) && !callbackFatal(err) && !errors.Is(err, context.DeadlineExceeded)
 		if err != nil {
 			outcome.Status = "failure"
+			if isDeferred {
+				outcome.Status = "deferred"
+			}
 			outcome.Error = boundedOperationalError(err, "monitor check failed")
 		}
 		if reportErr := report(outcome); reportErr != nil {
 			return reportErr
 		}
-		if err != nil && (once || callbackFatal(err)) {
+		if err != nil && !isDeferred && (once || callbackFatal(err)) {
 			return &reportedRunError{cause: err}
 		}
 		if once {

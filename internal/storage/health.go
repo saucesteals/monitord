@@ -18,6 +18,7 @@ type RunStatus string
 const (
 	RunSucceeded RunStatus = "success"
 	RunFailed    RunStatus = "failure"
+	RunDeferred  RunStatus = "deferred"
 )
 
 type RunOutcome struct {
@@ -92,10 +93,10 @@ func (s *Store) RecordRun(ctx context.Context, outcome RunOutcome) (HealthTransi
 	if outcome.DeploymentID == "" || outcome.Generation < 1 || outcome.Duration < 0 {
 		return "", errors.New("run outcome requires deployment, generation, and non-negative duration")
 	}
-	if outcome.Status != RunSucceeded && outcome.Status != RunFailed {
+	if outcome.Status != RunSucceeded && outcome.Status != RunFailed && outcome.Status != RunDeferred {
 		return "", fmt.Errorf("invalid run status %q", outcome.Status)
 	}
-	if outcome.Status != RunFailed && outcome.Error != "" {
+	if outcome.Status == RunSucceeded && outcome.Error != "" {
 		return "", errors.New("successful run outcome cannot contain an error")
 	}
 	if outcome.FinishedAt.IsZero() {
@@ -125,6 +126,19 @@ func (s *Store) RecordRun(ctx context.Context, outcome RunOutcome) (HealthTransi
 	var transition HealthTransition
 	now := toMs(outcome.FinishedAt)
 	duration := outcome.Duration.Milliseconds()
+	if outcome.Status == RunDeferred {
+		// Keep the last actual outcome, original error, timestamps and notification
+		// latch. Readiness after restart must not erase an existing failure state.
+		result, updateErr := tx.ExecContext(ctx, `UPDATE deployment_health SET status=CASE WHEN consecutive_failures>=? THEN 'unhealthy' WHEN consecutive_failures>0 THEN 'failing' ELSE status END,updated_at=? WHERE deployment_id=? AND generation=?`, threshold, now, outcome.DeploymentID, outcome.Generation)
+		if updateErr != nil {
+			return "", fmt.Errorf("record deferred run: %w", updateErr)
+		}
+		if err = requireOneRow(result, "record deferred run"); err != nil {
+			return "", err
+		}
+
+		return "", tx.Commit()
+	}
 	if outcome.Status == RunSucceeded {
 		result, updateErr := tx.ExecContext(ctx, `UPDATE deployment_health SET generation=?,status='healthy',consecutive_failures=0,last_run_status='success',last_run_at=?,last_duration_ms=?,last_success_at=?,last_error='',updated_at=? WHERE deployment_id=? AND generation=?`, outcome.Generation, now, duration, now, now, outcome.DeploymentID, outcome.Generation)
 		if updateErr != nil {
